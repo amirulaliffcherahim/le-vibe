@@ -1,9 +1,14 @@
+pub mod memory;
+
 use le_vibe_pybridge::{PolicyPort, ToolDefinition};
 use le_vibe_schema::validate_object_args;
+use regex::{Regex, RegexBuilder};
 use serde_json::{Value, json};
 use std::fs;
+use std::io::Read;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 const MAX_LINES: usize = 2000;
@@ -66,13 +71,28 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "grep".to_string(),
-            description: "Search for a pattern in files under a path".to_string(),
+            description: "Search for a regex/text pattern in files under a path".to_string(),
             parameters: json!({
                 "type": "object",
                 "required": ["pattern"],
                 "properties": {
                     "pattern": { "type": "string" },
-                    "path": { "type": "string" }
+                    "path": { "type": "string" },
+                    "case_insensitive": { "type": "boolean" },
+                    "glob": { "type": "string" },
+                    "context": { "type": "integer" }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "find".to_string(),
+            description: "Find files by path/filename pattern under a directory".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "pattern": { "type": "string" },
+                    "max_depth": { "type": "integer" }
                 }
             }),
         },
@@ -93,7 +113,8 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "required": ["command"],
                 "properties": {
-                    "command": { "type": "string" }
+                    "command": { "type": "string" },
+                    "timeout_secs": { "type": "integer" }
                 }
             }),
         },
@@ -104,7 +125,8 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "required": ["command"],
                 "properties": {
-                    "command": { "type": "string" }
+                    "command": { "type": "string" },
+                    "timeout_secs": { "type": "integer" }
                 }
             }),
         },
@@ -132,6 +154,59 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["questions"],
                 "properties": {
                     "questions": { "type": "array" }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "memory_search".to_string(),
+            description: "Hybrid Lucene-BM25 + 512d vector RAG search (default scope='memory'; opt-in scope='repo'). Returns inline text for short entries or compact stubs.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                    "query": { "type": "string" },
+                    "limit": { "type": "integer" },
+                    "scope": { "type": "string" }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "memory_write".to_string(),
+            description: "Save or upsert a durable fact/decision to project or global MEMORY.md / daily log. Include 3-6 synonym keywords for semantic recall and optional stable key for upsert.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "required": ["content"],
+                "properties": {
+                    "content": { "type": "string" },
+                    "title": { "type": "string" },
+                    "keywords": { "type": "array" },
+                    "key": { "type": "string" },
+                    "target": { "type": "string" },
+                    "scope": { "type": "string" }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "memory_read".to_string(),
+            description: "Read full memory entries by batch ids[] / id, or read long_term/daily/list.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "ids": { "type": "array" },
+                    "id": { "type": "string" },
+                    "target": { "type": "string" }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "memory_delete".to_string(),
+            description: "Delete an obsolete memory entry by id or key from MEMORY.md.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "required": ["id_or_key"],
+                "properties": {
+                    "id_or_key": { "type": "string" },
+                    "scope": { "type": "string" }
                 }
             }),
         },
@@ -313,6 +388,7 @@ fn run_read(args: &Value) -> Result<String, ToolError> {
     let path = args.get("path").and_then(Value::as_str).expect("validated");
     let raw = fs::read_to_string(path)?;
     let all_lines: Vec<&str> = raw.lines().collect();
+    let total = all_lines.len();
     let offset = args
         .get("offset")
         .and_then(Value::as_u64)
@@ -323,8 +399,21 @@ fn run_read(args: &Value) -> Result<String, ToolError> {
         .and_then(Value::as_u64)
         .map(|v| v as usize)
         .unwrap_or(MAX_LINES);
-    let slice: Vec<&str> = all_lines.into_iter().skip(offset).take(limit).collect();
-    Ok(truncate_output(&slice.join("\n")))
+    let numbered: Vec<String> = all_lines
+        .into_iter()
+        .enumerate()
+        .skip(offset)
+        .take(limit)
+        .map(|(idx, line)| format!("{}: {line}", idx + 1))
+        .collect();
+    let shown = numbered.len();
+    let mut out = truncate_output(&numbered.join("\n"));
+    if offset > 0 || offset + shown < total {
+        let start_line = if shown == 0 { 0 } else { offset + 1 };
+        let end_line = offset + shown;
+        out.push_str(&format!("\n[showing lines {start_line}..{end_line} of {total}]"));
+    }
+    Ok(out)
 }
 
 fn run_write(args: &Value) -> Result<String, ToolError> {
@@ -392,13 +481,86 @@ fn run_edit(args: &Value) -> Result<String, ToolError> {
     Ok(format!("Applied {} edit(s) to {path}", spans.len()))
 }
 
-fn grep_dir(root: &Path, pattern: &str, out: &mut Vec<String>) -> Result<(), ToolError> {
+const GREP_MAX_MATCHES: usize = 200;
+const FIND_MAX_RESULTS: usize = 500;
+const MAX_WALK_DEPTH: usize = 32;
+
+fn should_skip_dir(name: &str) -> bool {
+    matches!(
+        name,
+        ".git"
+            | "node_modules"
+            | "target"
+            | ".venv"
+            | "__pycache__"
+            | ".pytest_cache"
+            | "dist"
+            | "build"
+            | "Cargo.lock"
+    )
+}
+
+fn simple_glob_match(text: &str, pattern: &str) -> bool {
+    let p_bytes = pattern.as_bytes();
+    let t_bytes = text.as_bytes();
+    let (mut pi, mut ti) = (0, 0);
+    let (mut star, mut match_idx) = (None, 0);
+    while ti < t_bytes.len() {
+        if pi < p_bytes.len() && (p_bytes[pi] == b'?' || p_bytes[pi] == t_bytes[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p_bytes.len() && p_bytes[pi] == b'*' {
+            star = Some(pi);
+            match_idx = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            match_idx += 1;
+            ti = match_idx;
+        } else {
+            return false;
+        }
+    }
+    while pi < p_bytes.len() && p_bytes[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p_bytes.len()
+}
+
+fn grep_dir(
+    root: &Path,
+    re: &Regex,
+    glob: Option<&str>,
+    context: usize,
+    depth: usize,
+    out: &mut Vec<String>,
+) -> Result<(), ToolError> {
+    if depth > MAX_WALK_DEPTH {
+        return Ok(());
+    }
     if root.is_file() {
+        if let Some(g) = glob {
+            let name = root.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let path_s = root.to_string_lossy();
+            if !simple_glob_match(name, g) && !simple_glob_match(&path_s, g) {
+                return Ok(());
+            }
+        }
         if let Ok(content) = fs::read_to_string(root) {
-            for (idx, line) in content.lines().enumerate() {
-                if line.contains(pattern) {
-                    out.push(format!("{}:{}: {}", root.display(), idx + 1, line));
-                    if out.len() >= MAX_LINES {
+            let lines: Vec<&str> = content.lines().collect();
+            for (idx, line) in lines.iter().enumerate() {
+                if re.is_match(line) {
+                    if context > 0 {
+                        let start = idx.saturating_sub(context);
+                        let end = (idx + context + 1).min(lines.len());
+                        for (c_idx, c_line) in lines.iter().enumerate().take(end).skip(start) {
+                            let sep = if c_idx == idx { ':' } else { '-' };
+                            out.push(format!("{}:{}{sep} {}", root.display(), c_idx + 1, c_line));
+                        }
+                    } else {
+                        out.push(format!("{}:{}: {}", root.display(), idx + 1, line));
+                    }
+                    if out.len() >= GREP_MAX_MATCHES {
                         return Ok(());
                     }
                 }
@@ -410,11 +572,13 @@ fn grep_dir(root: &Path, pattern: &str, out: &mut Vec<String>) -> Result<(), Too
         let entry = entry?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        if matches!(name_str.as_ref(), ".git" | "node_modules" | "target" | ".venv") {
+        if should_skip_dir(&name_str)
+            || entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(false)
+        {
             continue;
         }
-        grep_dir(&entry.path(), pattern, out)?;
-        if out.len() >= MAX_LINES {
+        grep_dir(&entry.path(), re, glob, context, depth + 1, out)?;
+        if out.len() >= GREP_MAX_MATCHES {
             break;
         }
     }
@@ -424,10 +588,88 @@ fn grep_dir(root: &Path, pattern: &str, out: &mut Vec<String>) -> Result<(), Too
 fn run_grep(args: &Value) -> Result<String, ToolError> {
     let pattern = args.get("pattern").and_then(Value::as_str).expect("validated");
     let root = args.get("path").and_then(Value::as_str).unwrap_or(".");
+    let case_insensitive = args
+        .get("case_insensitive")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let glob = args.get("glob").and_then(Value::as_str);
+    let context = args
+        .get("context")
+        .and_then(Value::as_u64)
+        .map(|c| c.min(5) as usize)
+        .unwrap_or(0);
+
+    let re = RegexBuilder::new(pattern)
+        .case_insensitive(case_insensitive)
+        .build()
+        .or_else(|_| {
+            RegexBuilder::new(&regex::escape(pattern))
+                .case_insensitive(case_insensitive)
+                .build()
+        })
+        .map_err(|e| ToolError::Edit(format!("invalid grep pattern: {e}")))?;
+
     let mut hits = Vec::new();
-    grep_dir(Path::new(root), pattern, &mut hits)?;
+    grep_dir(Path::new(root), &re, glob, context, 0, &mut hits)?;
     if hits.is_empty() {
         Ok("No matches found.".to_string())
+    } else {
+        Ok(truncate_output(&hits.join("\n")))
+    }
+}
+
+fn find_walk(
+    root: &Path,
+    pattern: Option<&str>,
+    depth: usize,
+    max_depth: Option<usize>,
+    out: &mut Vec<String>,
+) -> Result<(), ToolError> {
+    if depth > MAX_WALK_DEPTH || max_depth.is_some_and(|m| depth > m) {
+        return Ok(());
+    }
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if should_skip_dir(&name_str)
+            || entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(false)
+        {
+            continue;
+        }
+        let path = entry.path();
+        let path_str = path.to_string_lossy().to_string();
+        let matches = pattern.is_none_or(|pat| {
+            simple_glob_match(&name_str, pat)
+                || simple_glob_match(&path_str, pat)
+                || path_str.contains(pat)
+        });
+        if matches {
+            let suffix = if path.is_dir() { "/" } else { "" };
+            out.push(format!("{path_str}{suffix}"));
+            if out.len() >= FIND_MAX_RESULTS {
+                return Ok(());
+            }
+        }
+        if path.is_dir() {
+            find_walk(&path, pattern, depth + 1, max_depth, out)?;
+            if out.len() >= FIND_MAX_RESULTS {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_find(args: &Value) -> Result<String, ToolError> {
+    let root = args.get("path").and_then(Value::as_str).unwrap_or(".");
+    let pattern = args.get("pattern").and_then(Value::as_str);
+    let max_depth = args.get("max_depth").and_then(Value::as_u64).map(|d| d as usize);
+    let mut hits = Vec::new();
+    find_walk(Path::new(root), pattern, 0, max_depth, &mut hits)?;
+    hits.sort();
+    if hits.is_empty() {
+        Ok("No files found.".to_string())
     } else {
         Ok(truncate_output(&hits.join("\n")))
     }
@@ -447,23 +689,61 @@ fn run_ls(args: &Value) -> Result<String, ToolError> {
 
 fn run_shell(shell: &str, args: &Value) -> Result<String, ToolError> {
     let cmd = args.get("command").and_then(Value::as_str).expect("validated");
-    let output = if shell == "powershell" {
-        Command::new("powershell")
-            .args(["-NoProfile", "-Command", cmd])
-            .output()?
+    let timeout_secs = args
+        .get("timeout_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(60)
+        .clamp(1, 600);
+
+    let mut command = if shell == "powershell" || shell == "pwsh" {
+        let mut c = Command::new(shell);
+        c.args(["-NoProfile", "-Command", cmd]);
+        c
+    } else if shell == "cmd" {
+        let mut c = Command::new("cmd");
+        c.args(["/C", cmd]);
+        c
     } else {
-        Command::new("bash").args(["-c", cmd]).output()?
+        let mut c = Command::new(shell);
+        c.args(["-c", cmd]);
+        c
     };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = if stderr.is_empty() {
-        stdout.to_string()
-    } else if stdout.is_empty() {
-        stderr.to_string()
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let status = loop {
+        if let Some(st) = child.try_wait()? {
+            break st;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ToolError::Edit(format!(
+                "command timed out after {timeout_secs}s"
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    let mut stdout_buf = String::new();
+    let mut stderr_buf = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_string(&mut stdout_buf);
+    }
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_string(&mut stderr_buf);
+    }
+    let combined = if stderr_buf.is_empty() {
+        stdout_buf
+    } else if stdout_buf.is_empty() {
+        stderr_buf
     } else {
-        format!("{stdout}\n{stderr}")
+        format!("{stdout_buf}\n{stderr_buf}")
     };
-    let code = output.status.code().unwrap_or(-1);
+    let code = status.code().unwrap_or(-1);
     Ok(truncate_output(&format!("exit_code={code}\n{combined}")))
 }
 
@@ -500,9 +780,13 @@ pub fn execute_builtin_tool_approved(name: &str, args: &Value) -> Result<String,
         "write" => run_write(args),
         "edit" => run_edit(args),
         "grep" => run_grep(args),
+        "find" => run_find(args),
         "ls" => run_ls(args),
         "bash" => run_shell("bash", args),
         "powershell" => run_shell("powershell", args),
+        "memory_search" | "memory_write" | "memory_read" | "memory_delete" => {
+            memory::execute_memory_tool(name, args).map_err(ToolError::Edit)
+        }
         _ => Err(ToolError::UnknownTool(name.to_string())),
     }
 }
@@ -560,7 +844,7 @@ mod tests {
             &json!({"path": file.to_string_lossy(), "offset": 2, "limit": 2}),
         )
         .unwrap();
-        assert_eq!(read_slice, "line2\nLINE_THREE");
+        assert_eq!(read_slice, "2: line2\n3: LINE_THREE\n[showing lines 2..3 of 3]");
 
         let grep_hits = execute_builtin_tool(
             &mut policy,
@@ -647,6 +931,58 @@ mod tests {
             &json!({"path": file.to_string_lossy(), "content": "overwrite"}),
         );
         assert!(matches!(gated, Err(ToolError::PolicyAsk(_))));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_numbers_lines_grep_regex_glob_find_and_timeout() {
+        let dir = std::env::temp_dir().join("le_vibe_tools_phase4_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("target")).unwrap();
+        let rs_file = dir.join("sample.rs");
+        fs::write(&rs_file, "fn Alpha() {}\nfn beta() {}\nfn gamma() {}\n").unwrap();
+        fs::write(dir.join("target").join("ignored.rs"), "fn Alpha() {}\n").unwrap();
+
+        let mut allow = AllowAllPolicy;
+        let read_out = execute_builtin_tool(
+            &mut allow,
+            "read",
+            &json!({"path": rs_file.to_string_lossy(), "offset": 2, "limit": 1}),
+        )
+        .unwrap();
+        assert!(read_out.contains("2: fn beta() {}"));
+        assert!(read_out.contains("[showing lines 2..2 of 3]"));
+
+        let grep_out = execute_builtin_tool(
+            &mut allow,
+            "grep",
+            &json!({
+                "path": dir.to_string_lossy(),
+                "pattern": "fn alpha",
+                "case_insensitive": true,
+                "glob": "*.rs"
+            }),
+        )
+        .unwrap();
+        assert!(grep_out.contains("sample.rs:1: fn Alpha() {}"));
+        assert!(!grep_out.contains("ignored.rs"));
+
+        let find_out = execute_builtin_tool(
+            &mut allow,
+            "find",
+            &json!({"path": dir.to_string_lossy(), "pattern": "*.rs"}),
+        )
+        .unwrap();
+        assert!(find_out.contains("sample.rs"));
+        assert!(!find_out.contains("ignored.rs"));
+
+        let timeout_res = execute_builtin_tool(
+            &mut allow,
+            "powershell",
+            &json!({"command": "Start-Sleep -Seconds 5", "timeout_secs": 1}),
+        );
+        assert!(matches!(timeout_res, Err(ToolError::Edit(msg)) if msg.contains("timed out")));
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

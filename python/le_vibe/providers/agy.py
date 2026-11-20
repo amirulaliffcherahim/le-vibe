@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Sequence
 import time
+import re
 from typing import Any
 import uuid
 
@@ -20,6 +21,11 @@ from le_vibe.providers.types import (
     ToolCall,
     TranscriptContext,
     Usage,
+)
+
+
+_AGY_ATTACHED_IMAGE_RE = re.compile(
+    r'\[attached_image name="[^"]*" mime="([^"]+)" data="data:[^;]+;base64,([^"]+)"\]'
 )
 
 
@@ -61,7 +67,14 @@ def build_agy_payload(
         role = "model" if msg.role == "assistant" else "user"
         parts: list[dict[str, Any]] = []
         if msg.content:
-            parts.append({"text": msg.content})
+            if role == "user" and "[attached_image " in msg.content:
+                for m in _AGY_ATTACHED_IMAGE_RE.finditer(msg.content):
+                    parts.append({"inlineData": {"mimeType": m.group(1), "data": m.group(2)}})
+                cleaned = _AGY_ATTACHED_IMAGE_RE.sub("", msg.content).strip()
+                if cleaned:
+                    parts.append({"text": cleaned})
+            else:
+                parts.append({"text": msg.content})
         for tc in msg.tool_calls:
             fc_part: dict[str, Any] = {"functionCall": {"name": tc.name, "args": tc.arguments}}
             if tc.thought_signature:

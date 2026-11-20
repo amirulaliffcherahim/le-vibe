@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 import fnmatch
+import json
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 
 class PermissionScope(StrEnum):
@@ -74,20 +76,94 @@ class PermissionStore:
         self._tool_permissions: dict[str, ToolPermission] = {
             "read": ToolPermission.ALWAYS,
             "grep": ToolPermission.ALWAYS,
+            "find": ToolPermission.ALWAYS,
             "ls": ToolPermission.ALWAYS,
             "todo": ToolPermission.ALWAYS,
             "ask_user_question": ToolPermission.ALWAYS,
+            "memory_search": ToolPermission.ALWAYS,
+            "memory_read": ToolPermission.ALWAYS,
+            "memory_write": ToolPermission.ALWAYS,
+            "memory_delete": ToolPermission.ALWAYS,
             "write": ToolPermission.ASK,
             "edit": ToolPermission.ASK,
             "bash": ToolPermission.ASK,
             "powershell": ToolPermission.ASK,
         }
         self._trusted_folders: tuple[Path, ...] = tuple(p.resolve() for p in trusted_folders)
+        self._blocked_commands: list[str] = []
+        self._allowed_paths: list[str] = []
+        self.loaded_files: list[str] = []
         self.yolo: bool = yolo
 
     def reset(self) -> None:
         self._rules.clear()
         self._tool_permissions.clear()
+        self._blocked_commands.clear()
+        self._allowed_paths.clear()
+        self.loaded_files.clear()
+
+    def apply_policy(self, data: dict[str, Any], *, base_dir: Path | None = None) -> None:
+        if folders := data.get("trusted_folders"):
+            if isinstance(folders, list):
+                resolved: list[Path] = []
+                for f in folders:
+                    p = Path(str(f)).expanduser()
+                    if not p.is_absolute() and base_dir is not None:
+                        p = base_dir / p
+                    resolved.append(p.resolve())
+                self._trusted_folders = tuple(resolved)
+
+        if perms := data.get("tool_permissions"):
+            if isinstance(perms, dict):
+                for tool_name, level in perms.items():
+                    try:
+                        self._tool_permissions[str(tool_name)] = ToolPermission(str(level).lower())
+                    except ValueError:
+                        continue
+
+        if cmds := data.get("allowed_commands"):
+            if isinstance(cmds, list):
+                for pat in cmds:
+                    for shell_tool in ("bash", "powershell"):
+                        self.add_rule(
+                            ApprovedRule(
+                                tool_name=shell_tool,
+                                scope=PermissionScope.COMMAND,
+                                session_pattern=str(pat),
+                            )
+                        )
+
+        if paths := data.get("allowed_paths"):
+            if isinstance(paths, list):
+                self._allowed_paths.extend(str(p) for p in paths)
+
+        if blocked := data.get("blocked_commands"):
+            if isinstance(blocked, list):
+                self._blocked_commands.extend(str(b).strip().lower() for b in blocked if str(b).strip())
+
+    @classmethod
+    def load_from_files(cls, paths: Sequence[Path], *, yolo: bool = False) -> PermissionStore:
+        store = cls(yolo=yolo)
+        for path in paths:
+            if path.exists() and path.is_file():
+                data = load_policy_file(path)
+                store.apply_policy(data)
+                store.loaded_files.append(str(path))
+        return store
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "yolo": self.yolo,
+            "loaded_files": list(self.loaded_files),
+            "trusted_folders": [str(p) for p in self._trusted_folders],
+            "tool_permissions": {k: v.value for k, v in sorted(self._tool_permissions.items())},
+            "allowed_paths": list(self._allowed_paths),
+            "blocked_commands": list(self._blocked_commands),
+            "session_rules": [
+                {"tool": r.tool_name, "scope": r.scope.value, "pattern": r.session_pattern}
+                for r in self._rules
+            ],
+        }
 
     def set_yolo(self, enabled: bool) -> None:
         self.yolo = enabled
@@ -151,8 +227,13 @@ class PermissionStore:
         command: str | None = None,
         target_path: str | None = None,
     ) -> PolicyDecision:
-        if command is not None and (reason := is_command_blocked(command)):
-            return PolicyDecision(action="deny", reason=reason)
+        if command is not None:
+            if reason := is_command_blocked(command):
+                return PolicyDecision(action="deny", reason=reason)
+            lowered = command.strip().lower()
+            for pat in self._blocked_commands:
+                if pat in lowered:
+                    return PolicyDecision(action="deny", reason=f"Blocked by policy rule: {pat}")
 
         if self.yolo:
             return PolicyDecision(action="allow", reason="Auto-approved (yolo)")
@@ -177,6 +258,8 @@ class PermissionStore:
                 return PolicyDecision(action="allow", reason="Matched approved command rule")
 
         if target_path is not None:
+            if any(wildcard_match(target_path, pat) for pat in self._allowed_paths):
+                return PolicyDecision(action="allow", reason="Matched policy allowed_paths rule")
             rp = RequiredPermission(scope=PermissionScope.OUTSIDE_DIRECTORY, invocation_pattern=target_path)
             if self.covers(tool_name, rp):
                 return PolicyDecision(action="allow", reason="Matched approved path rule")
@@ -187,6 +270,13 @@ class PermissionStore:
         return PolicyDecision(action="allow", reason="Default allow")
 
 
+def load_policy_file(path: Path) -> dict[str, Any]:
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"Policy file {path} must contain a JSON object")
+    return raw
+
+
 __all__ = [
     "ApprovedRule",
     "PermissionScope",
@@ -195,5 +285,6 @@ __all__ = [
     "RequiredPermission",
     "ToolPermission",
     "is_command_blocked",
+    "load_policy_file",
     "wildcard_match",
 ]

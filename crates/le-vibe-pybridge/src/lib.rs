@@ -1,8 +1,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -13,6 +16,8 @@ pub enum BridgeError {
     Json(#[from] serde_json::Error),
     #[error("python bridge closed stdout unexpectedly")]
     Closed,
+    #[error("cancelled by user")]
+    Cancelled,
     #[error("python error ({kind}): {message}")]
     Remote { kind: String, message: String },
 }
@@ -206,6 +211,52 @@ impl PythonBridge {
         let val = self.call("providers.logout", json!({ "provider": provider }))?;
         Ok(val.get("removed").and_then(Value::as_bool).unwrap_or(false))
     }
+
+    pub fn reload_extensions(&mut self) -> Result<Value, BridgeError> {
+        self.call("extensions.reload", json!({}))
+    }
+
+    pub fn reload_policy(&mut self) -> Result<Value, BridgeError> {
+        self.call("policy.reload", json!({}))
+    }
+
+    pub fn policy_status(&mut self) -> Result<Value, BridgeError> {
+        self.call("policy.status", json!({}))
+    }
+
+    pub fn extensions_status(&mut self) -> Result<Value, BridgeError> {
+        self.call("extensions.status", json!({}))
+    }
+
+    pub fn list_extension_commands(&mut self) -> Result<Vec<(String, String)>, BridgeError> {
+        let val = self.call("extensions.list_commands", json!({}))?;
+        let mut out = Vec::new();
+        if let Some(arr) = val.as_array() {
+            for item in arr {
+                if let Some(name) = item.get("name").and_then(Value::as_str) {
+                    let desc = item
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    out.push((name.to_string(), desc));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn run_extension_command(&mut self, name: &str, args: &str) -> Result<String, BridgeError> {
+        let val = self.call(
+            "extensions.run_command",
+            json!({ "name": name, "args": args }),
+        )?;
+        Ok(val
+            .get("output")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string())
+    }
 }
 
 pub trait PolicyPort {
@@ -232,32 +283,129 @@ pub trait PolicyPort {
 
 pub trait ExtensionPort {
     fn invoke_hook(&mut self, event: &str, payload: Value) -> Result<Value, BridgeError>;
+
+    fn list_extension_tools(&mut self) -> Result<Vec<ToolDefinition>, BridgeError> {
+        Ok(Vec::new())
+    }
+
+    fn execute_extension_tool(
+        &mut self,
+        _name: &str,
+        _arguments: Value,
+    ) -> Result<Value, BridgeError> {
+        Ok(Value::Null)
+    }
 }
 
 pub struct PythonBridge {
+    python_exe: String,
+    python_dir: PathBuf,
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    stdout_rx: mpsc::Receiver<std::io::Result<String>>,
     next_id: u64,
+    cancel: Option<Arc<AtomicBool>>,
+    yolo_enabled: bool,
+    granted_rules: Vec<(String, Option<String>, Option<String>)>,
 }
 
 impl PythonBridge {
-    pub fn spawn(python_exe: &str, python_dir: &Path) -> Result<Self, BridgeError> {
+    fn spawn_process(
+        python_exe: &str,
+        python_dir: &Path,
+    ) -> Result<(Child, ChildStdin, mpsc::Receiver<std::io::Result<String>>), BridgeError> {
         let mut child = Command::new(python_exe)
             .arg("-m")
             .arg("le_vibe.bridge")
             .env("PYTHONPATH", python_dir)
+            .env("PYTHONUTF8", "1")
+            .env("PYTHONIOENCODING", "utf-8")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()?;
         let stdin = child.stdin.take().ok_or(BridgeError::Closed)?;
-        let stdout = BufReader::new(child.stdout.take().ok_or(BridgeError::Closed)?);
+        let stdout = child.stdout.take().ok_or(BridgeError::Closed)?;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if tx.send(Ok(line)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        break;
+                    }
+                }
+            }
+        });
+        Ok((child, stdin, rx))
+    }
+
+    pub fn spawn(python_exe: &str, python_dir: &Path) -> Result<Self, BridgeError> {
+        let (child, stdin, stdout_rx) = Self::spawn_process(python_exe, python_dir)?;
         Ok(Self {
+            python_exe: python_exe.to_string(),
+            python_dir: python_dir.to_path_buf(),
             child,
             stdin,
-            stdout,
+            stdout_rx,
             next_id: 1,
+            cancel: None,
+            yolo_enabled: false,
+            granted_rules: Vec::new(),
         })
+    }
+
+    pub fn set_cancel_token(&mut self, cancel: Arc<AtomicBool>) {
+        self.cancel = Some(cancel);
+    }
+
+    fn respawn(&mut self) -> Result<(), BridgeError> {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let (child, stdin, stdout_rx) = Self::spawn_process(&self.python_exe, &self.python_dir)?;
+        self.child = child;
+        self.stdin = stdin;
+        self.stdout_rx = stdout_rx;
+        if self.yolo_enabled {
+            let _ = self.call_uncancellable("policy.set_yolo", json!({ "enabled": true }));
+        }
+        let rules = self.granted_rules.clone();
+        for (tool_name, command, target_path) in rules {
+            let _ = self.call_uncancellable(
+                "policy.grant_rule",
+                json!({
+                    "tool_name": tool_name,
+                    "command": command,
+                    "target_path": target_path,
+                }),
+            );
+        }
+        Ok(())
+    }
+
+    fn call_uncancellable(&mut self, method: &str, params: Value) -> Result<Value, BridgeError> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let req = json!({ "id": id, "method": method, "params": params });
+        let mut line = serde_json::to_string(&req)?;
+        line.push('\n');
+        self.stdin.write_all(line.as_bytes())?;
+        self.stdin.flush()?;
+        match self.stdout_rx.recv() {
+            Ok(Ok(resp_line)) => {
+                let resp: Value = serde_json::from_str(&resp_line)?;
+                Ok(resp.get("result").cloned().unwrap_or(Value::Null))
+            }
+            Ok(Err(e)) => Err(BridgeError::Spawn(e)),
+            Err(_) => Err(BridgeError::Closed),
+        }
     }
 
     pub fn call(&mut self, method: &str, params: Value) -> Result<Value, BridgeError> {
@@ -270,6 +418,7 @@ impl PythonBridge {
         params: Value,
         mut on_stream: impl FnMut(Value),
     ) -> Result<Value, BridgeError> {
+        let is_cancellable = method == "providers.stream" || method == "providers.complete";
         let id = self.next_id;
         self.next_id += 1;
 
@@ -280,11 +429,21 @@ impl PythonBridge {
         self.stdin.flush()?;
 
         loop {
-            let mut resp_line = String::new();
-            let read = self.stdout.read_line(&mut resp_line)?;
-            if read == 0 {
-                return Err(BridgeError::Closed);
+            if is_cancellable
+                && self
+                    .cancel
+                    .as_ref()
+                    .is_some_and(|c| c.load(Ordering::SeqCst))
+            {
+                let _ = self.respawn();
+                return Err(BridgeError::Cancelled);
             }
+            let resp_line = match self.stdout_rx.recv_timeout(Duration::from_millis(25)) {
+                Ok(Ok(l)) => l,
+                Ok(Err(e)) => return Err(BridgeError::Spawn(e)),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Err(BridgeError::Closed),
+            };
 
             let resp: Value = serde_json::from_str(&resp_line)?;
             if resp.get("stream").and_then(Value::as_bool) == Some(true) {
@@ -443,6 +602,7 @@ impl PolicyPort for PythonBridge {
     }
 
     fn set_yolo(&mut self, enabled: bool) -> Result<(), BridgeError> {
+        self.yolo_enabled = enabled;
         let _ = self.call("policy.set_yolo", json!({ "enabled": enabled }))?;
         Ok(())
     }
@@ -453,6 +613,11 @@ impl PolicyPort for PythonBridge {
         command: Option<&str>,
         target_path: Option<&str>,
     ) -> Result<(), BridgeError> {
+        self.granted_rules.push((
+            tool_name.to_string(),
+            command.map(ToString::to_string),
+            target_path.map(ToString::to_string),
+        ));
         let _ = self.call(
             "policy.grant_rule",
             json!({
@@ -470,6 +635,22 @@ impl ExtensionPort for PythonBridge {
         self.call(
             "extensions.invoke_hook",
             json!({ "event": event, "payload": payload }),
+        )
+    }
+
+    fn list_extension_tools(&mut self) -> Result<Vec<ToolDefinition>, BridgeError> {
+        let val = self.call("extensions.list_tools", json!({}))?;
+        Ok(serde_json::from_value(val)?)
+    }
+
+    fn execute_extension_tool(
+        &mut self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<Value, BridgeError> {
+        self.call(
+            "extensions.execute_tool",
+            json!({ "name": name, "arguments": arguments }),
         )
     }
 }

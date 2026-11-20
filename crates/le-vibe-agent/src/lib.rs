@@ -1,6 +1,8 @@
-use le_vibe_durable::SessionStore;
+use le_vibe_durable::{EntryKind, SessionStore};
+use le_vibe_mcp::McpManager;
 use le_vibe_pybridge::{
-    AssistantMessage, ChatMessage, CompletionRequest, PolicyPort, ProviderPort,
+    AssistantMessage, BridgeError, ChatMessage, CompletionRequest, ExtensionPort, PolicyPort,
+    ProviderPort, ToolCall,
 };
 use le_vibe_telemetry::TelemetryRecorder;
 use le_vibe_tools::{
@@ -9,22 +11,27 @@ use le_vibe_tools::{
 };
 use serde::Serialize;
 use serde_json::Value;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum AgentError {
     #[error("provider bridge error: {0}")]
-    Bridge(#[from] le_vibe_pybridge::BridgeError),
+    Bridge(#[from] BridgeError),
     #[error("session error: {0}")]
     Session(#[from] le_vibe_durable::SessionError),
     #[error("max turns exceeded ({0})")]
     MaxTurnsExceeded(usize),
+    #[error("turn cancelled by user")]
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
     TurnStart { turn: usize },
+    Status { text: String },
     ThinkingDelta { delta: String },
     TextDelta { delta: String },
     ToolCallStart { id: String, name: String },
@@ -54,7 +61,9 @@ pub struct AgentConfig {
     pub system_prompt: Option<String>,
     pub thinking_level: String,
     pub max_turns: usize,
+    pub max_retries: usize,
     pub allowed_tools: Option<Vec<String>>,
+    pub mode_name: Option<String>,
 }
 
 impl Default for AgentConfig {
@@ -64,13 +73,145 @@ impl Default for AgentConfig {
             model: "deepseek-v4-pro".to_string(),
             system_prompt: None,
             thinking_level: "medium".to_string(),
-            max_turns: 8,
+            max_turns: 40,
+            max_retries: 2,
             allowed_tools: None,
+            mode_name: None,
         }
     }
 }
 
-pub fn run_turn_loop<B: ProviderPort + PolicyPort>(
+const MODE_REMINDER_PREFIX: &str = "<system-reminder>Operational mode changed";
+
+pub fn mode_transition_reminder(prev: Option<&str>, current: &str) -> Option<String> {
+    if prev == Some(current) {
+        return None;
+    }
+    let msg = match current {
+        "plan" | "ask" => format!(
+            "{MODE_REMINDER_PREFIX} to {}. You are in read-only mode. Only read, grep, find, and ls are permitted. Do not attempt file edits or shell commands.</system-reminder>",
+            current.to_uppercase()
+        ),
+        "rea" => format!(
+            "{MODE_REMINDER_PREFIX} to REA (reverse-engineering). Read, search, and shell inspection tools are enabled; file write/edit tools are disabled.</system-reminder>"
+        ),
+        "cyber" | "normal" if matches!(prev, Some("plan" | "ask" | "rea")) => format!(
+            "{MODE_REMINDER_PREFIX} from {} to {}. You are no longer in read-only mode. Full file edit, shell, and verification tools are now permitted.</system-reminder>",
+            prev.unwrap_or("plan").to_uppercase(),
+            current.to_uppercase()
+        ),
+        _ => return None,
+    };
+    Some(msg)
+}
+
+pub fn sanitize_messages_for_provider(provider: &str, messages: &mut Vec<ChatMessage>) {
+    // Drop stale mode-change reminders from historical replay
+    messages.retain(|m| !m.content.starts_with(MODE_REMINDER_PREFIX));
+
+    let mut normalized: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+    let mut i = 0;
+    while i < messages.len() {
+        let mut msg = messages[i].clone();
+        if provider != "agy" {
+            for tc in &mut msg.tool_calls {
+                tc.thought_signature = None;
+            }
+        }
+        if provider != "deepseek" {
+            msg.reasoning_content = None;
+        }
+        if msg.role == "assistant" && !msg.tool_calls.is_empty() {
+            let expected_ids: Vec<(String, String)> = msg
+                .tool_calls
+                .iter()
+                .map(|tc| (tc.id.clone(), tc.name.clone()))
+                .collect();
+            normalized.push(msg);
+            let mut j = i + 1;
+            let mut seen_ids: Vec<String> = Vec::new();
+            while j < messages.len() && messages[j].role == "tool" {
+                if let Some(id) = &messages[j].tool_call_id {
+                    seen_ids.push(id.clone());
+                }
+                normalized.push(messages[j].clone());
+                j += 1;
+            }
+            for (id, name) in expected_ids {
+                if !seen_ids.iter().any(|s| s == &id) {
+                    normalized.push(ChatMessage {
+                        role: "tool".to_string(),
+                        content: "[interrupted]".to_string(),
+                        reasoning_content: None,
+                        tool_calls: Vec::new(),
+                        tool_call_id: Some(id),
+                        name: Some(name),
+                    });
+                }
+            }
+            i = j;
+            continue;
+        }
+        normalized.push(msg);
+        i += 1;
+    }
+    // Merge consecutive plain user messages so strict providers (vibe/claude/deepseek) never 400
+    let mut merged: Vec<ChatMessage> = Vec::with_capacity(normalized.len());
+    for msg in normalized {
+        if msg.role == "user"
+            && msg.tool_calls.is_empty()
+            && let Some(prev) = merged.last_mut()
+            && prev.role == "user"
+            && prev.tool_calls.is_empty()
+        {
+            if !prev.content.is_empty() && !msg.content.is_empty() {
+                prev.content.push_str("\n\n");
+            }
+            prev.content.push_str(&msg.content);
+            continue;
+        }
+        merged.push(msg);
+    }
+    *messages = merged;
+}
+
+fn is_transient_error(err: &BridgeError) -> bool {
+    let text = err.to_string();
+    text.contains("HTTP 429")
+        || text.contains("HTTP 502")
+        || text.contains("HTTP 503")
+        || text.contains("HTTP 504")
+        || text.contains("ReadTimeout")
+        || text.contains("ConnectError")
+}
+
+const TOOL_RESULT_MAX_BYTES: usize = 24 * 1024;
+
+pub fn cap_tool_output(text: &str) -> String {
+    if text.len() <= TOOL_RESULT_MAX_BYTES {
+        return text.to_string();
+    }
+    let mut head_end = 16 * 1024;
+    while head_end > 0 && !text.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = text.len().saturating_sub(6 * 1024);
+    while tail_start < text.len() && !text.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let omitted = tail_start.saturating_sub(head_end);
+    format!(
+        "{}\n...[truncated {omitted} bytes]...\n{}",
+        &text[..head_end],
+        &text[tail_start..]
+    )
+}
+
+fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|c| c.load(Ordering::SeqCst))
+}
+
+pub fn run_turn_loop<B: ProviderPort + PolicyPort + ExtensionPort>(
     bridge: &mut B,
     session: &mut SessionStore,
     telemetry: &TelemetryRecorder,
@@ -80,7 +221,7 @@ pub fn run_turn_loop<B: ProviderPort + PolicyPort>(
     run_turn_loop_streaming(bridge, session, telemetry, config, user_prompt, |_| {})
 }
 
-pub fn run_turn_loop_streaming<B: ProviderPort + PolicyPort>(
+pub fn run_turn_loop_streaming<B: ProviderPort + PolicyPort + ExtensionPort>(
     bridge: &mut B,
     session: &mut SessionStore,
     telemetry: &TelemetryRecorder,
@@ -103,32 +244,177 @@ pub fn run_turn_loop_streaming<B: ProviderPort + PolicyPort>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn run_turn_loop_interactive<B: ProviderPort + PolicyPort>(
+pub fn run_turn_loop_interactive<B: ProviderPort + PolicyPort + ExtensionPort>(
     bridge: &mut B,
     session: &mut SessionStore,
     telemetry: &TelemetryRecorder,
     todos: &mut TodoStore,
     config: &AgentConfig,
     user_prompt: &str,
+    on_event: impl FnMut(AgentEvent),
+    on_approval: impl FnMut(ApprovalRequest) -> ApprovalChoice,
+    on_ask_user: impl FnMut(Value) -> String,
+) -> Result<AssistantMessage, AgentError> {
+    run_turn_loop_with_mcp(
+        bridge,
+        session,
+        telemetry,
+        todos,
+        None,
+        config,
+        user_prompt,
+        on_event,
+        on_approval,
+        on_ask_user,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_turn_loop_with_mcp<B: ProviderPort + PolicyPort + ExtensionPort>(
+    bridge: &mut B,
+    session: &mut SessionStore,
+    telemetry: &TelemetryRecorder,
+    todos: &mut TodoStore,
+    mcp: Option<&mut McpManager>,
+    config: &AgentConfig,
+    user_prompt: &str,
+    on_event: impl FnMut(AgentEvent),
+    on_approval: impl FnMut(ApprovalRequest) -> ApprovalChoice,
+    on_ask_user: impl FnMut(Value) -> String,
+) -> Result<AssistantMessage, AgentError> {
+    run_turn_loop_cancellable(
+        bridge,
+        session,
+        telemetry,
+        todos,
+        mcp,
+        None,
+        config,
+        user_prompt,
+        on_event,
+        on_approval,
+        on_ask_user,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_turn_loop_cancellable<B: ProviderPort + PolicyPort + ExtensionPort>(
+    bridge: &mut B,
+    session: &mut SessionStore,
+    telemetry: &TelemetryRecorder,
+    todos: &mut TodoStore,
+    mut mcp: Option<&mut McpManager>,
+    cancel: Option<&AtomicBool>,
+    config: &AgentConfig,
+    user_prompt: &str,
     mut on_event: impl FnMut(AgentEvent),
     mut on_approval: impl FnMut(ApprovalRequest) -> ApprovalChoice,
     mut on_ask_user: impl FnMut(Value) -> String,
 ) -> Result<AssistantMessage, AgentError> {
-    session.append("user", user_prompt)?;
-    let mut messages: Vec<ChatMessage> = session
+    // Determine prior active mode from session before appending user turn
+    let prev_mode = session
         .active_branch()
         .into_iter()
-        .map(|entry| ChatMessage {
-            role: entry.role,
-            content: entry.content,
-            reasoning_content: None,
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            name: None,
-        })
-        .collect();
+        .rev()
+        .find(|e| e.kind == EntryKind::ModeChange)
+        .map(|e| e.content);
+    let mode_reminder = config
+        .mode_name
+        .as_deref()
+        .and_then(|cur| mode_transition_reminder(prev_mode.as_deref(), cur));
 
-    let tools: Vec<_> = builtin_tool_definitions()
+    session.append("user", user_prompt)?;
+    let mut messages: Vec<ChatMessage> = Vec::new();
+    for entry in session.active_branch() {
+        match entry.kind {
+            EntryKind::Message => {
+                messages.push(ChatMessage {
+                    role: entry.role,
+                    content: entry.content,
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    name: None,
+                });
+            }
+            EntryKind::CompactionSummary | EntryKind::BranchSummary => {
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: format!(
+                        "<session_summary>\n{}\n</session_summary>",
+                        entry.content
+                    ),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    name: None,
+                });
+                messages.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content: "Understood. I have the prior session summary and am ready to continue."
+                        .to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    name: None,
+                });
+            }
+            EntryKind::ToolCall => {
+                let args: Value = serde_json::from_str(&entry.content).unwrap_or_else(|_| Value::Object(Default::default()));
+                let tc = ToolCall {
+                    id: entry.tool_call_id.unwrap_or_default(),
+                    name: entry.tool_name.unwrap_or_default(),
+                    arguments: args,
+                    thought_signature: None,
+                };
+                if let Some(last) = messages.last_mut()
+                    && last.role == "assistant"
+                    && !last.tool_calls.is_empty()
+                {
+                    last.tool_calls.push(tc);
+                } else {
+                    messages.push(ChatMessage {
+                        role: "assistant".to_string(),
+                        content: String::new(),
+                        reasoning_content: None,
+                        tool_calls: vec![tc],
+                        tool_call_id: None,
+                        name: None,
+                    });
+                }
+            }
+            EntryKind::ToolResult => {
+                messages.push(ChatMessage {
+                    role: "tool".to_string(),
+                    content: entry.content,
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    tool_call_id: entry.tool_call_id,
+                    name: entry.tool_name,
+                });
+            }
+            EntryKind::ModelChange | EntryKind::ModeChange | EntryKind::SessionMeta => {}
+        }
+    }
+    sanitize_messages_for_provider(&config.provider, &mut messages);
+    if let Some(reminder) = mode_reminder {
+        let insert_idx = messages.len().saturating_sub(1);
+        messages.insert(
+            insert_idx,
+            ChatMessage {
+                role: "user".to_string(),
+                content: reminder,
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+            },
+        );
+    }
+
+    let ext_tools = bridge.list_extension_tools().unwrap_or_default();
+    let ext_tool_names: Vec<String> = ext_tools.iter().map(|t| t.name.clone()).collect();
+    let mut tools: Vec<_> = builtin_tool_definitions()
         .into_iter()
         .filter(|t| {
             config
@@ -137,26 +423,126 @@ pub fn run_turn_loop_interactive<B: ProviderPort + PolicyPort>(
                 .is_none_or(|allow| allow.iter().any(|a| a == &t.name))
         })
         .collect();
+    if config.allowed_tools.is_none() {
+        for ext in ext_tools {
+            if !tools.iter().any(|t| t.name == ext.name) {
+                tools.push(ext);
+            }
+        }
+        if let Some(mgr) = mcp.as_deref() {
+            for m_tool in mgr.tool_definitions() {
+                if !tools.iter().any(|t| t.name == m_tool.name) {
+                    tools.push(m_tool);
+                }
+            }
+        }
+    }
 
+    let mut last_partial_text = String::new();
     for turn in 0..config.max_turns {
+        if is_cancelled(cancel) {
+            let note = if last_partial_text.trim().is_empty() {
+                "[Interrupted by user]".to_string()
+            } else {
+                format!("{last_partial_text}\n\n[Interrupted by user]")
+            };
+            let _ = session.append("assistant", &note);
+            return Err(AgentError::Cancelled);
+        }
         on_event(AgentEvent::TurnStart { turn });
         let span = telemetry.record_span("agent.turn");
-        let reply = bridge.stream_complete(
-            CompletionRequest {
-                provider: config.provider.clone(),
-                model: config.model.clone(),
-                messages: messages.clone(),
-                system_prompt: config.system_prompt.clone(),
-                tools: tools.clone(),
-                thinking_level: config.thinking_level.clone(),
-            },
-            &mut |ev| match ev.kind.as_str() {
-                "thinking_delta" => on_event(AgentEvent::ThinkingDelta { delta: ev.delta }),
-                "text_delta" => on_event(AgentEvent::TextDelta { delta: ev.delta }),
-                _ => {}
-            },
-        )?;
+        sanitize_messages_for_provider(&config.provider, &mut messages);
+
+        let mut attempt = 0usize;
+        let reply = loop {
+            if is_cancelled(cancel) {
+                telemetry.finish_span(span);
+                let note = if last_partial_text.trim().is_empty() {
+                    "[Interrupted by user]".to_string()
+                } else {
+                    format!("{last_partial_text}\n\n[Interrupted by user]")
+                };
+                let _ = session.append("assistant", &note);
+                return Err(AgentError::Cancelled);
+            }
+            match bridge.stream_complete(
+                CompletionRequest {
+                    provider: config.provider.clone(),
+                    model: config.model.clone(),
+                    messages: messages.clone(),
+                    system_prompt: config.system_prompt.clone(),
+                    tools: tools.clone(),
+                    thinking_level: config.thinking_level.clone(),
+                },
+                &mut |ev| match ev.kind.as_str() {
+                    "thinking_delta" => on_event(AgentEvent::ThinkingDelta { delta: ev.delta }),
+                    "text_delta" => {
+                        last_partial_text.push_str(&ev.delta);
+                        on_event(AgentEvent::TextDelta { delta: ev.delta });
+                    }
+                    _ => {}
+                },
+            ) {
+                Ok(r) => break r,
+                Err(BridgeError::Cancelled) => {
+                    telemetry.finish_span(span);
+                    let note = if last_partial_text.trim().is_empty() {
+                        "[Interrupted by user]".to_string()
+                    } else {
+                        format!("{last_partial_text}\n\n[Interrupted by user]")
+                    };
+                    let _ = session.append("assistant", &note);
+                    return Err(AgentError::Cancelled);
+                }
+                Err(err)
+                    if attempt < config.max_retries
+                        && is_transient_error(&err)
+                        && !is_cancelled(cancel) =>
+                {
+                    attempt += 1;
+                    let delay_secs = match attempt {
+                        1 => 1,
+                        2 => 3,
+                        _ => 6,
+                    };
+                    let short_err: String = err.to_string().chars().take(60).collect();
+                    on_event(AgentEvent::Status {
+                        text: format!(
+                            "Transient error ({short_err}) — retrying ({attempt}/{}) in {delay_secs}s...",
+                            config.max_retries
+                        ),
+                    });
+                    for _ in 0..(delay_secs * 20) {
+                        if is_cancelled(cancel) {
+                            telemetry.finish_span(span);
+                            let note = if last_partial_text.trim().is_empty() {
+                                "[Interrupted by user]".to_string()
+                            } else {
+                                format!("{last_partial_text}\n\n[Interrupted by user]")
+                            };
+                            let _ = session.append("assistant", &note);
+                            return Err(AgentError::Cancelled);
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+                Err(err) => {
+                    telemetry.finish_span(span);
+                    let note = if last_partial_text.trim().is_empty() {
+                        format!("[Turn interrupted: {err}]")
+                    } else {
+                        format!("{last_partial_text}\n\n[Turn interrupted: {err}]")
+                    };
+                    let _ = session.append("assistant", &note);
+                    return Err(AgentError::Bridge(err));
+                }
+            }
+        };
         telemetry.finish_span(span);
+
+        if !reply.content.trim().is_empty() {
+            last_partial_text = reply.content.clone();
+        }
 
         if reply.tool_calls.is_empty() {
             session.append("assistant", &reply.content)?;
@@ -176,17 +562,143 @@ pub fn run_turn_loop_interactive<B: ProviderPort + PolicyPort>(
         });
 
         for tc in &reply.tool_calls {
+            if is_cancelled(cancel) {
+                let note = if last_partial_text.trim().is_empty() {
+                    "[Interrupted by user]".to_string()
+                } else {
+                    format!("{last_partial_text}\n\n[Interrupted by user]")
+                };
+                let _ = session.append("assistant", &note);
+                return Err(AgentError::Cancelled);
+            }
             on_event(AgentEvent::ToolCallStart {
                 id: tc.id.clone(),
                 name: tc.name.clone(),
             });
-            let (output, is_error) = if tc.name == "todo" {
+            let hook_res = bridge
+                .invoke_hook(
+                    "before_tool_call",
+                    serde_json::json!({ "tool": tc.name, "arguments": tc.arguments }),
+                )
+                .unwrap_or(Value::Null);
+            let blocked_reason = if hook_res.get("blocked").and_then(Value::as_bool) == Some(true) {
+                Some(
+                    hook_res
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Blocked by extension hook.")
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+            let (output, is_error) = if let Some(reason) = blocked_reason {
+                (reason, true)
+            } else if tc.name == "todo" {
                 match execute_todo_tool(todos, &tc.arguments) {
                     Ok(out) => (out, false),
                     Err(err) => (format!("Tool error: {err}"), true),
                 }
             } else if tc.name == "ask_user_question" {
                 (on_ask_user(tc.arguments.clone()), false)
+            } else if ext_tool_names.iter().any(|n| n == &tc.name) {
+                let cmd = tc
+                    .arguments
+                    .get("command")
+                    .and_then(Value::as_str);
+                let path = tc
+                    .arguments
+                    .get("path")
+                    .and_then(Value::as_str);
+                match bridge.evaluate_tool_call(&tc.name, cmd, path) {
+                    Ok(dec) if dec.action == "deny" => (format!("Policy denied: {}", dec.reason), true),
+                    Ok(dec) if dec.action == "ask" => {
+                        let choice = on_approval(ApprovalRequest {
+                            tool_name: tc.name.clone(),
+                            command: cmd.map(ToString::to_string),
+                            target_path: path.map(ToString::to_string),
+                            reason: dec.reason,
+                        });
+                        match choice {
+                            ApprovalChoice::Deny => ("Tool call denied by user.".to_string(), true),
+                            ApprovalChoice::AllowSession => {
+                                let _ = bridge.grant_rule(&tc.name, cmd, path);
+                                match bridge.execute_extension_tool(&tc.name, tc.arguments.clone()) {
+                                    Ok(val) => (serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string()), false),
+                                    Err(err) => (format!("Extension tool error: {err}"), true),
+                                }
+                            }
+                            ApprovalChoice::AllowYolo => {
+                                let _ = bridge.set_yolo(true);
+                                match bridge.execute_extension_tool(&tc.name, tc.arguments.clone()) {
+                                    Ok(val) => (serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string()), false),
+                                    Err(err) => (format!("Extension tool error: {err}"), true),
+                                }
+                            }
+                            ApprovalChoice::AllowOnce => {
+                                match bridge.execute_extension_tool(&tc.name, tc.arguments.clone()) {
+                                    Ok(val) => (serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string()), false),
+                                    Err(err) => (format!("Extension tool error: {err}"), true),
+                                }
+                            }
+                        }
+                    }
+                    Ok(_) => match bridge.execute_extension_tool(&tc.name, tc.arguments.clone()) {
+                        Ok(val) => (serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string()), false),
+                        Err(err) => (format!("Extension tool error: {err}"), true),
+                    },
+                    Err(err) => (format!("Policy error: {err}"), true),
+                }
+            } else if tc.name.starts_with("mcp__") {
+                match bridge.evaluate_tool_call(&tc.name, None, None) {
+                    Ok(dec) if dec.action == "deny" => (format!("Policy denied: {}", dec.reason), true),
+                    Ok(dec) if dec.action == "ask" => {
+                        let choice = on_approval(ApprovalRequest {
+                            tool_name: tc.name.clone(),
+                            command: None,
+                            target_path: None,
+                            reason: dec.reason,
+                        });
+                        match choice {
+                            ApprovalChoice::Deny => ("Tool call denied by user.".to_string(), true),
+                            ApprovalChoice::AllowSession => {
+                                let _ = bridge.grant_rule(&tc.name, None, None);
+                                match mcp.as_deref_mut() {
+                                    Some(mgr) => match mgr.call_namespaced_tool(&tc.name, tc.arguments.clone()) {
+                                        Ok(out) => (out, false),
+                                        Err(err) => (format!("MCP tool error: {err}"), true),
+                                    },
+                                    None => ("MCP manager unavailable.".to_string(), true),
+                                }
+                            }
+                            ApprovalChoice::AllowYolo => {
+                                let _ = bridge.set_yolo(true);
+                                match mcp.as_deref_mut() {
+                                    Some(mgr) => match mgr.call_namespaced_tool(&tc.name, tc.arguments.clone()) {
+                                        Ok(out) => (out, false),
+                                        Err(err) => (format!("MCP tool error: {err}"), true),
+                                    },
+                                    None => ("MCP manager unavailable.".to_string(), true),
+                                }
+                            }
+                            ApprovalChoice::AllowOnce => match mcp.as_deref_mut() {
+                                Some(mgr) => match mgr.call_namespaced_tool(&tc.name, tc.arguments.clone()) {
+                                    Ok(out) => (out, false),
+                                    Err(err) => (format!("MCP tool error: {err}"), true),
+                                },
+                                None => ("MCP manager unavailable.".to_string(), true),
+                            },
+                        }
+                    }
+                    Ok(_) => match mcp.as_deref_mut() {
+                        Some(mgr) => match mgr.call_namespaced_tool(&tc.name, tc.arguments.clone()) {
+                            Ok(out) => (out, false),
+                            Err(err) => (format!("MCP tool error: {err}"), true),
+                        },
+                        None => ("MCP manager unavailable.".to_string(), true),
+                    },
+                    Err(err) => (format!("Policy error: {err}"), true),
+                }
             } else {
                 match execute_builtin_tool(bridge, &tc.name, &tc.arguments) {
                     Ok(out) => (out, false),
@@ -240,6 +752,22 @@ pub fn run_turn_loop_interactive<B: ProviderPort + PolicyPort>(
                     Err(err) => (format!("Tool error: {err}"), true),
                 }
             };
+            let preview: String = output.lines().take(8).collect::<Vec<_>>().join("\n");
+            let _ = bridge.invoke_hook(
+                "after_tool_call",
+                serde_json::json!({
+                    "tool": tc.name,
+                    "is_error": is_error,
+                    "output": preview,
+                }),
+            );
+            let _ = session.append_tool_call(
+                &tc.id,
+                &tc.name,
+                serde_json::to_string(&tc.arguments).unwrap_or_else(|_| "{}".to_string()),
+            );
+            let capped_output = cap_tool_output(&output);
+            let _ = session.append_tool_result(&tc.id, &tc.name, &capped_output);
             on_event(AgentEvent::ToolCallEnd {
                 id: tc.id.clone(),
                 name: tc.name.clone(),
@@ -248,7 +776,7 @@ pub fn run_turn_loop_interactive<B: ProviderPort + PolicyPort>(
             });
             messages.push(ChatMessage {
                 role: "tool".to_string(),
-                content: output,
+                content: capped_output,
                 reasoning_content: None,
                 tool_calls: Vec::new(),
                 tool_call_id: Some(tc.id.clone()),
@@ -257,6 +785,15 @@ pub fn run_turn_loop_interactive<B: ProviderPort + PolicyPort>(
         }
     }
 
+    let note = if last_partial_text.trim().is_empty() {
+        format!("[Turn stopped: max turns exceeded ({})]", config.max_turns)
+    } else {
+        format!(
+            "{last_partial_text}\n\n[Turn stopped: max turns exceeded ({})]",
+            config.max_turns
+        )
+    };
+    let _ = session.append("assistant", &note);
     Err(AgentError::MaxTurnsExceeded(config.max_turns))
 }
 
@@ -320,19 +857,24 @@ mod tests {
         }
     }
 
-    impl PolicyPort for MockBridge {
-        fn evaluate_tool_call(
-            &mut self,
-            _tool_name: &str,
-            _command: Option<&str>,
-            _target_path: Option<&str>,
-        ) -> Result<PolicyDecision, BridgeError> {
-            Ok(PolicyDecision {
-                action: "allow".into(),
-                reason: "ok".into(),
-            })
+        impl PolicyPort for MockBridge {
+            fn evaluate_tool_call(
+                &mut self,
+                _tool_name: &str,
+                _command: Option<&str>,
+                _target_path: Option<&str>,
+            ) -> Result<PolicyDecision, BridgeError> {
+                Ok(PolicyDecision {
+                    action: "allow".into(),
+                    reason: "ok".into(),
+                })
+            }
         }
-    }
+        impl ExtensionPort for MockBridge {
+            fn invoke_hook(&mut self, _event: &str, payload: Value) -> Result<Value, BridgeError> {
+                Ok(payload)
+            }
+        }
 
     #[test]
     fn executes_tool_call_and_emits_streaming_events() {
@@ -347,7 +889,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(msg.content, "Handled missing file.");
-        assert_eq!(session.entries().len(), 2);
+        assert_eq!(session.entries().len(), 4);
         assert_eq!(telemetry.spans().len(), 2);
         assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolCallStart { name, .. } if name == "read")));
         assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnEnd { .. })));
@@ -422,6 +964,11 @@ mod tests {
                 })
             }
         }
+        impl ExtensionPort for AskWriteBridge {
+            fn invoke_hook(&mut self, _event: &str, payload: Value) -> Result<Value, BridgeError> {
+                Ok(payload)
+            }
+        }
 
         let mut bridge = AskWriteBridge {
             step: 0,
@@ -459,5 +1006,359 @@ mod tests {
         assert!(tool_outputs[0].1);
         assert_eq!(tool_outputs[0].0, "Tool call denied by user.");
         assert!(!std::path::Path::new("should_not_exist.txt").exists());
+    }
+
+    #[test]
+    fn extension_hook_blocks_and_extension_tool_executes() {
+        struct ExtBridge {
+            step: usize,
+            after_called: bool,
+        }
+        impl ProviderPort for ExtBridge {
+            fn list_providers(&mut self) -> Result<Vec<String>, BridgeError> {
+                Ok(vec!["deepseek".into()])
+            }
+            fn list_models(&mut self, _p: Option<&str>) -> Result<Vec<ModelSpec>, BridgeError> {
+                Ok(vec![])
+            }
+            fn complete(&mut self, _req: CompletionRequest) -> Result<AssistantMessage, BridgeError> {
+                self.step += 1;
+                if self.step == 1 {
+                    Ok(AssistantMessage {
+                        provider: "deepseek".into(),
+                        model: "deepseek-v4-pro".into(),
+                        content: String::new(),
+                        reasoning_content: None,
+                        tool_calls: vec![
+                            ToolCall {
+                                id: "tc_block".into(),
+                                name: "read".into(),
+                                arguments: json!({"path": ".env"}),
+                                thought_signature: None,
+                            },
+                            ToolCall {
+                                id: "tc_ext".into(),
+                                name: "project_stats".into(),
+                                arguments: json!({"path": "."}),
+                                thought_signature: None,
+                            },
+                        ],
+                        stop_reason: "tool_calls".into(),
+                        usage: Usage {
+                            input_tokens: 1,
+                            output_tokens: 1,
+                            cache_read_tokens: 0,
+                            cache_write_tokens: 0,
+                            cost_usd: 0.0,
+                        },
+                    })
+                } else {
+                    Ok(AssistantMessage {
+                        provider: "deepseek".into(),
+                        model: "deepseek-v4-pro".into(),
+                        content: "Handled extensions.".into(),
+                        reasoning_content: None,
+                        tool_calls: vec![],
+                        stop_reason: "stop".into(),
+                        usage: Usage {
+                            input_tokens: 1,
+                            output_tokens: 1,
+                            cache_read_tokens: 0,
+                            cache_write_tokens: 0,
+                            cost_usd: 0.0,
+                        },
+                    })
+                }
+            }
+        }
+        impl PolicyPort for ExtBridge {
+            fn evaluate_tool_call(
+                &mut self,
+                _tool_name: &str,
+                _command: Option<&str>,
+                _target_path: Option<&str>,
+            ) -> Result<PolicyDecision, BridgeError> {
+                Ok(PolicyDecision {
+                    action: "allow".into(),
+                    reason: "ok".into(),
+                })
+            }
+        }
+        impl ExtensionPort for ExtBridge {
+            fn invoke_hook(&mut self, event: &str, payload: Value) -> Result<Value, BridgeError> {
+                if event == "before_tool_call"
+                    && payload.get("tool").and_then(Value::as_str) == Some("read")
+                {
+                    return Ok(json!({ "blocked": true, "reason": "Blocked .env" }));
+                }
+                if event == "after_tool_call" {
+                    self.after_called = true;
+                }
+                Ok(payload)
+            }
+            fn list_extension_tools(&mut self) -> Result<Vec<le_vibe_pybridge::ToolDefinition>, BridgeError> {
+                Ok(vec![le_vibe_pybridge::ToolDefinition {
+                    name: "project_stats".into(),
+                    description: "stats".into(),
+                    parameters: json!({"type": "object"}),
+                }])
+            }
+            fn execute_extension_tool(&mut self, name: &str, _args: Value) -> Result<Value, BridgeError> {
+                assert_eq!(name, "project_stats");
+                Ok(json!({"total_files": 42}))
+            }
+        }
+
+        let mut bridge = ExtBridge {
+            step: 0,
+            after_called: false,
+        };
+        let mut session = SessionStore::in_memory();
+        let telemetry = TelemetryRecorder::new();
+        let mut todos = TodoStore::new();
+        let cfg = AgentConfig::default();
+
+        let mut results = Vec::new();
+        let msg = run_turn_loop_interactive(
+            &mut bridge,
+            &mut session,
+            &telemetry,
+            &mut todos,
+            &cfg,
+            "run",
+            |ev| {
+                if let AgentEvent::ToolCallEnd { name, is_error, output, .. } = ev {
+                    results.push((name, is_error, output));
+                }
+            },
+            |_| ApprovalChoice::AllowOnce,
+            |_| String::new(),
+        )
+        .unwrap();
+
+        assert_eq!(msg.content, "Handled extensions.");
+        assert!(bridge.after_called);
+        assert_eq!(results[0], ("read".into(), true, "Blocked .env".into()));
+        assert_eq!(results[1].0, "project_stats");
+        assert!(!results[1].1);
+        assert!(results[1].2.contains("42"));
+    }
+
+    #[test]
+    fn cancellation_persists_partial_and_returns_cancelled() {
+        let cancel = AtomicBool::new(true);
+        let mut bridge = MockBridge { step: 0 };
+        let mut session = SessionStore::in_memory();
+        let telemetry = TelemetryRecorder::new();
+        let mut todos = TodoStore::new();
+        let cfg = AgentConfig::default();
+
+        let err = run_turn_loop_cancellable(
+            &mut bridge,
+            &mut session,
+            &telemetry,
+            &mut todos,
+            None,
+            Some(&cancel),
+            &cfg,
+            "abort me",
+            |_| {},
+            |_| ApprovalChoice::Deny,
+            |_| String::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AgentError::Cancelled));
+        assert!(
+            session
+                .entries()
+                .last()
+                .is_some_and(|e| e.content.contains("[Interrupted by user]"))
+        );
+    }
+
+    #[test]
+    fn transient_503_retries_and_succeeds() {
+        struct FlakyBridge {
+            attempts: usize,
+        }
+        impl ProviderPort for FlakyBridge {
+            fn list_providers(&mut self) -> Result<Vec<String>, BridgeError> {
+                Ok(vec!["vibe".into()])
+            }
+            fn list_models(&mut self, _p: Option<&str>) -> Result<Vec<ModelSpec>, BridgeError> {
+                Ok(vec![])
+            }
+            fn complete(&mut self, _req: CompletionRequest) -> Result<AssistantMessage, BridgeError> {
+                self.attempts += 1;
+                if self.attempts == 1 {
+                    return Err(BridgeError::Remote {
+                        kind: "RuntimeError".into(),
+                        message: "HTTP 503 Service Unavailable".into(),
+                    });
+                }
+                Ok(AssistantMessage {
+                    provider: "vibe".into(),
+                    model: "mistral-large-4-0".into(),
+                    content: "Recovered!".into(),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: "stop".into(),
+                    usage: Usage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cache_read_tokens: 0,
+                        cache_write_tokens: 0,
+                        cost_usd: 0.0,
+                    },
+                })
+            }
+        }
+        impl PolicyPort for FlakyBridge {
+            fn evaluate_tool_call(
+                &mut self,
+                _tool_name: &str,
+                _command: Option<&str>,
+                _target_path: Option<&str>,
+            ) -> Result<PolicyDecision, BridgeError> {
+                Ok(PolicyDecision {
+                    action: "allow".into(),
+                    reason: "ok".into(),
+                })
+            }
+        }
+        impl ExtensionPort for FlakyBridge {
+            fn invoke_hook(&mut self, _event: &str, payload: Value) -> Result<Value, BridgeError> {
+                Ok(payload)
+            }
+        }
+
+        let mut bridge = FlakyBridge { attempts: 0 };
+        let mut session = SessionStore::in_memory();
+        let telemetry = TelemetryRecorder::new();
+        let cfg = AgentConfig::default();
+        let mut statuses = Vec::new();
+        let msg = run_turn_loop_streaming(&mut bridge, &mut session, &telemetry, &cfg, "hi", |ev| {
+            if let AgentEvent::Status { text } = ev {
+                statuses.push(text);
+            }
+        })
+        .unwrap();
+        assert_eq!(msg.content, "Recovered!");
+        assert_eq!(bridge.attempts, 2);
+        assert_eq!(statuses.len(), 1);
+    }
+
+    #[test]
+    fn sanitizes_cross_provider_messages_and_prunes_stale_mode_reminders() {
+        let mut msgs = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: format!("{MODE_REMINDER_PREFIX} to PLAN.</system-reminder>"),
+                reasoning_content: None,
+                tool_calls: vec![],
+                tool_call_id: None,
+                name: None,
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: String::new(),
+                reasoning_content: Some("foreign thought".into()),
+                tool_calls: vec![ToolCall {
+                    id: "tc_1".into(),
+                    name: "read".into(),
+                    arguments: json!({"path": "README.md"}),
+                    thought_signature: Some("sig_agy".into()),
+                }],
+                tool_call_id: None,
+                name: None,
+            },
+        ];
+        sanitize_messages_for_provider("vibe", &mut msgs);
+        assert_eq!(msgs.len(), 2); // assistant + synthesized [interrupted] tool result; stale reminder pruned
+        assert_eq!(msgs[0].reasoning_content, None);
+        assert_eq!(msgs[0].tool_calls[0].thought_signature, None);
+        assert_eq!(msgs[1].role, "tool");
+        assert_eq!(msgs[1].content, "[interrupted]");
+        assert_eq!(msgs[1].tool_call_id.as_deref(), Some("tc_1"));
+    }
+
+    #[test]
+    fn mode_transition_reminder_is_edge_triggered() {
+        assert!(mode_transition_reminder(Some("plan"), "plan").is_none());
+        let to_plan = mode_transition_reminder(Some("normal"), "plan").unwrap();
+        assert!(to_plan.contains("read-only"));
+        let to_cyber = mode_transition_reminder(Some("plan"), "cyber").unwrap();
+        assert!(to_cyber.contains("no longer in read-only"));
+    }
+
+    #[test]
+    fn compaction_and_handover_replay_produces_valid_role_alternation() {
+        struct CaptureBridge {
+            seen_messages: Vec<ChatMessage>,
+        }
+        impl ProviderPort for CaptureBridge {
+            fn list_providers(&mut self) -> Result<Vec<String>, BridgeError> {
+                Ok(vec!["vibe".into()])
+            }
+            fn list_models(&mut self, _p: Option<&str>) -> Result<Vec<ModelSpec>, BridgeError> {
+                Ok(vec![])
+            }
+            fn complete(&mut self, req: CompletionRequest) -> Result<AssistantMessage, BridgeError> {
+                self.seen_messages = req.messages;
+                Ok(AssistantMessage {
+                    provider: "vibe".into(),
+                    model: "mistral-large-4-0".into(),
+                    content: "Ready!".into(),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: "stop".into(),
+                    usage: Usage {
+                        input_tokens: 10,
+                        output_tokens: 2,
+                        cache_read_tokens: 0,
+                        cache_write_tokens: 0,
+                        cost_usd: 0.0,
+                    },
+                })
+            }
+        }
+        impl PolicyPort for CaptureBridge {
+            fn evaluate_tool_call(
+                &mut self,
+                _tool_name: &str,
+                _command: Option<&str>,
+                _target_path: Option<&str>,
+            ) -> Result<PolicyDecision, BridgeError> {
+                Ok(PolicyDecision {
+                    action: "allow".into(),
+                    reason: "ok".into(),
+                })
+            }
+        }
+        impl ExtensionPort for CaptureBridge {
+            fn invoke_hook(&mut self, _event: &str, payload: Value) -> Result<Value, BridgeError> {
+                Ok(payload)
+            }
+        }
+
+        let mut session = SessionStore::in_memory();
+        session
+            .append_compaction("Goal: fix auth. Files: auth.rs.")
+            .unwrap();
+        let mut bridge = CaptureBridge {
+            seen_messages: Vec::new(),
+        };
+        let telemetry = TelemetryRecorder::new();
+        let cfg = AgentConfig {
+            provider: "vibe".into(),
+            model: "mistral-large-4-0".into(),
+            ..Default::default()
+        };
+        let reply = run_turn_loop(&mut bridge, &mut session, &telemetry, &cfg, "continue now").unwrap();
+        assert_eq!(reply.content, "Ready!");
+        let roles: Vec<&str> = bridge.seen_messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["user", "assistant", "user"]);
+        assert!(bridge.seen_messages[0].content.contains("<session_summary>"));
+        assert_eq!(bridge.seen_messages[2].content, "continue now");
     }
 }

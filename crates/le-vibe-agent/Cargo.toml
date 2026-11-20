@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 le-vibe-durable = { path = "../le-vibe-durable" }
+le-vibe-mcp = { path = "../le-vibe-mcp" }
 le-vibe-pybridge = { path = "../le-vibe-pybridge" }
 le-vibe-telemetry = { path = "../le-vibe-telemetry" }
 le-vibe-tools = { path = "../le-vibe-tools" }

@@ -1,0 +1,28 @@
+{
+  "trusted_folders": ["."],
+  "tool_permissions": {
+    "read": "always",
+    "grep": "always",
+    "find": "always",
+    "ls": "always",
+    "todo": "always",
+    "ask_user_question": "always",
+    "write": "ask",
+    "edit": "ask",
+    "bash": "ask",
+    "powershell": "ask"
+  },
+  "allowed_commands": [
+    "git status",
+    "git diff *",
+    "git log *",
+    "cargo test *",
+    "cargo check *",
+    "pytest *"
+  ],
+  "allowed_paths": [],
+  "blocked_commands": [
+    "git push --force",
+    "git reset --hard"
+  ]
+}

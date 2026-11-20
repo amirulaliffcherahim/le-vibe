@@ -4,6 +4,16 @@ Chronological timeline of milestones on `master` (`https://github.com/amirulalif
 
 ---
 
+## 2026-11-21 — v0.2.0-beta.1: Production Rust TUI, Hybrid RAG Memory v2, Layered /config, MCP & Self-Optimization
+
+- **Rust Hybrid RAG Memory v2 (`crates/le-vibe-tools/src/memory.rs`)**: Pure-Rust Lucene-IDF BM25 + 512-dim scaled `i8` cosine vector cache (`rag-cache.bin`) + RRF, partitioned by git root (`~/.le-vibe/projects/<hash>/memory/`) with zero git noise, dual-emit `camelCase`/`snake_case` tokenizer, `keywords` write-time expansion, `key` upsert, `memory_delete`, daily recency decay, adaptive inlining, session-pinned `<memory_toc>`, pre-compaction memory flush, and `/memory`.
+- **Modularized Rust Workspace & Production TUI**: Split `le-vibe-tui` into 10 focused modules and `le-vibe-cli` into 6 modules; added Markdown renderer, dirty-driven redraw loop, 16ms input burst draining, collapsible thinking (`Ctrl+T`) & tool (`Ctrl+O`) cards, live Todo strip, `@file` fuzzy autocomplete, default `Ctrl+V`/drag-and-drop image & file paste with native multimodal forwarding (`vibe` `image_url`, `agy` `inlineData`), and `TestBackend` render tests (`40x12` & `140x40`).
+- **Instant `Esc` Cancel, Retry, Steering & Mid-Session Switching**: Background stdout reader thread in `le-vibe-pybridge` aborts in-flight streams within 25ms and replays `yolo` + `granted_rules` on respawn; added 429/5xx exponential backoff retry, prompt queueing while busy, cross-provider message sanitization, and OpenCode-style edge-triggered mode transitions (`normal`, `plan`, `ask`, `rea`, `cyber`).
+- **Layered `/config` & New Slash Commands**: Upgraded `/config` to 16 searchable settings across `user`/`project`/`session` scopes; added `/policy`, `/rewind` (user-input checkpoints), `/rename`, `/status`, `/context`, `/clone`, `/handover`, `/export` (`.md`/`.html`), `/report` (bug report PDF), `/loop`, `/plugins`, `/reload-plugins` (custom plugin `/` commands), `/suggestion` (session-driven self-optimization), `/copy`, `/help`, `/trust`, `/changelog`, and `/mcp`.
+- **Native MCP, CLI Parity, Examples & Docs**: Wired `le-vibe-mcp` (`McpManager` + `mcp.json`); added `--help`, `--version`, `-p`, piped stdin, `@file`, `--no-session`, `--fork`, `--tools`, `--export`; added `examples/example.md` + 3 Python extensions + 3 JSON policies; added 7 `docs/*.md` guides; added compile-time-gated dev debugger (`F12` + `~/.le-vibe/logs/`, stripped in `--no-default-features` official releases).
+
+---
+
 ## 2026-11-20 — Permissions, YOLO, Todo, Ask-User, /config & Main Branch Cutover
 
 - **`1c88849f7`** — Added `/config` interactive settings modal (Theme, Terminal Shell, Agent Mode, YOLO, Thinking Level, Reduced Motion) persisted in `~/.le-vibe/settings.json`.

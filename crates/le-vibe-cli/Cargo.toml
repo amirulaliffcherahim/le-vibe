@@ -8,11 +8,17 @@ license.workspace = true
 name = "le-vibe"
 path = "src/main.rs"
 
+[features]
+default = ["dev-debug"]
+dev-debug = []
+
 [dependencies]
 le-vibe-agent = { path = "../le-vibe-agent" }
 le-vibe-durable = { path = "../le-vibe-durable" }
+le-vibe-mcp = { path = "../le-vibe-mcp" }
 le-vibe-pybridge = { path = "../le-vibe-pybridge" }
 le-vibe-telemetry = { path = "../le-vibe-telemetry" }
 le-vibe-tools = { path = "../le-vibe-tools" }
 le-vibe-tui = { path = "../le-vibe-tui" }
+serde = { workspace = true }
 serde_json = { workspace = true }

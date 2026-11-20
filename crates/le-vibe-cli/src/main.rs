@@ -1,62 +1,41 @@
-use le_vibe_agent::{
-    AgentConfig, AgentEvent, ApprovalChoice, run_turn_loop_interactive, run_turn_loop_streaming,
-};
+mod cli;
+mod debug_log;
+mod features;
+mod rpc;
+mod settings;
+mod worker;
+
+use le_vibe_agent::{AgentConfig, AgentEvent, ApprovalChoice};
 use le_vibe_durable::SessionStore;
 use le_vibe_pybridge::{PolicyPort, ProviderPort, PythonBridge};
 use le_vibe_telemetry::TelemetryRecorder;
-use le_vibe_tools::TodoStore;
 use le_vibe_tui::{
     ALL_SHELLS, ALL_THEMES, ActiveModal, AgentMode, TerminalGuard, ThemeId, TranscriptBlock,
-    TuiAction, TuiState, draw_frame, format_tokens, poll_tui_action, render_status_bar,
+    TuiAction, TuiState, build_system_prompt, draw_frame, export_session_html,
+    export_session_markdown, format_tokens, poll_tui_action, render_status_bar,
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::fs;
-use std::io::{self, BufRead, Write};
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::mpsc;
+use std::io::{self, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-fn resolve_python_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("LE_VIBE_PYTHON_DIR") {
-        return PathBuf::from(dir);
-    }
-    let cwd_python = PathBuf::from("python");
-    if cwd_python.exists() {
-        return cwd_python;
-    }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|root| root.join("python"))
-        .unwrap_or(cwd_python)
-}
-
-fn resolve_python_exe(python_dir: &Path) -> String {
-    let venv_win = python_dir.join(".venv").join("Scripts").join("python.exe");
-    if venv_win.exists() {
-        return venv_win.to_string_lossy().to_string();
-    }
-    let venv_unix = python_dir.join(".venv").join("bin").join("python");
-    if venv_unix.exists() {
-        return venv_unix.to_string_lossy().to_string();
-    }
-    "python".to_string()
-}
-
-fn arg_value(args: &[String], flag: &str) -> Option<String> {
-    args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
-}
-
-/// The model a provider starts on: whatever its live catalog recommends.
-/// Nothing is hardcoded, so a provider that is not connected yields no model.
-fn default_model_for(bridge: &mut PythonBridge, provider: &str) -> String {
-    bridge.default_model(provider).unwrap_or_default()
-}
-
-fn provider_arg(args: &[String]) -> String {
-    arg_value(args, "--provider").unwrap_or_else(|| "vibe".to_string())
-}
+use crate::cli::{CliAction, build_initial_prompt, help_text, parse_cli_args};
+use crate::debug_log::{DEBUG_ENABLED, EventLogger};
+use crate::features::{
+    LoopScheduler, PastedItem, build_optimization_digest, classify_pasted_text,
+    grab_clipboard_item, parse_loop_spec,
+};
+use crate::rpc::{run_rpc_mode, run_streaming_prompt};
+use crate::settings::{
+    arg_value, current_git_branch, current_repo_name, cwd_string, default_mcp_paths,
+    default_model_for, format_cwd, load_history, load_layered_settings, load_scope,
+    open_session_with_opts, provider_arg, resolve_python_dir, resolve_python_exe, save_history,
+    save_scope, save_setting, save_setting_for_scope, scan_workspace_files, self_repo_path,
+    sessions_dir, summarize_git_status, trust_cwd_in_policy,
+};
+use crate::worker::{WorkerCmd, WorkerMsg, refresh_state, spawn_tui_worker, update_quota_badges, usage_report};
 
 fn prompt_line(label: &str) -> String {
     print!("{label}");
@@ -118,1214 +97,179 @@ fn handle_login(bridge: &mut PythonBridge, args: &[String]) {
     }
 }
 
-fn run_streaming_prompt(
-    bridge: &mut PythonBridge,
-    session: &mut SessionStore,
-    telemetry: &TelemetryRecorder,
-    cfg: &AgentConfig,
-    prompt: &str,
-    json_mode: bool,
-) {
-    let res = run_turn_loop_streaming(bridge, session, telemetry, cfg, prompt, |ev| {
-        if json_mode {
-            println!("{}", serde_json::to_string(&ev).unwrap());
-            return;
-        }
-        match ev {
-            AgentEvent::TextDelta { delta } => {
-                print!("{delta}");
-                let _ = io::stdout().flush();
-            }
-            AgentEvent::ToolCallStart { name, .. } => {
-                eprintln!("\n[tool:{name}]");
-            }
-            _ => {}
-        }
-    });
-    if !json_mode {
-        println!();
-    }
-    if let Err(err) = res {
-        eprintln!("Error: {err}");
-        if json_mode {
-            std::process::exit(1);
-        }
-    }
-}
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let python_dir = resolve_python_dir();
-    let python_exe = resolve_python_exe(&python_dir);
-    let mut bridge = PythonBridge::spawn(&python_exe, &python_dir)
-        .expect("failed to start le-vibe Python bridge");
+    let action = parse_cli_args(&args);
 
-    match args.first().map(String::as_str) {
-        Some("login") => {
-            handle_login(&mut bridge, &args[1..]);
+    match action {
+        CliAction::Help => {
+            println!("{}", help_text());
             return;
         }
-        Some("logout") => {
-            let provider = arg_value(&args[1..], "--provider").unwrap_or_else(|| "vibe".to_string());
-            match bridge.logout(&provider) {
-                Ok(true) => println!("Removed saved credentials for {provider}"),
-                Ok(false) => println!("No saved credentials found for {provider}"),
-                Err(err) => {
-                    eprintln!("Logout failed: {err}");
-                    std::process::exit(1);
+        CliAction::Version => {
+            println!("le-vibe {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        CliAction::Subcommand(ref sub, ref sub_args) if sub == "mcp" => {
+            if sub_args.first().map(String::as_str) == Some("list") || sub_args.is_empty() {
+                let mgr = le_vibe_mcp::McpManager::from_config_files(&default_mcp_paths());
+                let summary = mgr.status_summary();
+                if summary.is_empty() {
+                    println!("No MCP servers configured (~/.le-vibe/mcp.json or .le-vibe/mcp.json).");
+                } else {
+                    for (name, status) in summary {
+                        println!("{name}: {status}");
+                    }
                 }
+            } else {
+                eprintln!("Usage: le-vibe mcp list");
+                std::process::exit(1);
             }
             return;
         }
-        Some("auth") => {
-            let status = bridge.auth_status().expect("auth status");
-            println!("{}", serde_json::to_string_pretty(&status).unwrap());
-            return;
-        }
-        Some("usage") => {
+        CliAction::ExportOffline { input, output } => {
+            let session = SessionStore::open(&input).expect("failed to open session file");
             let mut state = TuiState::new(
-                provider_arg(&args[1..]),
-                String::new(),
+                "session".into(),
+                "export".into(),
                 format_cwd(),
                 current_git_branch(),
             );
-            refresh_state(&mut bridge, &mut state, false);
-            let live = bridge.fetch_usage(None).unwrap_or(Value::Null);
-            println!("{}", usage_report(&state, &live));
+            for entry in session.active_branch() {
+                match entry.role.as_str() {
+                    "user" => state.blocks.push(TranscriptBlock::User(entry.content)),
+                    "assistant" => state.blocks.push(TranscriptBlock::Assistant(entry.content)),
+                    _ => state.blocks.push(TranscriptBlock::System(entry.content)),
+                }
+            }
+            let out_path = output.unwrap_or_else(|| format!("{input}.html"));
+            let content = if out_path.ends_with(".md") {
+                export_session_markdown(&state)
+            } else {
+                export_session_html(&state)
+            };
+            fs::write(&out_path, content).expect("failed to write export");
+            println!("Exported {out_path}");
             return;
         }
         _ => {}
     }
 
-    if args.iter().any(|a| a == "--list-models") {
-        let models = bridge
-            .refresh_models(None)
-            .or_else(|_| bridge.list_models(None))
-            .expect("list models");
-        for m in models {
-            println!("{}/{} ({})", m.provider, m.id, m.name);
-        }
-        return;
-    }
+    let python_dir = resolve_python_dir();
+    let python_exe = resolve_python_exe(&python_dir);
+    let mut bridge = PythonBridge::spawn(&python_exe, &python_dir)
+        .expect("failed to start le-vibe Python bridge");
 
-    let mut provider = arg_value(&args, "--provider").unwrap_or_else(|| "vibe".to_string());
-    let mut model = arg_value(&args, "--model").unwrap_or_else(|| default_model_for(&mut bridge, &provider));
-    let mode = arg_value(&args, "--mode");
-    let json_mode = mode.as_deref() == Some("json");
-    let rpc_mode = mode.as_deref() == Some("rpc");
-    let mut session = open_session(&args);
-    let telemetry = TelemetryRecorder::new();
-
-    if rpc_mode {
-        run_rpc_mode(&mut bridge, &mut session, &telemetry, &mut provider, &mut model);
-        return;
-    }
-
-    if let Some(prompt) = arg_value(&args, "--print") {
-        if !json_mode {
-            eprintln!("{}", render_status_bar(&provider, &model));
-        }
-        let cfg = AgentConfig {
-            provider,
-            model,
-            system_prompt: Some("You are le-vibe, a concise coding assistant.".to_string()),
-            thinking_level: "medium".to_string(),
-            max_turns: 8,
-            allowed_tools: None,
-        };
-        run_streaming_prompt(&mut bridge, &mut session, &telemetry, &cfg, &prompt, json_mode);
-        return;
-    }
-
-    let yolo = args.iter().any(|a| a == "--yolo" || a == "--auto-approve");
-    if yolo {
-        let _ = bridge.set_yolo(true);
-    }
-
-    run_interactive_tui(bridge, session, telemetry, provider, model, yolo);
-}
-
-/// "45s" / "3m" / "2h" / "5d" for a catalog age in seconds.
-fn humanize_age(seconds: f64) -> String {
-    let seconds = seconds.max(0.0) as u64;
-    if seconds < 60 {
-        format!("{seconds}s")
-    } else if seconds < 3_600 {
-        format!("{}m", seconds / 60)
-    } else if seconds < 86_400 {
-        format!("{}h", seconds / 3_600)
-    } else {
-        format!("{}d", seconds / 86_400)
-    }
-}
-
-fn current_git_branch() -> Option<String> {
-    let out = Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let b = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if b.is_empty() { None } else { Some(b) }
-}
-
-fn current_repo_name() -> String {
-    if let Ok(out) = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        && out.status.success()
-    {
-        let root = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if let Some(name) = Path::new(&root).file_name().and_then(|s| s.to_str())
-            && !name.is_empty()
-        {
-            return name.to_string();
-        }
-    }
-    std::env::current_dir()
-        .ok()
-        .and_then(|p| p.file_name().and_then(|s| s.to_str()).map(ToString::to_string))
-        .unwrap_or_else(|| ".".to_string())
-}
-
-fn summarize_git_status() -> String {
-    let Ok(out) = Command::new("git")
-        .args(["status", "--porcelain=v2", "--branch", "--untracked-files=normal"])
-        .output()
-    else {
-        return String::new();
-    };
-    if !out.status.success() {
-        return String::new();
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let (mut staged, mut unstaged, mut untracked, mut conflicts, mut ahead, mut behind) =
-        (0u32, 0u32, 0u32, 0u32, 0u32, 0u32);
-
-    for line in text.lines() {
-        if let Some(ab) = line.strip_prefix("# branch.ab ") {
-            let mut parts = ab.split_whitespace();
-            if let (Some(a), Some(b)) = (parts.next(), parts.next()) {
-                ahead = a.trim_start_matches('+').parse().unwrap_or(0);
-                behind = b.trim_start_matches('-').parse().unwrap_or(0);
-            }
-        } else if line.starts_with("? ") {
-            untracked += 1;
-        } else if line.starts_with("u ") {
-            conflicts += 1;
-        } else if line.starts_with("1 ") || line.starts_with("2 ") {
-            let bytes = line.as_bytes();
-            if bytes.len() >= 4 {
-                if bytes[2] != b'.' {
-                    staged += 1;
-                }
-                if bytes[3] != b'.' {
-                    unstaged += 1;
-                }
-            }
-        }
-    }
-
-    let mut badges = Vec::new();
-    if conflicts > 0 {
-        badges.push(format!("!{conflicts}"));
-    }
-    if staged > 0 {
-        badges.push(format!("+{staged}"));
-    }
-    if unstaged > 0 {
-        badges.push(format!("~{unstaged}"));
-    }
-    if untracked > 0 {
-        badges.push(format!("?{untracked}"));
-    }
-    if ahead > 0 {
-        badges.push(format!("↑{ahead}"));
-    }
-    if behind > 0 {
-        badges.push(format!("↓{behind}"));
-    }
-    if badges.is_empty() {
-        String::new()
-    } else {
-        format!("[{}]", badges.join(" "))
-    }
-}
-
-fn format_cwd() -> String {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let home = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from);
-    if let Some(h) = home
-        && let Ok(rel) = cwd.strip_prefix(&h)
-    {
-        let rel_str = rel.to_string_lossy();
-        return if rel_str.is_empty() {
-            "~".to_string()
-        } else {
-            format!("~\\{rel_str}")
-        };
-    }
-    cwd.to_string_lossy().to_string()
-}
-
-fn refresh_state(bridge: &mut PythonBridge, state: &mut TuiState, live_network: bool) {
-    state.cwd = format_cwd();
-    state.git_branch = current_git_branch();
-    let models_res = if live_network {
-        bridge
-            .refresh_models(None)
-            .or_else(|_| bridge.list_models(None))
-    } else {
-        bridge.list_models(None)
-    };
-    if let Ok(models) = models_res {
-        // A provider that is not connected reports no models, so the picker follows the account.
-        if let Some(found) = models
-            .iter()
-            .find(|m| m.provider == state.provider && m.id == state.model)
-        {
-            state.context_window = found.context_window;
-        } else if let Ok(preferred) = bridge.default_model(&state.provider).map(|m| {
-            models
-                .iter()
-                .find(|candidate| candidate.provider == state.provider && candidate.id == m)
-                .or_else(|| models.iter().find(|candidate| candidate.provider == state.provider))
-                .map(|candidate| (candidate.id.clone(), candidate.context_window))
-        }) && let Some((id, ctx)) = preferred
-        {
-            state.model = id;
-            state.context_window = ctx;
-        }
-        state.available_models = models
-            .into_iter()
-            .map(|m| {
-                let name = if m.exhausted {
-                    format!("{} · out of quota", m.name)
-                } else {
-                    m.name
-                };
-                (m.provider, m.id, name)
-            })
-            .collect();
-    }
-    if let Ok(status) = bridge.auth_status()
-        && let Some(obj) = status.as_object()
-    {
-        for (p, info) in obj {
-            let authed = info
-                .get("authenticated")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let src = info
-                .get("source")
-                .and_then(Value::as_str)
-                .unwrap_or("none")
-                .to_string();
-            state.provider_auth.insert(p.clone(), (authed, src));
-        }
-    }
-}
-
-/// ISO-8601 UTC timestamp ("2026-12-01T00:00:00Z") to a Unix epoch second.
-fn parse_iso_utc(text: &str) -> Option<i64> {
-    let bytes = text.as_bytes();
-    if bytes.len() < 19 {
-        return None;
-    }
-    let num = |range: std::ops::Range<usize>| text.get(range)?.parse::<i64>().ok();
-    let (year, month, day) = (num(0..4)?, num(5..7)?, num(8..10)?);
-    let (hour, minute, second) = (num(11..13)?, num(14..16)?, num(17..19)?);
-    // Days since the Unix epoch for a proleptic Gregorian date (Howard Hinnant's algorithm).
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = (month + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
-}
-
-/// "4d 3h" / "2h 15m" / "12m" until `reset_at`, empty when the time is unknown or past.
-fn resets_in(reset_at: Option<&str>) -> String {
-    let Some(raw) = reset_at else {
-        return String::new();
-    };
-    let Some(target) = parse_iso_utc(raw) else {
-        return String::new();
-    };
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let left = target - now;
-    if left <= 0 {
-        return "resets now".to_string();
-    }
-    let (days, hours, minutes) = (left / 86_400, (left % 86_400) / 3_600, (left % 3_600) / 60);
-    if days > 0 {
-        format!("resets {days}d {hours}h")
-    } else if hours > 0 {
-        format!("resets {hours}h {minutes}m")
-    } else {
-        format!("resets {minutes}m")
-    }
-}
-
-/// Name the window a reset time implies: a reset hours away is the rolling five-hour
-/// window, one days away is the weekly window, and an unknown reset stays unlabelled.
-fn window_label(reset_at: Option<&str>) -> &'static str {
-    let Some(raw) = reset_at else {
-        return "Limit";
-    };
-    let Some(target) = parse_iso_utc(raw) else {
-        return "Limit";
-    };
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    match (target - now) / 3_600 {
-        left if left <= 6 => "Five Hour Limit",
-        _ => "Weekly Limit",
-    }
-}
-
-/// A filled bar for the fraction still left, e.g. `[#####################-]`.
-fn quota_bar(remaining: f64, width: usize) -> String {
-    let filled = ((remaining.clamp(0.0, 1.0) * width as f64).round() as usize).min(width);
-    format!(
-        "[{}{}]",
-        "#".repeat(filled),
-        "-".repeat(width.saturating_sub(filled))
-    )
-}
-
-fn usage_report(state: &TuiState, live: &Value) -> String {
-    let mut lines: Vec<String> = Vec::new();
-    let str_of = |v: Option<&Value>| v.and_then(Value::as_str).unwrap_or("").to_string();
-
-    // Antigravity: one bar per quota window the account actually has.
-    if let Some(agy) = live.get("agy") {
-        lines.push(format!(
-            "{} ({})",
-            str_of(agy.get("plan")),
-            str_of(agy.get("tier_id"))
-        ));
-        if let Some(groups) = agy.get("groups").and_then(Value::as_array) {
-            for group in groups {
-                let label = str_of(group.get("label"));
-                lines.push(String::new());
-                lines.push(label);
-                if let Some(buckets) = group.get("buckets").and_then(Value::as_array) {
-                    for bucket in buckets {
-                        let b_name = str_of(bucket.get("label"));
-                        let remaining = bucket
-                            .get("remaining")
-                            .and_then(Value::as_f64)
-                            .unwrap_or(0.0);
-                        let reset = resets_in(bucket.get("reset_at").and_then(Value::as_str));
-                        lines.push(format!(
-                            "  {} {b_name}: {:.1}% left{}",
-                            quota_bar(remaining, 22),
-                            remaining * 100.0,
-                            if reset.is_empty() {
-                                String::new()
-                            } else {
-                                format!(" · {reset}")
-                            }
-                        ));
-                    }
-                } else {
-                    let remaining = group
-                        .get("remaining")
-                        .and_then(Value::as_f64)
-                        .unwrap_or(0.0);
-                    let reset = resets_in(group.get("reset_at").and_then(Value::as_str));
-                    lines.push(format!(
-                        "  {} {} Remaining: {:.1}% left{}",
-                        quota_bar(remaining, 22),
-                        window_label(group.get("reset_at").and_then(Value::as_str)),
-                        remaining * 100.0,
-                        if reset.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" · {reset}")
+    match action {
+        CliAction::Subcommand(sub, sub_args) => {
+            match sub.as_str() {
+                "login" => handle_login(&mut bridge, &sub_args),
+                "logout" => {
+                    let provider = arg_value(&sub_args, "--provider").unwrap_or_else(|| "vibe".to_string());
+                    match bridge.logout(&provider) {
+                        Ok(true) => println!("Removed saved credentials for {provider}"),
+                        Ok(false) => println!("No saved credentials found for {provider}"),
+                        Err(err) => {
+                            eprintln!("Logout failed: {err}");
+                            std::process::exit(1);
                         }
-                    ));
-                }
-            }
-        } else if !agy.get("authenticated").and_then(Value::as_bool).unwrap_or(true) {
-            lines.push("  not logged in — /login agy".to_string());
-        }
-        lines.push(String::new());
-    }
-
-    // Mistral: plan plus the monthly Vibe Code budget.
-    if let Some(vibe) = live.get("vibe") {
-        lines.push(format!("Mistral Vibe ({})", str_of(vibe.get("plan"))));
-        match vibe.get("budget_used_pct").and_then(Value::as_f64) {
-            Some(used) => {
-                let total = vibe
-                    .get("budget_total")
-                    .and_then(Value::as_f64)
-                    .unwrap_or(0.0);
-                let reset = resets_in(vibe.get("budget_reset_at").and_then(Value::as_str));
-                lines.push(format!(
-                    "  {} Vibe Budget: {:.1}% used · ${:.2} / ${:.0}{}",
-                    quota_bar(1.0 - used / 100.0, 22),
-                    used,
-                    total * used / 100.0,
-                    total,
-                    if reset.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" · {reset}")
                     }
-                ));
-            }
-            None => lines.push("  budget unavailable".to_string()),
-        }
-        if let Some(api_used) = vibe.get("api_budget_used_pct").and_then(Value::as_f64) {
-            let api_total = vibe
-                .get("api_budget_total")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0);
-            let api_reset = resets_in(vibe.get("api_budget_reset_at").and_then(Value::as_str));
-            lines.push(format!(
-                "  {} API Budget:  {:.1}% used · ${:.2} / ${:.0}{}",
-                quota_bar(1.0 - api_used / 100.0, 22),
-                api_used,
-                api_total * api_used / 100.0,
-                api_total,
-                if api_reset.is_empty() {
-                    String::new()
-                } else {
-                    format!(" · {api_reset}")
                 }
-            ));
-        }
-        let payg = vibe
-            .get("payg_enabled")
-            .and_then(Value::as_bool)
-            .map(|on| if on { "on" } else { "off" })
-            .unwrap_or("unknown");
-        lines.push(format!("  Pay-as-you-go: {payg}"));
-        lines.push(String::new());
-    }
-
-    // DeepSeek: account balance.
-    if let Some(deepseek) = live.get("deepseek") {
-        lines.push("DeepSeek".to_string());
-        match deepseek.get("balances").and_then(Value::as_array) {
-            Some(balances) if !balances.is_empty() => {
-                for balance in balances {
-                    lines.push(format!(
-                        "  {} {} balance (granted {} · topped up {})",
-                        str_of(balance.get("currency")),
-                        str_of(balance.get("total")),
-                        str_of(balance.get("granted")),
-                        str_of(balance.get("topped_up"))
-                    ));
+                "auth" => {
+                    let status = bridge.auth_status().expect("auth status");
+                    println!("{}", serde_json::to_string_pretty(&status).unwrap());
                 }
-            }
-            _ => lines.push(format!(
-                "  balance unavailable — {}",
-                str_of(deepseek.get("error"))
-            )),
-        }
-        lines.push(String::new());
-    }
-
-    lines.push(format!(
-        "Session: ↑{} ↓{} R{} · ${:.4}",
-        format_tokens(state.input_tokens),
-        format_tokens(state.output_tokens),
-        format_tokens(state.cache_read_tokens),
-        state.cost_usd
-    ));
-    lines.join("\n")
-}
-
-enum WorkerCmd {
-    RefreshCatalog {
-        live: bool,
-        announce: bool,
-        provider: String,
-        model: String,
-    },
-    CheckStaleAndRefresh {
-        provider: String,
-        model: String,
-    },
-    FetchUsage,
-    RunPrompt {
-        provider: String,
-        model: String,
-        thinking_level: String,
-        mode: AgentMode,
-        shell: String,
-        prompt: String,
-    },
-    ResolveModel {
-        pattern: String,
-        default_provider: String,
-    },
-    SwitchProvider {
-        provider: String,
-    },
-    Login {
-        target: String,
-        api_key: Option<String>,
-    },
-    Logout {
-        target: String,
-    },
-    RunShell {
-        command: String,
-        shell: String,
-        include_in_context: bool,
-    },
-    SetYolo(bool),
-    Compact,
-    Tree,
-    Skills,
-    Shutdown,
-}
-
-enum WorkerMsg {
-    CatalogSynced {
-        models: Vec<(String, String, String)>,
-        default_thinking: Vec<(String, String, String)>,
-        auth: Vec<(String, bool, String)>,
-        cwd: String,
-        branch: Option<String>,
-        resolved_model: Option<(String, u64)>,
-        notice: Option<String>,
-    },
-    UsageLoaded(Value),
-    ModelResolved {
-        provider: String,
-        model: String,
-        thinking_level: String,
-        context_window: u64,
-    },
-    ProviderSwitched {
-        provider: String,
-        model: String,
-        thinking_level: String,
-        context_window: u64,
-    },
-    Agent(AgentEvent),
-    ApprovalNeeded {
-        tool: String,
-        detail: String,
-        reason: String,
-    },
-    QuestionNeeded {
-        header: String,
-        question: String,
-        options: Vec<(String, String)>,
-    },
-    ShellResult {
-        command: String,
-        output: String,
-        in_context: bool,
-        git_badges: String,
-    },
-    TurnDone {
-        provider: String,
-        input_tokens: u64,
-        output_tokens: u64,
-        cache_read_tokens: u64,
-        cost_usd: f64,
-        tps: Option<f64>,
-        git_badges: String,
-    },
-    TurnError(String),
-    Notice(String),
-    Idle,
-}
-
-struct SyncPayload {
-    models: Vec<(String, String, String)>,
-    default_thinking: Vec<(String, String, String)>,
-    auth: Vec<(String, bool, String)>,
-    resolved_model: Option<(String, u64)>,
-}
-
-fn collect_sync_payload(
-    bridge: &mut PythonBridge,
-    provider: &str,
-    model: &str,
-    live_network: bool,
-) -> SyncPayload {
-    let models_res = if live_network {
-        bridge
-            .refresh_models(None)
-            .or_else(|_| bridge.list_models(None))
-    } else {
-        bridge.list_models(None)
-    };
-    let mut resolved_model = None;
-    let mut avail = Vec::new();
-    let mut default_thinking = Vec::new();
-    if let Ok(models) = models_res {
-        if let Some(found) = models
-            .iter()
-            .find(|m| m.provider == provider && m.id == model)
-        {
-            resolved_model = Some((found.id.clone(), found.context_window));
-        } else if let Ok(pref) = bridge.default_model(provider)
-            && let Some(cand) = models
-                .iter()
-                .find(|c| c.provider == provider && c.id == pref)
-                .or_else(|| models.iter().find(|c| c.provider == provider))
-        {
-            resolved_model = Some((cand.id.clone(), cand.context_window));
-        }
-        for m in models {
-            default_thinking.push((m.provider.clone(), m.id.clone(), m.default_thinking));
-            let name = if m.exhausted {
-                format!("{} · out of quota", m.name)
-            } else {
-                m.name
-            };
-            avail.push((m.provider, m.id, name));
-        }
-    }
-    let mut auth_vec = Vec::new();
-    if let Ok(status) = bridge.auth_status()
-        && let Some(obj) = status.as_object()
-    {
-        for (p, info) in obj {
-            let authed = info
-                .get("authenticated")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let src = info
-                .get("source")
-                .and_then(Value::as_str)
-                .unwrap_or("none")
-                .to_string();
-            auth_vec.push((p.clone(), authed, src));
-        }
-    }
-    SyncPayload {
-        models: avail,
-        default_thinking,
-        auth: auth_vec,
-        resolved_model,
-    }
-}
-
-fn spawn_tui_worker(
-    mut bridge: PythonBridge,
-    mut session: SessionStore,
-    telemetry: TelemetryRecorder,
-) -> (
-    mpsc::Sender<WorkerCmd>,
-    mpsc::Receiver<WorkerMsg>,
-    mpsc::Sender<ApprovalChoice>,
-    mpsc::Sender<String>,
-) {
-    let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCmd>();
-    let (msg_tx, msg_rx) = mpsc::channel::<WorkerMsg>();
-    let (approval_tx, approval_rx) = mpsc::channel::<ApprovalChoice>();
-    let (question_tx, question_rx) = mpsc::channel::<String>();
-
-    std::thread::spawn(move || {
-        let mut todos = TodoStore::new();
-        while let Ok(cmd) = cmd_rx.recv() {
-            match cmd {
-                WorkerCmd::Shutdown => break,
-                WorkerCmd::SetYolo(enabled) => {
-                    let _ = bridge.set_yolo(enabled);
-                }
-                WorkerCmd::RefreshCatalog {
-                    live,
-                    announce,
-                    provider,
-                    model,
-                } => {
-                    let SyncPayload {
-                        models,
-                        default_thinking,
-                        auth,
-                        resolved_model,
-                    } = collect_sync_payload(&mut bridge, &provider, &model, live);
-                    let cwd = format_cwd();
-                    let branch = current_git_branch();
-                    let notice = if announce {
-                        let age = bridge
-                            .catalog_state()
-                            .ok()
-                            .and_then(|(age, _)| age)
-                            .map(humanize_age)
-                            .unwrap_or_else(|| "just now".to_string());
-                        let skill_count = bridge
-                            .list_skills(&[".le-vibe/skills", ".pi/skills"])
-                            .map(|s| s.len())
-                            .unwrap_or(0);
-                        Some(format!(
-                            "Reloaded live catalogs: {} models across 3 providers (updated {age}), {skill_count} skills, cwd={cwd}",
-                            models.len()
-                        ))
-                    } else {
-                        None
-                    };
-                    let _ = msg_tx.send(WorkerMsg::CatalogSynced {
-                        models,
-                        default_thinking,
-                        auth,
-                        cwd,
-                        branch,
-                        resolved_model,
-                        notice,
-                    });
-                    let _ = msg_tx.send(WorkerMsg::Idle);
-                }
-                WorkerCmd::CheckStaleAndRefresh { provider, model } => {
-                    if let Ok((_age, true)) = bridge.catalog_state() {
-                        let SyncPayload {
-                            models,
-                            default_thinking,
-                            auth,
-                            resolved_model,
-                        } = collect_sync_payload(&mut bridge, &provider, &model, true);
-                        let _ = msg_tx.send(WorkerMsg::CatalogSynced {
-                            models,
-                            default_thinking,
-                            auth,
-                            cwd: format_cwd(),
-                            branch: current_git_branch(),
-                            resolved_model,
-                            notice: None,
-                        });
-                    }
-                    let _ = msg_tx.send(WorkerMsg::Idle);
-                }
-                WorkerCmd::FetchUsage => {
+                "usage" => {
+                    let mut state = TuiState::new(
+                        provider_arg(&sub_args),
+                        String::new(),
+                        format_cwd(),
+                        current_git_branch(),
+                    );
+                    refresh_state(&mut bridge, &mut state, false);
                     let live = bridge.fetch_usage(None).unwrap_or(Value::Null);
-                    let _ = msg_tx.send(WorkerMsg::UsageLoaded(live));
-                    let _ = msg_tx.send(WorkerMsg::Idle);
+                    println!("{}", usage_report(&state, &live));
                 }
-                WorkerCmd::ResolveModel {
-                    pattern,
-                    default_provider,
-                } => {
-                    match bridge.resolve_model(&pattern, &default_provider) {
-                        Ok(resolved) => {
-                            let ctx = bridge
-                                .list_models(Some(&resolved.provider))
-                                .ok()
-                                .and_then(|ms| {
-                                    ms.into_iter()
-                                        .find(|m| m.id == resolved.model)
-                                        .map(|m| m.context_window)
-                                })
-                                .unwrap_or(256_000);
-                            let _ = msg_tx.send(WorkerMsg::ModelResolved {
-                                provider: resolved.provider,
-                                model: resolved.model,
-                                thinking_level: resolved.thinking_level,
-                                context_window: ctx,
-                            });
-                        }
-                        Err(e) => {
-                            let _ = msg_tx.send(WorkerMsg::Notice(format!("Model not found: {e}")));
-                        }
+                _ => {}
+            }
+        }
+        CliAction::ListModels(query) => {
+            let models = bridge
+                .refresh_models(None)
+                .or_else(|_| bridge.list_models(None))
+                .expect("list models");
+            let q = query.as_deref().unwrap_or("").to_lowercase();
+            for m in models {
+                if q.is_empty()
+                    || m.id.to_lowercase().contains(&q)
+                    || m.name.to_lowercase().contains(&q)
+                    || m.provider.to_lowercase().contains(&q)
+                {
+                    println!("{}/{} ({})", m.provider, m.id, m.name);
+                }
+            }
+        }
+        CliAction::Run(opts) => {
+            let mut provider = opts.provider.clone().unwrap_or_else(|| "vibe".to_string());
+            let mut model = opts
+                .model
+                .clone()
+                .unwrap_or_else(|| default_model_for(&mut bridge, &provider));
+            let json_mode = opts.mode.as_deref() == Some("json");
+            let rpc_mode = opts.mode.as_deref() == Some("rpc");
+            let mut session = open_session_with_opts(&opts);
+            let telemetry = TelemetryRecorder::new();
+
+            if opts.yolo {
+                let _ = bridge.set_yolo(true);
+            }
+
+            if rpc_mode {
+                run_rpc_mode(&mut bridge, &mut session, &telemetry, &mut provider, &mut model);
+                return;
+            }
+
+            let non_tty = !std::io::IsTerminal::is_terminal(&std::io::stdout());
+            if opts.print_mode || json_mode || non_tty {
+                let initial_prompt = build_initial_prompt(&opts);
+                if opts.print_mode || json_mode || initial_prompt.is_some() {
+                    let prompt = initial_prompt.unwrap_or_default();
+                    if !json_mode {
+                        eprintln!("{}", render_status_bar(&provider, &model));
                     }
-                    let _ = msg_tx.send(WorkerMsg::Idle);
-                }
-                WorkerCmd::SwitchProvider { provider } => {
-                    let model = default_model_for(&mut bridge, &provider);
-                    let found = bridge
-                        .list_models(Some(&provider))
-                        .ok()
-                        .and_then(|ms| ms.into_iter().find(|m| m.id == model));
-                    let ctx = found.as_ref().map(|m| m.context_window).unwrap_or(256_000);
-                    let def_think = found
-                        .map(|m| m.default_thinking)
-                        .unwrap_or_else(|| "medium".to_string());
-                    let _ = msg_tx.send(WorkerMsg::ProviderSwitched {
-                        provider,
-                        model,
-                        thinking_level: def_think,
-                        context_window: ctx,
-                    });
-                    let _ = msg_tx.send(WorkerMsg::Idle);
-                }
-                WorkerCmd::Login { target, api_key } => {
-                    let res = if let Some(key) = api_key {
-                        bridge.save_api_key(&target, &key)
-                    } else if target == "agy" {
-                        bridge.login_agy_oauth()
-                    } else if target == "vibe" {
-                        bridge.login_vibe_oidc()
-                    } else {
-                        Err(le_vibe_pybridge::BridgeError::Remote {
-                            kind: "Auth".into(),
-                            message: "For deepseek, pass your API key: /login deepseek <DEEPSEEK_API_KEY>".into(),
-                        })
-                    };
-                    match res {
-                        Ok(path) => {
-                            let SyncPayload {
-                                models,
-                                default_thinking,
-                                auth,
-                                resolved_model,
-                            } = collect_sync_payload(&mut bridge, &target, "", true);
-                            let _ = msg_tx.send(WorkerMsg::CatalogSynced {
-                                models,
-                                default_thinking,
-                                auth,
-                                cwd: format_cwd(),
-                                branch: current_git_branch(),
-                                resolved_model,
-                                notice: Some(format!("Logged in to {target} (saved to {path})")),
-                            });
-                        }
-                        Err(e) => {
-                            let _ = msg_tx.send(WorkerMsg::Notice(format!("Login failed: {e}")));
-                        }
-                    }
-                    let _ = msg_tx.send(WorkerMsg::Idle);
-                }
-                WorkerCmd::Logout { target } => {
-                    match bridge.logout(&target) {
-                        Ok(true) => {
-                            let SyncPayload {
-                                models,
-                                default_thinking,
-                                auth,
-                                resolved_model,
-                            } = collect_sync_payload(&mut bridge, &target, "", true);
-                            let _ = msg_tx.send(WorkerMsg::CatalogSynced {
-                                models,
-                                default_thinking,
-                                auth,
-                                cwd: format_cwd(),
-                                branch: current_git_branch(),
-                                resolved_model,
-                                notice: Some(format!("Removed saved credentials for {target}.")),
-                            });
-                        }
-                        Ok(false) => {
-                            let _ = msg_tx.send(WorkerMsg::Notice(format!(
-                                "No saved credentials found for {target}."
-                            )));
-                        }
-                        Err(e) => {
-                            let _ = msg_tx.send(WorkerMsg::Notice(format!("Logout failed: {e}")));
-                        }
-                    }
-                    let _ = msg_tx.send(WorkerMsg::Idle);
-                }
-                WorkerCmd::RunShell {
-                    command,
-                    shell,
-                    include_in_context,
-                } => {
-                    let shell_out = run_shell_command(&shell, &command);
-                    let text = match shell_out {
-                        Ok(out) => {
-                            let stdout = String::from_utf8_lossy(&out.stdout);
-                            let stderr = String::from_utf8_lossy(&out.stderr);
-                            let code = out.status.code().unwrap_or(-1);
-                            let mut combined = String::new();
-                            if !stdout.trim().is_empty() {
-                                combined.push_str(stdout.trim_end());
-                            }
-                            if !stderr.trim().is_empty() {
-                                if !combined.is_empty() {
-                                    combined.push('\n');
-                                }
-                                combined.push_str(stderr.trim_end());
-                            }
-                            if combined.is_empty() {
-                                format!("exit_code={code}")
-                            } else {
-                                format!("{combined}\n[exit_code={code}]")
-                            }
-                        }
-                        Err(e) => format!("Failed to run command: {e}"),
-                    };
-                    if include_in_context {
-                        let _ = session.append(
-                            "user",
-                            format!("[shell: ! {command}]\n{text}"),
-                        );
-                    }
-                    let _ = msg_tx.send(WorkerMsg::ShellResult {
-                        command,
-                        output: text,
-                        in_context: include_in_context,
-                        git_badges: summarize_git_status(),
-                    });
-                    let _ = msg_tx.send(WorkerMsg::Idle);
-                }
-                WorkerCmd::Compact => {
-                    let count = session.active_branch().len();
-                    let _ = session.append_compaction(format!("Compacted {count} prior messages."));
-                    let _ = msg_tx.send(WorkerMsg::Notice(format!(
-                        "Compacted session context ({count} prior entries)."
-                    )));
-                    let _ = msg_tx.send(WorkerMsg::Idle);
-                }
-                WorkerCmd::Tree => {
-                    let mut out = Vec::new();
-                    for entry in session.active_branch() {
-                        out.push(format!(
-                            "[{}] (parent={:?}, role={}): {}",
-                            entry.id,
-                            entry.parent_id,
-                            entry.role,
-                            entry.content.chars().take(80).collect::<String>()
-                        ));
-                    }
-                    if out.is_empty() {
-                        out.push("Session tree is empty.".to_string());
-                    }
-                    let _ = msg_tx.send(WorkerMsg::Notice(out.join("\n")));
-                    let _ = msg_tx.send(WorkerMsg::Idle);
-                }
-                WorkerCmd::Skills => {
-                    if let Ok(skills) = bridge.list_skills(&[".le-vibe/skills", ".pi/skills"]) {
-                        let msg = if skills.is_empty() {
-                            "No SKILL.md files discovered.".to_string()
-                        } else {
-                            skills
-                                .into_iter()
-                                .map(|s| format!("{} — {} ({})", s.name, s.description, s.path))
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        };
-                        let _ = msg_tx.send(WorkerMsg::Notice(msg));
-                    }
-                    let _ = msg_tx.send(WorkerMsg::Idle);
-                }
-                WorkerCmd::RunPrompt {
-                    provider,
-                    model,
-                    thinking_level,
-                    mode,
-                    shell,
-                    prompt,
-                } => {
-                    let self_repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                        .parent()
-                        .and_then(|p| p.parent())
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_else(|| ".".to_string());
-                    let sys = format!(
-                        "{}\nEnvironment: os={}, active_shell={shell}. Only write commands and tool calls compatible with `{shell}` on `{}`.\nSelf-reference: le-vibe source repository is at `{self_repo}` (Rust harness in `crates/*`, Python provider/policy/extension engine in `python/le_vibe/*`, docs in `goal.md`, `plan.md`, `README.md`, `change-log.md`). To self-modify & verify: run `cargo test --workspace` and `pytest python/tests`, and reinstall with `cargo install --path crates/le-vibe-cli`.",
-                        mode.system_prompt(),
-                        std::env::consts::OS,
-                        std::env::consts::OS,
+                    let agent_mode = opts
+                        .agent_mode
+                        .as_deref()
+                        .and_then(AgentMode::from_name)
+                        .unwrap_or(AgentMode::Normal);
+                    let allowed_tools = opts.allowed_tools.or_else(|| agent_mode.allowed_tools());
+                    let sys = build_system_prompt(
+                        agent_mode,
+                        "powershell",
+                        &cwd_string(),
+                        &self_repo_path(),
+                        &[],
+                        "",
                     );
                     let cfg = AgentConfig {
-                        provider: provider.clone(),
+                        provider,
                         model,
                         system_prompt: Some(sys),
-                        thinking_level,
-                        max_turns: 8,
-                        allowed_tools: mode.allowed_tools(),
+                        thinking_level: opts.thinking.unwrap_or_else(|| "medium".to_string()),
+                        max_turns: 40,
+                        max_retries: 2,
+                        allowed_tools,
+                        mode_name: Some(agent_mode.name().to_string()),
                     };
-                    let mut first_delta_at: Option<Instant> = None;
-                    let mut last_delta_at: Option<Instant> = None;
-                    let res = run_turn_loop_interactive(
-                        &mut bridge,
-                        &mut session,
-                        &telemetry,
-                        &mut todos,
-                        &cfg,
-                        &prompt,
-                        |ev| {
-                            if matches!(
-                                ev,
-                                AgentEvent::TextDelta { .. } | AgentEvent::ThinkingDelta { .. }
-                            ) {
-                                let now = Instant::now();
-                                first_delta_at.get_or_insert(now);
-                                last_delta_at = Some(now);
-                            }
-                            let _ = msg_tx.send(WorkerMsg::Agent(ev));
-                        },
-                        |req| {
-                            let detail = req
-                                .command
-                                .or(req.target_path)
-                                .unwrap_or_else(|| "(no target)".to_string());
-                            let _ = msg_tx.send(WorkerMsg::ApprovalNeeded {
-                                tool: req.tool_name,
-                                detail,
-                                reason: req.reason,
-                            });
-                            approval_rx.recv().unwrap_or(ApprovalChoice::Deny)
-                        },
-                        |args| {
-                            let q_arr = args.get("questions").and_then(Value::as_array);
-                            let first = q_arr.and_then(|a| a.first());
-                            let header = first
-                                .and_then(|q| q.get("header"))
-                                .and_then(Value::as_str)
-                                .unwrap_or("Question")
-                                .to_string();
-                            let question = first
-                                .and_then(|q| q.get("question"))
-                                .and_then(Value::as_str)
-                                .unwrap_or("Please choose an option:")
-                                .to_string();
-                            let options = first
-                                .and_then(|q| q.get("options"))
-                                .and_then(Value::as_array)
-                                .map(|opts| {
-                                    opts.iter()
-                                        .filter_map(|o| {
-                                            let l = o.get("label")?.as_str()?.to_string();
-                                            let d = o
-                                                .get("description")
-                                                .and_then(Value::as_str)
-                                                .unwrap_or("")
-                                                .to_string();
-                                            Some((l, d))
-                                        })
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            let _ = msg_tx.send(WorkerMsg::QuestionNeeded {
-                                header,
-                                question,
-                                options,
-                            });
-                            question_rx
-                                .recv()
-                                .unwrap_or_else(|_| "User cancelled.".to_string())
-                        },
-                    );
-                    let tps = match (first_delta_at, last_delta_at) {
-                        (Some(start), Some(end)) => {
-                            let ms = end.duration_since(start).as_millis() as f64;
-                            if ms >= 250.0 {
-                                Some(res.as_ref().map(|r| r.usage.output_tokens as f64).unwrap_or(0.0) / (ms / 1000.0))
-                            } else {
-                                None
-                            }
-                        }
-                        _ => None,
-                    };
-                    match res {
-                        Ok(reply) => {
-                            let _ = msg_tx.send(WorkerMsg::TurnDone {
-                                provider,
-                                input_tokens: reply.usage.input_tokens,
-                                output_tokens: reply.usage.output_tokens,
-                                cache_read_tokens: reply.usage.cache_read_tokens,
-                                cost_usd: reply.usage.cost_usd,
-                                tps,
-                                git_badges: summarize_git_status(),
-                            });
-                        }
-                        Err(err) => {
-                            let _ = msg_tx.send(WorkerMsg::TurnError(err.to_string()));
-                        }
-                    }
-                    let _ = msg_tx.send(WorkerMsg::Idle);
+                    run_streaming_prompt(&mut bridge, &mut session, &telemetry, &cfg, &prompt, json_mode);
+                    return;
                 }
             }
+
+            run_interactive_tui(bridge, session, telemetry, provider, model, opts.yolo);
         }
-    });
-
-    (cmd_tx, msg_rx, approval_tx, question_tx)
-}
-
-fn mini_bar(remaining: f64) -> String {
-    let filled = ((remaining.clamp(0.0, 1.0) * 6.0).round() as usize).min(6);
-    format!("[{}{}]", "#".repeat(filled), "-".repeat(6 - filled))
-}
-
-fn agy_5h_remaining(agy: &Value, active_model: &str) -> Option<(f64, &'static str)> {
-    let want_group = if active_model.starts_with("claude") || active_model.starts_with("gpt") {
-        "claude"
-    } else if active_model.contains("argon") {
-        "argon"
-    } else {
-        "gemini"
-    };
-
-    if let Some(groups) = agy.get("groups").and_then(Value::as_array) {
-        let mut fallback_5h: Option<f64> = None;
-        for grp in groups {
-            let label = grp
-                .get("label")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_lowercase();
-            let is_target_group = label.contains(want_group);
-            if let Some(buckets) = grp.get("buckets").and_then(Value::as_array) {
-                for b in buckets {
-                    let window = b.get("window").and_then(Value::as_str).unwrap_or("");
-                    let b_label = b
-                        .get("label")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_lowercase();
-                    let is_5h = window == "5h" || b_label.contains("five hour");
-                    if let Some(rem) = b.get("remaining").and_then(Value::as_f64) {
-                        if is_target_group && is_5h {
-                            return Some((rem, "5h"));
-                        }
-                        if is_5h {
-                            fallback_5h = Some(fallback_5h.map_or(rem, |cur| cur.min(rem)));
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(rem) = fallback_5h {
-            return Some((rem, "5h"));
-        }
-    }
-    agy.get("quota_remaining")
-        .and_then(Value::as_f64)
-        .map(|rem| (rem, "7d"))
-}
-
-fn update_quota_badges(state: &mut TuiState, live: &Value) {
-    if let Some(agy) = live.get("agy")
-        && let Some((rem, _win)) = agy_5h_remaining(agy, &state.model)
-    {
-        state.provider_quota_badge.insert(
-            "agy".to_string(),
-            format!("agy {} {:.1}%", mini_bar(rem), rem * 100.0),
-        );
-    }
-    if let Some(vibe) = live.get("vibe")
-        && let Some(used) = vibe.get("budget_used_pct").and_then(Value::as_f64)
-    {
-        let rem = (1.0 - used / 100.0).clamp(0.0, 1.0);
-        state.provider_quota_badge.insert(
-            "vibe".to_string(),
-            format!("vibe {} {:.1}%", mini_bar(rem), rem * 100.0),
-        );
-    }
-    if let Some(ds) = live.get("deepseek")
-        && let Some(b) = ds
-            .get("balances")
-            .and_then(Value::as_array)
-            .and_then(|arr| arr.first())
-    {
-        let cur = b.get("currency").and_then(Value::as_str).unwrap_or("USD");
-        let tot = b.get("total").and_then(Value::as_str).unwrap_or("0");
-        state
-            .provider_quota_badge
-            .insert("deepseek".to_string(), format!("deepseek {cur} {tot}"));
+        CliAction::Help | CliAction::Version | CliAction::ExportOffline { .. } => {}
     }
 }
 
@@ -1347,19 +291,70 @@ fn run_interactive_tui(
     state.repo_name = current_repo_name();
     state.git_badges = summarize_git_status();
     state.scoped_models = load_scope();
-    if let Some(saved_shell) = load_setting("terminal") {
-        state.shell = saved_shell;
+    state.history = load_history();
+    let (layered, origins) = load_layered_settings();
+    state.config_origins = origins;
+    let parse_bool = |k: &str, default: bool| -> bool {
+        layered
+            .get(k)
+            .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "on" | "yes"))
+            .unwrap_or(default)
+    };
+    if let Some(saved_shell) = layered.get("terminal") {
+        state.shell = saved_shell.clone();
     }
-    if let Some(saved_theme) = load_setting("theme").and_then(|s| ThemeId::from_name(&s)) {
+    if let Some(saved_theme) = layered.get("theme").and_then(|s| ThemeId::from_name(s)) {
         state.theme = saved_theme;
     }
+    if let Some(saved_mode) = layered.get("mode").and_then(|s| AgentMode::from_name(s)) {
+        state.mode = saved_mode;
+    }
+    if let Some(saved_thinking) = layered.get("thinking") {
+        state.thinking_level = saved_thinking.clone();
+    }
+    if !initial_yolo {
+        state.yolo = parse_bool("yolo", false);
+    }
+    state.show_thinking = parse_bool("show_thinking", true);
+    state.expand_tools = parse_bool("expand_tools", false);
+    state.reduced_motion = parse_bool("reduced_motion", state.reduced_motion);
+    state.quiet_startup = parse_bool("quiet_startup", false);
+    state.bell_on_done = parse_bool("bell_on_done", false);
+    state.auto_compact = parse_bool("auto_compact", true);
+    if let Some(pct) = layered
+        .get("compact_threshold_pct")
+        .and_then(|s| s.trim_end_matches('%').parse::<u64>().ok())
+    {
+        state.compact_threshold_pct = pct.clamp(50, 95);
+    }
+    if let Some(mt) = layered.get("max_turns").and_then(|s| s.parse::<usize>().ok()) {
+        state.max_turns = mt.clamp(5, 200);
+    }
+    if let Some(rm) = layered.get("retry_max").and_then(|s| s.parse::<usize>().ok()) {
+        state.retry_max = rm.min(5);
+    }
+    state.confirm_on_exit = parse_bool("confirm_on_exit", false);
+    state.double_esc_rewind = parse_bool("double_esc_rewind", true);
     state.status_text = Some("Syncing live model catalogs...".to_string());
     state.is_busy = true;
 
-    let (cmd_tx, msg_rx, approval_tx, question_tx) =
-        spawn_tui_worker(bridge, session, telemetry);
+    let logger = EventLogger::new_default();
+    logger.log(
+        "ui",
+        "tui_start",
+        None,
+        format!("provider={} model={}", state.provider, state.model),
+    );
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (cmd_tx, msg_rx, approval_tx, question_tx) = spawn_tui_worker(
+        bridge,
+        session,
+        telemetry,
+        Arc::clone(&cancel),
+        Arc::clone(&logger),
+    );
     let _ = cmd_tx.send(WorkerCmd::RefreshCatalog {
-        live: true,
+        live: false,
         announce: false,
         provider: state.provider.clone(),
         model: state.model.clone(),
@@ -1368,10 +363,23 @@ fn run_interactive_tui(
 
     let mut guard = TerminalGuard::enter().expect("failed to initialize TUI terminal");
     let mut last_catalog_check = Instant::now();
+    let mut last_spinner_tick = Instant::now();
     let mut last_live_usage: Option<Value> = None;
+    let mut last_recorded_mode = state.mode;
+    let mut turn_tools_count: usize = 0;
+    let mut loop_scheduler = LoopScheduler::default();
+    let mut last_quit_press: Option<Instant> = None;
+    let mut last_esc_empty: Option<Instant> = None;
+    let mut needs_redraw = true;
 
     loop {
+        if state.mode != last_recorded_mode {
+            last_recorded_mode = state.mode;
+            needs_redraw = true;
+            let _ = cmd_tx.send(WorkerCmd::RecordModeChange(state.mode.name().to_string()));
+        }
         while let Ok(msg) = msg_rx.try_recv() {
+            needs_redraw = true;
             match msg {
                 WorkerMsg::CatalogSynced {
                     models,
@@ -1384,8 +392,6 @@ fn run_interactive_tui(
                 } => {
                     state.cwd = cwd;
                     state.git_branch = branch;
-                    state.repo_name = current_repo_name();
-                    state.git_badges = summarize_git_status();
                     state.available_models = models;
                     for (p, id, dt) in default_thinking {
                         state.model_default_thinking.insert((p, id), dt);
@@ -1449,6 +455,9 @@ fn run_interactive_tui(
                     )));
                 }
                 WorkerMsg::Agent(ev) => match ev {
+                    AgentEvent::Status { text } => {
+                        state.status_text = Some(text);
+                    }
                     AgentEvent::ThinkingDelta { delta } => {
                         if let Some(TranscriptBlock::Thinking(buf)) = state.blocks.last_mut() {
                             buf.push_str(&delta);
@@ -1464,6 +473,8 @@ fn run_interactive_tui(
                         }
                     }
                     AgentEvent::ToolCallStart { name, .. } => {
+                        turn_tools_count += 1;
+                        logger.log("tool", "start", None, name.clone());
                         state.status_text = Some(format!("Running tool {name}..."));
                         state.blocks.push(TranscriptBlock::Tool {
                             name,
@@ -1478,6 +489,12 @@ fn run_interactive_tui(
                         ..
                     } => {
                         let label = if is_error { "failed" } else { "done" };
+                        logger.log(
+                            if is_error { "error" } else { "tool" },
+                            "end",
+                            None,
+                            format!("{name} -> {label} ({} bytes)", output.len()),
+                        );
                         let preview: String = output.lines().take(8).collect::<Vec<_>>().join("\n");
                         if let Some(TranscriptBlock::Tool {
                             name: n,
@@ -1497,6 +514,10 @@ fn run_interactive_tui(
                     detail,
                     reason,
                 } => {
+                    if state.bell_on_done {
+                        let _ = write!(io::stdout(), "\x07");
+                        let _ = io::stdout().flush();
+                    }
                     state.approval_prompt = Some((tool, detail, reason));
                     state.modal = ActiveModal::ApprovalModal;
                     state.modal_idx = 0;
@@ -1534,11 +555,15 @@ fn run_interactive_tui(
                     tps,
                     git_badges,
                 } => {
-                    if let Some(started) = state.active_started.take() {
-                        state.active_ms = state
-                            .active_ms
-                            .saturating_add(started.elapsed().as_millis() as u64);
-                    }
+                    let turn_ms = state
+                        .active_started
+                        .take()
+                        .map(|started| {
+                            let ms = started.elapsed().as_millis() as u64;
+                            state.active_ms = state.active_ms.saturating_add(ms);
+                            ms
+                        })
+                        .unwrap_or(0);
                     state.last_tps = tps;
                     state.git_badges = git_badges;
                     state.record_usage(
@@ -1548,6 +573,25 @@ fn run_interactive_tui(
                         cache_read_tokens,
                         cost_usd,
                     );
+                    if turn_tools_count > 0 {
+                        let tps_str = tps.map(|v| format!(" · {v:.1} t/s")).unwrap_or_default();
+                        state.blocks.push(TranscriptBlock::System(format!(
+                            "✓ {} tool(s) · {} out{tps_str} · {:.1}s",
+                            turn_tools_count,
+                            format_tokens(output_tokens),
+                            turn_ms as f64 / 1000.0
+                        )));
+                        turn_tools_count = 0;
+                    }
+                    if state.bell_on_done {
+                        let _ = write!(io::stdout(), "\x07");
+                        let _ = io::stdout().flush();
+                    }
+                    if state.mode == AgentMode::Plan {
+                        state.blocks.push(TranscriptBlock::System(
+                            "Plan ready — press Shift+Tab to switch mode.".to_string(),
+                        ));
+                    }
                 }
                 WorkerMsg::TurnError(err) => {
                     if let Some(started) = state.active_started.take() {
@@ -1562,15 +606,103 @@ fn run_interactive_tui(
                 WorkerMsg::Notice(text) => {
                     state.blocks.push(TranscriptBlock::System(text));
                 }
+                WorkerMsg::RewindLoaded(rows) => {
+                    state.rewind_rows = rows;
+                    state.modal_idx = state.rewind_rows.len().saturating_sub(1);
+                    state.modal = ActiveModal::RewindPicker;
+                }
+                WorkerMsg::SessionsLoaded(rows) => {
+                    state.session_rows = rows;
+                    state.modal_filter.clear();
+                    state.modal_idx = 0;
+                    state.modal = ActiveModal::SessionPicker;
+                }
+                WorkerMsg::WorkspaceFilesLoaded(files) => {
+                    state.workspace_files = files;
+                }
+                WorkerMsg::PluginCommandsLoaded(cmds) => {
+                    state.plugin_commands = cmds;
+                }
+                WorkerMsg::SessionReplaced {
+                    blocks,
+                    notice,
+                    prefill_input,
+                    reset_usage,
+                } => {
+                    if reset_usage {
+                        state.input_tokens = 0;
+                        state.output_tokens = 0;
+                        state.cache_read_tokens = 0;
+                        state.cost_usd = 0.0;
+                    }
+                    state.blocks.clear();
+                    for (role, content) in blocks {
+                        match role.as_str() {
+                            "user" => state.blocks.push(TranscriptBlock::User(content)),
+                            "assistant" => state.blocks.push(TranscriptBlock::Assistant(content)),
+                            _ => state.blocks.push(TranscriptBlock::System(content)),
+                        }
+                    }
+                    state.blocks.push(TranscriptBlock::System(notice));
+                    state.scroll_offset = 0;
+                    if let Some(text) = prefill_input {
+                        state.input = text;
+                        state.cursor = state.input.len();
+                    }
+                }
+                WorkerMsg::TodosUpdated(items) => {
+                    state.todos = items;
+                }
                 WorkerMsg::Idle => {
-                    state.is_busy = false;
-                    state.status_text = None;
+                    if let Some(next_prompt) = state.queued_prompts.pop_front() {
+                        state.is_busy = true;
+                        state.active_started = Some(Instant::now());
+                        state.status_text = Some("Thinking...".to_string());
+                        state.blocks.push(TranscriptBlock::User(next_prompt.clone()));
+                        let _ = cmd_tx.send(WorkerCmd::RunPrompt {
+                            provider: state.provider.clone(),
+                            model: state.model.clone(),
+                            thinking_level: state.thinking_level.clone(),
+                            mode: state.mode,
+                            shell: state.shell.clone(),
+                            max_turns: state.max_turns,
+                            retry_max: state.retry_max,
+                            prompt: next_prompt,
+                        });
+                    } else {
+                        state.is_busy = false;
+                        state.status_text = None;
+                    }
                 }
             }
         }
 
-        if state.is_busy || state.usage_loading {
+        if (state.is_busy || state.usage_loading)
+            && last_spinner_tick.elapsed() >= Duration::from_millis(80)
+        {
+            last_spinner_tick = Instant::now();
             state.advance_spinner();
+            needs_redraw = true;
+        }
+
+        if !state.is_busy
+            && let Some(due_prompt) = loop_scheduler.pop_due()
+        {
+            needs_redraw = true;
+            state.blocks.push(TranscriptBlock::User(format!("[loop] {due_prompt}")));
+            state.is_busy = true;
+            state.active_started = Some(Instant::now());
+            state.status_text = Some("Running scheduled loop...".to_string());
+            let _ = cmd_tx.send(WorkerCmd::RunPrompt {
+                provider: state.provider.clone(),
+                model: state.model.clone(),
+                thinking_level: state.thinking_level.clone(),
+                mode: state.mode,
+                shell: state.shell.clone(),
+                max_turns: state.max_turns,
+                retry_max: state.retry_max,
+                prompt: due_prompt,
+            });
         }
 
         if last_catalog_check.elapsed() >= Duration::from_secs(60) && !state.is_busy {
@@ -1581,17 +713,165 @@ fn run_interactive_tui(
             });
         }
 
-        guard.terminal.draw(|f| draw_frame(f, &state)).unwrap();
+        if needs_redraw {
+            if DEBUG_ENABLED && state.modal == ActiveModal::DebugModal {
+                let summary = format!(
+                    "State: busy={} mode={} model={}/{} blocks={} queue={} last_draw={}ms",
+                    state.is_busy,
+                    state.mode.name(),
+                    state.provider,
+                    state.model,
+                    state.blocks.len(),
+                    state.queued_prompts.len(),
+                    state.last_draw_ms,
+                );
+                state.debug_lines = logger.formatted_lines(&state.debug_filter, &summary);
+            }
+            let draw_start = Instant::now();
+            let before_scroll = state.rendered_scroll.get();
+            if guard.terminal.draw(|f| draw_frame(f, &state)).is_err() {
+                break;
+            }
+            let draw_ms = draw_start.elapsed().as_millis() as u64;
+            state.last_draw_ms = draw_ms;
+            if draw_ms > 16 {
+                logger.log("perf", "slow_frame", Some(draw_ms), format!("blocks={}", state.blocks.len()));
+            }
+            // Keep animating while smooth scroll is still easing.
+            needs_redraw = state.rendered_scroll.get() != before_scroll;
+        }
 
-        match poll_tui_action(&mut state, Duration::from_millis(33)).unwrap_or(TuiAction::None) {
-            TuiAction::None => {}
+        // Wait up to 16ms for the first input event, then drain bursts without redrawing per key.
+        let mut actions = Vec::new();
+        let first = poll_tui_action(&mut state, Duration::from_millis(16)).unwrap_or(TuiAction::None);
+        if !matches!(first, TuiAction::None) {
+            needs_redraw = true;
+            actions.push(first);
+            for _ in 0..15 {
+                let next = poll_tui_action(&mut state, Duration::ZERO).unwrap_or(TuiAction::None);
+                if matches!(next, TuiAction::None) {
+                    break;
+                }
+                actions.push(next);
+            }
+        }
+        let mut should_quit = false;
+        for action in actions {
+            match action {
+            TuiAction::None | TuiAction::Redraw => {}
             TuiAction::Quit => {
+                if state.confirm_on_exit
+                    && last_quit_press
+                        .is_none_or(|t| t.elapsed() > Duration::from_millis(1500))
+                {
+                    last_quit_press = Some(Instant::now());
+                    state.status_text = Some("Press Ctrl+C again to quit".to_string());
+                    continue;
+                }
+                save_history(&state.history);
                 if state.scope_dirty {
                     save_scope(&state.scoped_models);
                 }
                 let _ = cmd_tx.send(WorkerCmd::Shutdown);
+                should_quit = true;
                 break;
             }
+            TuiAction::Interrupt => {
+                if !state.is_busy && state.input.is_empty() && state.double_esc_rewind {
+                    if last_esc_empty.is_some_and(|t| t.elapsed() <= Duration::from_millis(700)) {
+                        last_esc_empty = None;
+                        let _ = cmd_tx.send(WorkerCmd::ListRewindCheckpoints);
+                    } else {
+                        last_esc_empty = Some(Instant::now());
+                    }
+                    continue;
+                }
+                logger.log("ui", "interrupt", None, "Esc pressed while busy");
+                cancel.store(true, Ordering::SeqCst);
+                state.queued_prompts.clear();
+                state.status_text = Some("Interrupting...".to_string());
+            }
+            TuiAction::ToggleDebug => {
+                if DEBUG_ENABLED {
+                    if state.modal == ActiveModal::DebugModal {
+                        state.modal = ActiveModal::None;
+                        state.help_scroll = 0;
+                    } else {
+                        state.help_scroll = 0;
+                        state.modal = ActiveModal::DebugModal;
+                        logger.log("ui", "debug_open", None, "opened debugger overlay");
+                    }
+                }
+            }
+            TuiAction::DebugClear => {
+                if DEBUG_ENABLED {
+                    logger.clear();
+                    state.help_scroll = 0;
+                }
+            }
+            TuiAction::DebugCycleFilter => {
+                if DEBUG_ENABLED {
+                    const FILTERS: &[&str] = &["all", "error", "perf", "worker", "agent", "tool", "ui"];
+                    let cur = FILTERS
+                        .iter()
+                        .position(|f| *f == state.debug_filter)
+                        .unwrap_or(0);
+                    state.debug_filter = FILTERS[(cur + 1) % FILTERS.len()].to_string();
+                    state.help_scroll = 0;
+                }
+            }
+            TuiAction::PasteClipboard => {
+                if let Some(item) = grab_clipboard_item() {
+                    match item {
+                        PastedItem::Image { name, mime, base64 } => {
+                            state.pending_attachments.push((name.clone(), mime, base64));
+                            state.blocks.push(TranscriptBlock::System(format!(
+                                "Attached clipboard image: {name}"
+                            )));
+                        }
+                        PastedItem::ImageTooLarge(msg) => {
+                            state.blocks.push(TranscriptBlock::System(format!(
+                                "Image skipped: {msg}"
+                            )));
+                        }
+                        PastedItem::FilePath(path) => {
+                            let ins = format!("@{path} ");
+                            state.input.insert_str(state.cursor, &ins);
+                            state.cursor += ins.len();
+                        }
+                        PastedItem::PlainText(txt) => {
+                            let norm = txt.replace("\r\n", "\n").replace('\r', "\n");
+                            state.input.insert_str(state.cursor, &norm);
+                            state.cursor += norm.len();
+                        }
+                    }
+                }
+            }
+            TuiAction::Pasted(raw) => match classify_pasted_text(&raw) {
+                PastedItem::Image { name, mime, base64 } => {
+                    state.pending_attachments.push((name.clone(), mime, base64));
+                    state.blocks.push(TranscriptBlock::System(format!(
+                        "Attached pasted image: {name}"
+                    )));
+                }
+                PastedItem::ImageTooLarge(msg) => {
+                    state.blocks.push(TranscriptBlock::System(format!(
+                        "Image skipped: {msg}"
+                    )));
+                }
+                PastedItem::FilePath(path) => {
+                    let ins = format!("@{path} ");
+                    state.input.insert_str(state.cursor, &ins);
+                    state.cursor += ins.len();
+                    state.selected_slash_idx = 0;
+                }
+                PastedItem::PlainText(txt) => {
+                    let norm = txt.replace("\r\n", "\n").replace('\r', "\n");
+                    state.input.insert_str(state.cursor, &norm);
+                    state.cursor += norm.len();
+                    state.selected_slash_idx = 0;
+                }
+            },
             TuiAction::CycleModel => {
                 let pool = state.cycle_pool();
                 if !pool.is_empty() {
@@ -1603,6 +883,10 @@ fn run_interactive_tui(
                     state.provider = provider;
                     state.model = model;
                     state.apply_default_thinking();
+                    let _ = cmd_tx.send(WorkerCmd::RecordModelChange(format!(
+                        "{}/{}:{}",
+                        state.provider, state.model, state.thinking_level
+                    )));
                     if let Some(live) = &last_live_usage {
                         update_quota_badges(&mut state, live);
                     }
@@ -1632,54 +916,116 @@ fn run_interactive_tui(
                     state.scoped_models.len()
                 )));
             }
-            TuiAction::ConfigCycle(idx) => match idx {
-                0 => {
-                    let cur = ALL_THEMES
-                        .iter()
-                        .position(|t| *t == state.theme)
-                        .unwrap_or(0);
-                    state.theme = ALL_THEMES[(cur + 1) % ALL_THEMES.len()];
-                    save_setting("theme", state.theme.name());
+            TuiAction::ConfigCycleKey(key) => {
+                let scope = state.config_save_scope;
+                let next_val: Option<String> = match key.as_str() {
+                    "theme" => {
+                        let cur = ALL_THEMES.iter().position(|t| *t == state.theme).unwrap_or(0);
+                        state.theme = ALL_THEMES[(cur + 1) % ALL_THEMES.len()];
+                        Some(state.theme.name().to_string())
+                    }
+                    "terminal" => {
+                        let shells = ["powershell", "pwsh", "bash", "cmd", "zsh", "sh"];
+                        let cur = shells.iter().position(|s| *s == state.shell).unwrap_or(0);
+                        state.shell = shells[(cur + 1) % shells.len()].to_string();
+                        Some(state.shell.clone())
+                    }
+                    "mode" => {
+                        state.mode = state.mode.next();
+                        Some(state.mode.name().to_string())
+                    }
+                    "thinking" => {
+                        let levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+                        let cur = levels.iter().position(|l| *l == state.thinking_level).unwrap_or(3);
+                        state.thinking_level = levels[(cur + 1) % levels.len()].to_string();
+                        Some(state.thinking_level.clone())
+                    }
+                    "yolo" => {
+                        state.yolo = !state.yolo;
+                        let _ = cmd_tx.send(WorkerCmd::SetYolo(state.yolo));
+                        Some(state.yolo.to_string())
+                    }
+                    "show_thinking" => {
+                        state.show_thinking = !state.show_thinking;
+                        Some(state.show_thinking.to_string())
+                    }
+                    "expand_tools" => {
+                        state.expand_tools = !state.expand_tools;
+                        Some(state.expand_tools.to_string())
+                    }
+                    "reduced_motion" => {
+                        state.reduced_motion = !state.reduced_motion;
+                        Some(state.reduced_motion.to_string())
+                    }
+                    "quiet_startup" => {
+                        state.quiet_startup = !state.quiet_startup;
+                        Some(state.quiet_startup.to_string())
+                    }
+                    "bell_on_done" => {
+                        state.bell_on_done = !state.bell_on_done;
+                        Some(state.bell_on_done.to_string())
+                    }
+                    "auto_compact" => {
+                        state.auto_compact = !state.auto_compact;
+                        Some(state.auto_compact.to_string())
+                    }
+                    "compact_threshold_pct" => {
+                        let opts = [70u64, 80, 85, 90];
+                        let cur = opts.iter().position(|v| *v == state.compact_threshold_pct).unwrap_or(2);
+                        state.compact_threshold_pct = opts[(cur + 1) % opts.len()];
+                        Some(state.compact_threshold_pct.to_string())
+                    }
+                    "max_turns" => {
+                        let opts = [20usize, 40, 80];
+                        let cur = opts.iter().position(|v| *v == state.max_turns).unwrap_or(1);
+                        state.max_turns = opts[(cur + 1) % opts.len()];
+                        Some(state.max_turns.to_string())
+                    }
+                    "retry_max" => {
+                        let opts = [0usize, 2, 3];
+                        let cur = opts.iter().position(|v| *v == state.retry_max).unwrap_or(1);
+                        state.retry_max = opts[(cur + 1) % opts.len()];
+                        Some(state.retry_max.to_string())
+                    }
+                    "double_esc_rewind" => {
+                        state.double_esc_rewind = !state.double_esc_rewind;
+                        Some(state.double_esc_rewind.to_string())
+                    }
+                    "confirm_on_exit" => {
+                        state.confirm_on_exit = !state.confirm_on_exit;
+                        Some(state.confirm_on_exit.to_string())
+                    }
+                    _ => None,
+                };
+                if let Some(val) = next_val {
+                    let origin = save_setting_for_scope(scope, &key, &val);
+                    state.config_origins.insert(key, origin.to_string());
                 }
-                1 => {
-                    let shells = ["powershell", "pwsh", "bash", "cmd", "zsh", "sh"];
-                    let cur = shells
-                        .iter()
-                        .position(|s| *s == state.shell)
-                        .unwrap_or(0);
-                    state.shell = shells[(cur + 1) % shells.len()].to_string();
-                    save_setting("terminal", &state.shell);
-                }
-                2 => {
-                    state.mode = state.mode.next();
-                }
-                3 => {
-                    state.yolo = !state.yolo;
-                    let _ = cmd_tx.send(WorkerCmd::SetYolo(state.yolo));
-                }
-                4 => {
-                    let levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-                    let cur = levels
-                        .iter()
-                        .position(|l| *l == state.thinking_level)
-                        .unwrap_or(3);
-                    state.thinking_level = levels[(cur + 1) % levels.len()].to_string();
-                }
-                5 => {
-                    state.reduced_motion = !state.reduced_motion;
-                }
-                _ => {}
-            },
+            }
             TuiAction::Submit(input) => {
-                if input == "/exit" || input == "/quit" {
+                if state.is_busy && !input.starts_with('/') {
+                    state.queued_prompts.push_back(input);
+                    state.status_text = Some(format!(
+                        "Queued ({}) — Esc to interrupt",
+                        state.queued_prompts.len()
+                    ));
+                    continue;
+                }
+                if input == "/quit" {
+                    save_history(&state.history);
                     if state.scope_dirty {
                         save_scope(&state.scoped_models);
                     }
                     let _ = cmd_tx.send(WorkerCmd::Shutdown);
+                    should_quit = true;
                     break;
                 }
                 if input == "/clear" {
                     state.blocks.clear();
+                    continue;
+                }
+                if input == "/policy" {
+                    let _ = cmd_tx.send(WorkerCmd::PolicyStatus);
                     continue;
                 }
                 if input == "/usage" {
@@ -1690,8 +1036,20 @@ fn run_interactive_tui(
                     continue;
                 }
                 if input == "/reload" {
+                    let (layered, origins) = load_layered_settings();
+                    state.config_origins = origins;
+                    if let Some(t) = layered.get("theme").and_then(|s| ThemeId::from_name(s)) {
+                        state.theme = t;
+                    }
+                    if let Some(sh) = layered.get("terminal") {
+                        state.shell = sh.clone();
+                    }
+                    if let Some(m) = layered.get("mode").and_then(|s| AgentMode::from_name(s)) {
+                        state.mode = m;
+                    }
+                    state.workspace_files = scan_workspace_files(std::path::Path::new("."), 1500);
                     state.is_busy = true;
-                    state.status_text = Some("Pulling live model catalogs...".to_string());
+                    state.status_text = Some("Reloading catalogs, settings, policy, plugins & MCP...".to_string());
                     let _ = cmd_tx.send(WorkerCmd::RefreshCatalog {
                         live: true,
                         announce: true,
@@ -1715,9 +1073,9 @@ fn run_interactive_tui(
                     state.modal_idx = match state.mode {
                         AgentMode::Normal => 0,
                         AgentMode::Plan => 1,
-                        AgentMode::Execute => 2,
-                        AgentMode::Ask => 3,
-                        AgentMode::Rea => 4,
+                        AgentMode::Ask => 2,
+                        AgentMode::Rea => 3,
+                        AgentMode::Cyber => 4,
                     };
                     continue;
                 }
@@ -1731,13 +1089,14 @@ fn run_interactive_tui(
                         )));
                     } else {
                         state.blocks.push(TranscriptBlock::System(format!(
-                            "Unknown mode {:?}. Choose: normal, plan, execute, ask, rea.",
+                            "Unknown mode {:?}. Choose: normal, plan, ask, rea, cyber.",
                             arg.trim()
                         )));
                     }
                     continue;
                 }
                 if input == "/config" {
+                    state.modal_filter.clear();
                     state.modal = ActiveModal::ConfigModal;
                     state.modal_idx = 0;
                     continue;
@@ -1784,25 +1143,336 @@ fn run_interactive_tui(
                     continue;
                 }
                 if input == "/compact" {
-                    let _ = cmd_tx.send(WorkerCmd::Compact);
+                    state.is_busy = true;
+                    state.status_text = Some("Compacting session via LLM...".to_string());
+                    let _ = cmd_tx.send(WorkerCmd::Compact {
+                        provider: state.provider.clone(),
+                        model: state.model.clone(),
+                        instructions: None,
+                    });
                     continue;
                 }
-                if input == "/tree" {
-                    let _ = cmd_tx.send(WorkerCmd::Tree);
+                if let Some(arg) = input.strip_prefix("/compact ") {
+                    state.is_busy = true;
+                    state.status_text = Some("Compacting session via LLM...".to_string());
+                    let _ = cmd_tx.send(WorkerCmd::Compact {
+                        provider: state.provider.clone(),
+                        model: state.model.clone(),
+                        instructions: Some(arg.trim().to_string()),
+                    });
+                    continue;
+                }
+                if input == "/rewind" {
+                    let _ = cmd_tx.send(WorkerCmd::ListRewindCheckpoints);
+                    continue;
+                }
+                if let Some(arg) = input.strip_prefix("/rewind ") {
+                    let id = arg.trim();
+                    if id != "(empty)" && !id.is_empty() {
+                        let _ = cmd_tx.send(WorkerCmd::RewindTo(id.to_string()));
+                    }
+                    continue;
+                }
+                if input == "/new" {
+                    state.input_tokens = 0;
+                    state.output_tokens = 0;
+                    state.cache_read_tokens = 0;
+                    state.cost_usd = 0.0;
+                    let _ = cmd_tx.send(WorkerCmd::NewSession);
+                    continue;
+                }
+                if input == "/resume" {
+                    let _ = cmd_tx.send(WorkerCmd::ListSessions);
+                    continue;
+                }
+                if let Some(arg) = input.strip_prefix("/resume ") {
+                    let p = arg.trim();
+                    if p != "(none)" && !p.is_empty() {
+                        let _ = cmd_tx.send(WorkerCmd::ResumeSession(p.to_string()));
+                    }
+                    continue;
+                }
+                if input == "/rename" {
+                    let _ = cmd_tx.send(WorkerCmd::SetSessionName(None));
+                    continue;
+                }
+                if let Some(arg) = input.strip_prefix("/rename ") {
+                    let _ = cmd_tx.send(WorkerCmd::SetSessionName(Some(arg.trim().to_string())));
+                    continue;
+                }
+                if input == "/status" {
+                    let _ = cmd_tx.send(WorkerCmd::SessionInfo);
+                    continue;
+                }
+                if input == "/context" {
+                    let _ = cmd_tx.send(WorkerCmd::ContextInfo {
+                        mode: state.mode,
+                        shell: state.shell.clone(),
+                        context_window: state.context_window,
+                        last_input_tokens: state.input_tokens,
+                    });
+                    continue;
+                }
+                if input == "/clone" {
+                    let _ = cmd_tx.send(WorkerCmd::CloneSession);
+                    continue;
+                }
+                if input == "/handover" {
+                    state.is_busy = true;
+                    state.status_text = Some("Generating session handover...".to_string());
+                    let _ = cmd_tx.send(WorkerCmd::Handover {
+                        provider: state.provider.clone(),
+                        model: state.model.clone(),
+                        goal: None,
+                    });
+                    continue;
+                }
+                if let Some(arg) = input.strip_prefix("/handover ") {
+                    state.is_busy = true;
+                    state.status_text = Some("Generating session handover...".to_string());
+                    let _ = cmd_tx.send(WorkerCmd::Handover {
+                        provider: state.provider.clone(),
+                        model: state.model.clone(),
+                        goal: Some(arg.trim().to_string()),
+                    });
+                    continue;
+                }
+                if input == "/report" {
+                    state.is_busy = true;
+                    state.status_text = Some("Generating bug report PDF...".to_string());
+                    let _ = cmd_tx.send(WorkerCmd::GenerateBugReport {
+                        provider: state.provider.clone(),
+                        model: state.model.clone(),
+                        repo: state.repo_name.clone(),
+                    });
+                    continue;
+                }
+                if input == "/suggestion" {
+                    let home = std::env::var_os("USERPROFILE")
+                        .or_else(|| std::env::var_os("HOME"))
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|| std::path::PathBuf::from("."));
+                    let logs_dir = home.join(".le-vibe").join("logs");
+                    let prompt = build_optimization_digest(
+                        &sessions_dir(),
+                        &logs_dir,
+                        &self_repo_path(),
+                    );
+                    state.blocks.push(TranscriptBlock::User("/suggestion".to_string()));
+                    state.is_busy = true;
+                    state.active_started = Some(Instant::now());
+                    state.status_text = Some("Analyzing previous sessions for optimizations...".to_string());
+                    let _ = cmd_tx.send(WorkerCmd::RunPrompt {
+                        provider: state.provider.clone(),
+                        model: state.model.clone(),
+                        thinking_level: state.thinking_level.clone(),
+                        mode: state.mode,
+                        shell: state.shell.clone(),
+                        max_turns: state.max_turns,
+                        retry_max: state.retry_max,
+                        prompt,
+                    });
+                    continue;
+                }
+                if input == "/memory" {
+                    let store = le_vibe_tools::memory::MemoryRagStore::open_default();
+                    state.blocks.push(TranscriptBlock::System(store.stats_summary()));
+                    continue;
+                }
+                if let Some(arg) = input.strip_prefix("/memory ") {
+                    let q = arg.trim();
+                    let store = le_vibe_tools::memory::MemoryRagStore::open_default();
+                    if q.eq_ignore_ascii_case("index") {
+                        match store.index_repo_docs(std::path::Path::new("."), 300) {
+                            Ok(n) => state.blocks.push(TranscriptBlock::System(format!(
+                                "Indexed {n} repo doc/signature chunks into Rust RAG v2 store."
+                            ))),
+                            Err(err) => state.blocks.push(TranscriptBlock::System(format!(
+                                "RAG indexing failed: {err}"
+                            ))),
+                        }
+                    } else {
+                        let (scope, query) = if let Some(rest) = q.strip_prefix("repo ") {
+                            ("repo", rest.trim())
+                        } else {
+                            ("memory", q)
+                        };
+                        let hits = store.search(query, 5, scope);
+                        if hits.is_empty() {
+                            state.blocks.push(TranscriptBlock::System(format!(
+                                "No relevant {scope} matches for {query:?}."
+                            )));
+                        } else {
+                            let body = hits
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, h)| {
+                                    let preview: String = h.body.chars().take(180).collect();
+                                    format!(
+                                        "{}. [{}] [{}] (cos={:.2}, bm25={:.2}) {}\n   {}",
+                                        i + 1,
+                                        h.id,
+                                        h.source,
+                                        h.cosine,
+                                        h.bm25,
+                                        h.title,
+                                        preview.replace('\n', " ")
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            state.blocks.push(TranscriptBlock::System(body));
+                        }
+                    }
+                    continue;
+                }
+                if input == "/loop" || input == "/loop list" {
+                    state.blocks.push(TranscriptBlock::System(loop_scheduler.list_summary()));
+                    continue;
+                }
+                if let Some(arg) = input.strip_prefix("/loop ") {
+                    let trimmed = arg.trim();
+                    if let Some(stop_target) = trimmed.strip_prefix("stop") {
+                        let removed = loop_scheduler.stop(stop_target.trim());
+                        state.active_loops = loop_scheduler.len();
+                        state.blocks.push(TranscriptBlock::System(format!(
+                            "Stopped {removed} scheduled loop(s)."
+                        )));
+                    } else if let Some((interval, prompt)) = parse_loop_spec(trimmed) {
+                        let id = loop_scheduler.add(interval, prompt.clone());
+                        state.active_loops = loop_scheduler.len();
+                        state.blocks.push(TranscriptBlock::System(format!(
+                            "Scheduled loop #{id} every {}s: {prompt} (stop with /loop stop {id})",
+                            interval.as_secs()
+                        )));
+                    } else {
+                        state.blocks.push(TranscriptBlock::System(
+                            "Usage: /loop <interval> <prompt> (e.g. /loop 2m cargo test) | /loop list | /loop stop [id|all]"
+                                .to_string(),
+                        ));
+                    }
+                    continue;
+                }
+                if input == "/plugins" {
+                    let _ = cmd_tx.send(WorkerCmd::PluginsStatus);
+                    continue;
+                }
+                if input == "/reload-plugins" {
+                    let _ = cmd_tx.send(WorkerCmd::ReloadPlugins);
                     continue;
                 }
                 if input == "/skills" {
                     let _ = cmd_tx.send(WorkerCmd::Skills);
                     continue;
                 }
-                if input == "/scoped-models" {
-                    state.scope_view = true;
-                    state.modal = ActiveModal::ModelPicker;
+                if input == "/mcp" {
+                    let _ = cmd_tx.send(WorkerCmd::McpStatus);
+                    continue;
+                }
+                if input == "/export" {
+                    state.modal = ActiveModal::ExportPicker;
                     state.modal_idx = 0;
+                    continue;
+                }
+                if let Some(arg) = input.strip_prefix("/export ") {
+                    let parts: Vec<&str> = arg.split_whitespace().collect();
+                    let first = parts.first().copied().unwrap_or("md");
+                    let (fmt, explicit_path) = if first.eq_ignore_ascii_case("html")
+                        || first.eq_ignore_ascii_case("htm")
+                    {
+                        ("html", parts.get(1).copied())
+                    } else if first.eq_ignore_ascii_case("md")
+                        || first.eq_ignore_ascii_case("markdown")
+                    {
+                        ("md", parts.get(1).copied())
+                    } else if first.ends_with(".html") || first.ends_with(".htm") {
+                        ("html", Some(first))
+                    } else {
+                        ("md", Some(first))
+                    };
+                    let ts = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let out_path = explicit_path
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| format!("le-vibe-session-{ts}.{fmt}"));
+                    let content = if fmt == "html" {
+                        export_session_html(&state)
+                    } else {
+                        export_session_markdown(&state)
+                    };
+                    match fs::write(&out_path, content) {
+                        Ok(()) => state.blocks.push(TranscriptBlock::System(format!(
+                            "Exported session ({fmt}) to {out_path}"
+                        ))),
+                        Err(err) => state.blocks.push(TranscriptBlock::System(format!(
+                            "Export failed ({out_path}): {err}"
+                        ))),
+                    }
+                    continue;
+                }
+                if input == "/copy" {
+                    let last_msg = state.blocks.iter().rev().find_map(|b| match b {
+                        TranscriptBlock::Assistant(txt) if !txt.trim().is_empty() => Some(txt.clone()),
+                        _ => None,
+                    });
+                    if let Some(txt) = last_msg {
+                        let copied = copy_to_clipboard(&txt);
+                        if copied {
+                            state.blocks.push(TranscriptBlock::System(format!(
+                                "Copied {} chars to clipboard.",
+                                txt.len()
+                            )));
+                        } else {
+                            state.blocks.push(TranscriptBlock::System(
+                                "Clipboard copy failed (Set-Clipboard / pbcopy / xclip unavailable).".to_string(),
+                            ));
+                        }
+                    } else {
+                        state.blocks.push(TranscriptBlock::System(
+                            "No assistant response to copy.".to_string(),
+                        ));
+                    }
+                    continue;
+                }
+                if input == "/help" {
+                    state.help_scroll = 0;
+                    state.modal = ActiveModal::HelpModal;
+                    continue;
+                }
+                if input == "/trust" {
+                    match trust_cwd_in_policy() {
+                        Ok(p) => {
+                            state.blocks.push(TranscriptBlock::System(format!(
+                                "Trusted cwd in {}; reloading policy...",
+                                p.display()
+                            )));
+                            let _ = cmd_tx.send(WorkerCmd::RefreshCatalog {
+                                live: false,
+                                announce: true,
+                                provider: state.provider.clone(),
+                                model: state.model.clone(),
+                            });
+                        }
+                        Err(err) => state.blocks.push(TranscriptBlock::System(format!(
+                            "Failed to update policy.json: {err}"
+                        ))),
+                    }
+                    continue;
+                }
+                if input == "/changelog" {
+                    let path = std::path::PathBuf::from(self_repo_path()).join("change-log.md");
+                    state.changelog_lines = fs::read_to_string(&path)
+                        .map(|s| s.lines().map(ToString::to_string).collect())
+                        .unwrap_or_else(|_| vec!["change-log.md not found.".to_string()]);
+                    state.help_scroll = 0;
+                    state.modal = ActiveModal::ChangelogModal;
                     continue;
                 }
                 if input == "/model" {
                     state.scope_view = true;
+                    state.modal_filter.clear();
                     state.modal = ActiveModal::ModelPicker;
                     state.modal_idx = state
                         .picker_rows()
@@ -1823,23 +1493,6 @@ fn run_interactive_tui(
                     let _ = cmd_tx.send(WorkerCmd::ResolveModel {
                         pattern: arg.trim().to_string(),
                         default_provider: state.provider.clone(),
-                    });
-                    continue;
-                }
-                if input == "/provider" {
-                    state.modal = ActiveModal::ProviderPicker;
-                    state.modal_idx = match state.provider.as_str() {
-                        "deepseek" => 1,
-                        "agy" => 2,
-                        _ => 0,
-                    };
-                    continue;
-                }
-                if let Some(arg) = input.strip_prefix("/provider ") {
-                    state.is_busy = true;
-                    state.status_text = Some("Switching provider...".to_string());
-                    let _ = cmd_tx.send(WorkerCmd::SwitchProvider {
-                        provider: arg.trim().to_string(),
                     });
                     continue;
                 }
@@ -1916,6 +1569,52 @@ fn run_interactive_tui(
                     continue;
                 }
 
+                // Dispatch dynamic plugin/extension slash commands if matched
+                if input.starts_with('/') {
+                    let mut parts = input.splitn(2, char::is_whitespace);
+                    let cmd_name = parts.next().unwrap_or("");
+                    let cmd_args = parts.next().unwrap_or("").trim().to_string();
+                    if state
+                        .plugin_commands
+                        .iter()
+                        .any(|(name, _)| name == cmd_name)
+                    {
+                        let _ = cmd_tx.send(WorkerCmd::RunPluginCommand {
+                            name: cmd_name.to_string(),
+                            args: cmd_args,
+                        });
+                        continue;
+                    }
+                }
+
+                let mut prompt_text = input;
+                if !state.pending_attachments.is_empty() {
+                    let mut att_blocks = Vec::new();
+                    for (name, mime, b64) in state.pending_attachments.drain(..) {
+                        att_blocks.push(format!(
+                            "[attached_image name=\"{name}\" mime=\"{mime}\" data=\"data:{mime};base64,{b64}\"]"
+                        ));
+                    }
+                    prompt_text = format!("{}\n\n{prompt_text}", att_blocks.join("\n"));
+                }
+                let input = prompt_text;
+
+                if state.auto_compact
+                    && state.context_window > 0
+                    && state.input_tokens
+                        >= (state.context_window * state.compact_threshold_pct) / 100
+                {
+                    state.blocks.push(TranscriptBlock::System(format!(
+                        "Context >= {}% — running auto-compaction before turn...",
+                        state.compact_threshold_pct
+                    )));
+                    let _ = cmd_tx.send(WorkerCmd::Compact {
+                        provider: state.provider.clone(),
+                        model: state.model.clone(),
+                        instructions: None,
+                    });
+                }
+
                 state.blocks.push(TranscriptBlock::User(input.clone()));
                 state.is_busy = true;
                 state.active_started = Some(Instant::now());
@@ -1926,210 +1625,50 @@ fn run_interactive_tui(
                     thinking_level: state.thinking_level.clone(),
                     mode: state.mode,
                     shell: state.shell.clone(),
+                    max_turns: state.max_turns,
+                    retry_max: state.retry_max,
                     prompt: input,
                 });
             }
         }
+        }
+        if should_quit {
+            break;
+        }
     }
 }
 
-fn settings_file() -> PathBuf {
-    let home = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".le-vibe").join("settings.json")
-}
 
-fn load_setting(key: &str) -> Option<String> {
-    let raw = fs::read_to_string(settings_file()).ok()?;
-    let val: Value = serde_json::from_str(&raw).ok()?;
-    val.get(key)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string)
-}
-
-fn save_setting(key: &str, value: &str) {
-    let path = settings_file();
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let mut obj = fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Map<String, Value>>(&s).ok())
-        .unwrap_or_default();
-    obj.insert(key.to_string(), json!(value));
-    let _ = fs::write(
-        path,
-        serde_json::to_string_pretty(&Value::Object(obj)).unwrap_or_default() + "\n",
-    );
-}
-
-fn run_shell_command(shell: &str, command: &str) -> io::Result<std::process::Output> {
-    let lower = shell.to_lowercase();
-    if lower == "powershell" || lower == "pwsh" || lower.ends_with("powershell.exe") || lower.ends_with("pwsh.exe") {
-        Command::new(shell)
-            .args(["-NoProfile", "-Command", command])
-            .output()
-    } else if lower == "cmd" || lower.ends_with("cmd.exe") {
-        Command::new(shell).args(["/C", command]).output()
+fn copy_to_clipboard(text: &str) -> bool {
+    let candidates: &[(&str, &[&str])] = if cfg!(target_os = "windows") {
+        &[("powershell", &["-NoProfile", "-Command", "Set-Clipboard -Value $input"])]
+    } else if cfg!(target_os = "macos") {
+        &[("pbcopy", &[])]
     } else {
-        Command::new(shell).args(["-c", command]).output()
-    }
-}
-
-fn scope_file() -> PathBuf {
-    let home = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".le-vibe").join("scoped-models.json")
-}
-
-fn load_scope() -> Vec<(String, String)> {
-    let Ok(raw) = fs::read_to_string(scope_file()) else {
-        return Vec::new();
+        &[("wl-copy", &[]), ("xclip", &["-selection", "clipboard"])]
     };
-    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
-        return Vec::new();
-    };
-    value
-        .get("models")
-        .and_then(Value::as_array)
-        .map(|rows| {
-            rows.iter()
-                .filter_map(|row| {
-                    let provider = row.get("provider")?.as_str()?.to_string();
-                    let id = row.get("id")?.as_str()?.to_string();
-                    Some((provider, id))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn save_scope(scope: &[(String, String)]) {
-    let path = scope_file();
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let rows: Vec<Value> = scope
-        .iter()
-        .map(|(provider, id)| json!({ "provider": provider, "id": id }))
-        .collect();
-    let _ = fs::write(
-        path,
-        serde_json::to_string_pretty(&json!({ "models": rows })).unwrap_or_default() + "
-",
-    );
-}
-
-fn sessions_dir() -> PathBuf {
-    let home = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".le-vibe").join("sessions")
-}
-
-fn open_session(args: &[String]) -> SessionStore {
-    if let Some(path) = arg_value(args, "--session") {
-        return SessionStore::open(path).expect("failed to open session file");
-    }
-    let dir = sessions_dir();
-    if let Some(id) = arg_value(args, "--resume") {
-        let p = dir.join(format!("{id}.jsonl"));
-        return SessionStore::open(p).expect("failed to resume session");
-    }
-    if args.iter().any(|a| a == "--continue")
-        && let Ok(entries) = fs::read_dir(&dir)
-    {
-        let mut files: Vec<PathBuf> = entries
-            .filter_map(|e| e.ok().map(|x| x.path()))
-            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("jsonl"))
-            .collect();
-        files.sort();
-        if let Some(latest) = files.pop() {
-            return SessionStore::open(latest).expect("failed to continue session");
+    for (bin, args) in candidates {
+        if let Ok(mut child) = std::process::Command::new(bin)
+            .args(*args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            if child.wait().is_ok_and(|s| s.success()) {
+                return true;
+            }
         }
     }
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let p = dir.join(format!("session-{ts}.jsonl"));
-    SessionStore::open(p).unwrap_or_else(|_| SessionStore::in_memory())
-}
-
-fn run_rpc_mode(
-    bridge: &mut PythonBridge,
-    session: &mut SessionStore,
-    telemetry: &TelemetryRecorder,
-    provider: &mut String,
-    model: &mut String,
-) {
-    let stdin = io::stdin();
-    for line in stdin.lock().lines().map_while(Result::ok) {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Ok(req) = serde_json::from_str::<Value>(trimmed) else {
-            println!("{}", json!({"error": "invalid json"}));
-            continue;
-        };
-        let id = req.get("id").cloned().unwrap_or(Value::Null);
-        let method = req.get("method").and_then(Value::as_str).unwrap_or("");
-        let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
-
-        let resp = match method {
-            "list_models" => match bridge.list_models(None) {
-                Ok(models) => json!({"id": id, "result": models}),
-                Err(e) => json!({"id": id, "error": e.to_string()}),
-            },
-            "auth_status" => match bridge.auth_status() {
-                Ok(status) => json!({"id": id, "result": status}),
-                Err(e) => json!({"id": id, "error": e.to_string()}),
-            },
-            "session_tree" => json!({"id": id, "result": session.active_branch()}),
-            "set_model" => {
-                if let Some(p) = params.get("provider").and_then(Value::as_str) {
-                    *provider = p.to_string();
-                }
-                if let Some(m) = params.get("model").and_then(Value::as_str) {
-                    *model = m.to_string();
-                }
-                json!({"id": id, "result": {"provider": provider, "model": model}})
-            }
-            "prompt" => {
-                let text = params.get("text").and_then(Value::as_str).unwrap_or("");
-                let cfg = AgentConfig {
-                    provider: provider.clone(),
-                    model: model.clone(),
-                    system_prompt: Some("You are le-vibe, a concise coding assistant.".to_string()),
-                    thinking_level: "medium".to_string(),
-                    max_turns: 8,
-                    allowed_tools: None,
-                };
-                match run_turn_loop_streaming(bridge, session, telemetry, &cfg, text, |ev| {
-                    println!("{}", json!({"id": id, "event": ev}));
-                }) {
-                    Ok(reply) => json!({"id": id, "result": reply}),
-                    Err(e) => json!({"id": id, "error": e.to_string()}),
-                }
-            }
-            _ => json!({"id": id, "error": format!("unknown method: {method}")}),
-        };
-        println!("{resp}");
-        let _ = io::stdout().flush();
-    }
+    false
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_iso_utc, quota_bar, resets_in};
+    use crate::worker::{parse_iso_utc, quota_bar, resets_in};
 
     #[test]
     fn parses_iso_utc_timestamps() {

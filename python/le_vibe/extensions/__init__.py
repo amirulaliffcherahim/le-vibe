@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
+import importlib.util
 from pathlib import Path
+import sys
 from typing import Any
 
 import yaml
@@ -57,10 +59,25 @@ def discover_skills(roots: Sequence[Path]) -> list[SkillSpec]:
     return discovered
 
 
+@dataclass(frozen=True, slots=True)
+class PythonCommandSpec:
+    name: str
+    description: str
+    handler: Callable[[str], str | Awaitable[str]] = field(repr=False)
+
+
 class ExtensionHost:
     def __init__(self) -> None:
         self._hooks: dict[str, list[HookCallback]] = {}
         self._tools: dict[str, PythonToolSpec] = {}
+        self._commands: dict[str, PythonCommandSpec] = {}
+        self.load_errors: list[str] = []
+
+    def clear(self) -> None:
+        self._hooks.clear()
+        self._tools.clear()
+        self._commands.clear()
+        self.load_errors.clear()
 
     def on(self, event: str, callback: HookCallback) -> None:
         self._hooks.setdefault(event, []).append(callback)
@@ -68,8 +85,32 @@ class ExtensionHost:
     def register_tool(self, spec: PythonToolSpec) -> None:
         self._tools[spec.name] = spec
 
+    def register_command(
+        self,
+        name: str,
+        description: str,
+        handler: Callable[[str], str | Awaitable[str]],
+    ) -> None:
+        norm = name if name.startswith("/") else f"/{name}"
+        self._commands[norm] = PythonCommandSpec(name=norm, description=description, handler=handler)
+
     def list_tools(self) -> tuple[PythonToolSpec, ...]:
         return tuple(self._tools.values())
+
+    def list_commands(self) -> tuple[PythonCommandSpec, ...]:
+        return tuple(self._commands.values())
+
+    def hook_events(self) -> dict[str, int]:
+        return {k: len(v) for k, v in sorted(self._hooks.items())}
+
+    async def run_command(self, name: str, args: str = "") -> str:
+        norm = name if name.startswith("/") else f"/{name}"
+        if norm not in self._commands:
+            raise KeyError(f"Unknown plugin slash command: {norm!r}")
+        res = self._commands[norm].handler(args)
+        if isinstance(res, Awaitable):
+            res = await res
+        return str(res)
 
     async def invoke_hook(self, event: str, payload: dict[str, Any]) -> dict[str, Any]:
         current = dict(payload)
@@ -90,6 +131,31 @@ class ExtensionHost:
         return result
 
 
+def load_extensions_from_dirs(host: ExtensionHost, dirs: Sequence[Path]) -> list[str]:
+    loaded: list[str] = []
+    for directory in dirs:
+        if not directory.exists() or not directory.is_dir():
+            continue
+        for py_file in sorted(directory.glob("*.py")):
+            if py_file.name.startswith("_"):
+                continue
+            mod_name = f"le_vibe_ext_{py_file.stem}_{abs(hash(str(py_file.resolve())))}"
+            try:
+                spec = importlib.util.spec_from_file_location(mod_name, py_file)
+                if spec is None or spec.loader is None:
+                    continue
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[mod_name] = module
+                spec.loader.exec_module(module)
+                register_fn = getattr(module, "register", None)
+                if callable(register_fn):
+                    register_fn(host)
+                    loaded.append(str(py_file))
+            except Exception as exc:
+                host.load_errors.append(f"{py_file}: {exc}")
+    return loaded
+
+
 __all__ = [
     "ExtensionHost",
     "HookCallback",
@@ -97,5 +163,6 @@ __all__ = [
     "SkillSpec",
     "ToolHandler",
     "discover_skills",
+    "load_extensions_from_dirs",
     "parse_skill_file",
 ]

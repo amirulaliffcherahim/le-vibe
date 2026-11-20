@@ -1,0 +1,18 @@
+{
+  "trusted_folders": ["."],
+  "tool_permissions": {
+    "read": "always",
+    "grep": "always",
+    "find": "always",
+    "ls": "always",
+    "todo": "always",
+    "ask_user_question": "always",
+    "write": "never",
+    "edit": "never",
+    "bash": "never",
+    "powershell": "never"
+  },
+  "allowed_commands": [],
+  "allowed_paths": [],
+  "blocked_commands": []
+}

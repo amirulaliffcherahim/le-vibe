@@ -1,0 +1,617 @@
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+pub(crate) const MAX_IMAGE_BYTES: usize = 3_750_000;
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScheduledLoop {
+    pub id: u64,
+    pub interval: Duration,
+    pub prompt: String,
+    pub next_run: Instant,
+    pub runs: u64,
+}
+
+#[derive(Default)]
+pub(crate) struct LoopScheduler {
+    next_id: u64,
+    items: Vec<ScheduledLoop>,
+}
+
+impl LoopScheduler {
+    pub(crate) fn add(&mut self, interval: Duration, prompt: String) -> u64 {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.items.push(ScheduledLoop {
+            id,
+            interval,
+            prompt,
+            next_run: Instant::now() + interval,
+            runs: 0,
+        });
+        id
+    }
+
+    pub(crate) fn stop(&mut self, target: &str) -> usize {
+        if target.eq_ignore_ascii_case("all") || target.is_empty() {
+            let n = self.items.len();
+            self.items.clear();
+            return n;
+        }
+        if let Ok(id) = target.parse::<u64>() {
+            let before = self.items.len();
+            self.items.retain(|l| l.id != id);
+            return before - self.items.len();
+        }
+        0
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub(crate) fn list_summary(&self) -> String {
+        if self.items.is_empty() {
+            return "No active loops. Start one with: /loop 2m <prompt> or /loop every 30s <prompt>"
+                .to_string();
+        }
+        self.items
+            .iter()
+            .map(|l| {
+                let rem = l
+                    .next_run
+                    .saturating_duration_since(Instant::now())
+                    .as_secs();
+                format!(
+                    "#{} every {}s (runs: {}, next in {}s): {}",
+                    l.id,
+                    l.interval.as_secs(),
+                    l.runs,
+                    rem,
+                    l.prompt
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    pub(crate) fn pop_due(&mut self) -> Option<String> {
+        let now = Instant::now();
+        for item in &mut self.items {
+            if now >= item.next_run {
+                item.next_run = now + item.interval;
+                item.runs += 1;
+                return Some(item.prompt.clone());
+            }
+        }
+        None
+    }
+}
+
+/// Parses `"2m cargo test"`, `"every 30s git status"`, `"every 5 minutes check build"`.
+pub(crate) fn parse_loop_spec(raw: &str) -> Option<(Duration, String)> {
+    let tokens: Vec<&str> = raw.split_whitespace().collect();
+    if tokens.is_empty() {
+        return None;
+    }
+    let start = if tokens[0].eq_ignore_ascii_case("every") {
+        1
+    } else {
+        0
+    };
+    let tok = *tokens.get(start)?;
+    let (secs, consumed) = if let Some(n) = tok.strip_suffix('s').and_then(|v| v.parse::<u64>().ok())
+    {
+        (n, start + 1)
+    } else if let Some(n) = tok.strip_suffix('m').and_then(|v| v.parse::<u64>().ok()) {
+        (n * 60, start + 1)
+    } else if let Some(n) = tok.strip_suffix('h').and_then(|v| v.parse::<u64>().ok()) {
+        (n * 3600, start + 1)
+    } else if let Ok(n) = tok.parse::<u64>() {
+        let unit = tokens.get(start + 1).copied().unwrap_or("");
+        let mult = match unit.to_lowercase().as_str() {
+            "s" | "sec" | "secs" | "second" | "seconds" => 1,
+            "m" | "min" | "mins" | "minute" | "minutes" => 60,
+            "h" | "hr" | "hrs" | "hour" | "hours" => 3600,
+            _ => return None,
+        };
+        (n * mult, start + 2)
+    } else {
+        return None;
+    };
+
+    let prompt = tokens.get(consumed..)?.join(" ");
+    if prompt.trim().is_empty() || secs == 0 {
+        return None;
+    }
+    Some((Duration::from_secs(secs.clamp(5, 86_400)), prompt))
+}
+
+pub(crate) fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    None
+}
+
+pub(crate) fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(triple & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+pub(crate) enum PastedItem {
+    Image {
+        name: String,
+        mime: String,
+        base64: String,
+    },
+    ImageTooLarge(String),
+    FilePath(String),
+    PlainText(String),
+}
+
+pub(crate) fn try_load_image_file(path: &Path) -> Option<PastedItem> {
+    let bytes = fs::read(path).ok()?;
+    let mime = sniff_image_mime(&bytes)?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("image.png")
+        .to_string();
+    if bytes.len() > MAX_IMAGE_BYTES {
+        return Some(PastedItem::ImageTooLarge(format!(
+            "{name} is {:.2} MB (max 3.75 MB)",
+            bytes.len() as f64 / 1_000_000.0
+        )));
+    }
+    Some(PastedItem::Image {
+        name,
+        mime: mime.to_string(),
+        base64: base64_encode(&bytes),
+    })
+}
+
+pub(crate) fn classify_pasted_text(raw: &str) -> PastedItem {
+    let trimmed = raw.trim();
+    let unquoted = trimmed
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| trimmed.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(trimmed);
+    if !unquoted.is_empty() && !unquoted.contains('\n') {
+        let p = Path::new(unquoted);
+        if p.exists() && p.is_file() {
+            if let Some(img) = try_load_image_file(p) {
+                return img;
+            }
+            return PastedItem::FilePath(unquoted.to_string());
+        }
+    }
+    PastedItem::PlainText(raw.to_string())
+}
+
+pub(crate) fn grab_clipboard_item() -> Option<PastedItem> {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let tmp_png = std::env::temp_dir().join(format!("le-vibe-clip-{ts}.png"));
+
+    #[cfg(target_os = "windows")]
+    {
+        let script = format!(
+            "Add-Type -AssemblyName System.Windows.Forms; \
+             if ([Windows.Forms.Clipboard]::ContainsImage()) {{ \
+               $img = [Windows.Forms.Clipboard]::GetImage(); \
+               $img.Save('{}', [System.Drawing.Imaging.ImageFormat]::Png); \
+               Write-Output 'IMG'; \
+             }} elseif ([Windows.Forms.Clipboard]::ContainsFileDropList()) {{ \
+               $f = [Windows.Forms.Clipboard]::GetFileDropList()[0]; \
+               Write-Output ('FILE:' + $f); \
+             }} elseif ([Windows.Forms.Clipboard]::ContainsText()) {{ \
+               Write-Output ('TEXT:' + [Windows.Forms.Clipboard]::GetText()); \
+             }}",
+            tmp_png.display().to_string().replace('\'', "''")
+        );
+        if let Ok(out) = Command::new("powershell")
+            .args(["-NoProfile", "-STA", "-Command", &script])
+            .output()
+            && out.status.success()
+        {
+            let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if text == "IMG" && tmp_png.exists() {
+                let item = try_load_image_file(&tmp_png);
+                let _ = fs::remove_file(&tmp_png);
+                return item;
+            }
+            if let Some(file_path) = text.strip_prefix("FILE:") {
+                return Some(classify_pasted_text(file_path));
+            }
+            if let Some(plain) = text.strip_prefix("TEXT:") {
+                return Some(classify_pasted_text(plain));
+            }
+        }
+        None
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = tmp_png;
+        let out = if cfg!(target_os = "macos") {
+            Command::new("pbpaste").output().ok()
+        } else {
+            Command::new("wl-paste")
+                .output()
+                .ok()
+                .or_else(|| Command::new("xclip").args(["-o", "-selection", "clipboard"]).output().ok())
+        };
+        out.and_then(|o| {
+            if o.status.success() {
+                let s = String::from_utf8_lossy(&o.stdout).to_string();
+                if !s.is_empty() {
+                    return Some(classify_pasted_text(&s));
+                }
+            }
+            None
+        })
+    }
+}
+
+fn escape_html_str(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+pub(crate) fn render_bug_report_html(repo: &str, model: &str, body_md: &str) -> String {
+    let mut sections_html = String::new();
+    let mut in_code = false;
+    for line in body_md.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            in_code = !in_code;
+            if in_code {
+                sections_html.push_str("<pre><code>");
+            } else {
+                sections_html.push_str("</code></pre>\n");
+            }
+            continue;
+        }
+        if in_code {
+            sections_html.push_str(&escape_html_str(line));
+            sections_html.push('\n');
+            continue;
+        }
+        if let Some(h) = trimmed.strip_prefix("### ") {
+            sections_html.push_str(&format!("<h3>{}</h3>\n", escape_html_str(h)));
+        } else if let Some(h) = trimmed.strip_prefix("## ") {
+            sections_html.push_str(&format!("<h2>{}</h2>\n", escape_html_str(h)));
+        } else if let Some(h) = trimmed.strip_prefix("# ") {
+            sections_html.push_str(&format!("<h1>{}</h1>\n", escape_html_str(h)));
+        } else if let Some(item) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+            sections_html.push_str(&format!("<p class=\"li\">• {}</p>\n", escape_html_str(item)));
+        } else if trimmed.is_empty() {
+            sections_html.push_str("<div class=\"sp\"></div>\n");
+        } else {
+            sections_html.push_str(&format!("<p>{}</p>\n", escape_html_str(line)));
+        }
+    }
+    if in_code {
+        sections_html.push_str("</code></pre>\n");
+    }
+
+    format!(
+        "<!doctype html>\n\
+         <html lang=\"en\">\n\
+         <head>\n\
+         <meta charset=\"utf-8\">\n\
+         <title>Bug Report — {}</title>\n\
+         <style>\n\
+         @page {{ size: A4; margin: 18mm; }}\n\
+         body {{ font-family: 'Segoe UI', system-ui, sans-serif; color: #111827; line-height: 1.55; font-size: 11pt; }}\n\
+         header {{ border-bottom: 2px solid #0f172a; padding-bottom: 10px; margin-bottom: 18px; }}\n\
+         .meta {{ color: #4b5563; font-size: 9.5pt; }}\n\
+         h1 {{ font-size: 18pt; margin: 0 0 6px; color: #0f172a; }}\n\
+         h2 {{ font-size: 13pt; margin: 18px 0 6px; color: #1e3a8a; border-bottom: 1px solid #e5e7eb; padding-bottom: 3px; }}\n\
+         h3 {{ font-size: 11.5pt; margin: 12px 0 4px; color: #374151; }}\n\
+         p {{ margin: 4px 0; }}\n\
+         p.li {{ padding-left: 14px; }}\n\
+         .sp {{ height: 6px; }}\n\
+         pre {{ background: #f3f4f6; border: 1px solid #d1d5db; border-radius: 4px; padding: 10px; font-size: 9pt; overflow-x: auto; white-space: pre-wrap; }}\n\
+         </style>\n\
+         </head>\n\
+         <body>\n\
+         <header>\n\
+         <h1>Software Defect &amp; Fix Report</h1>\n\
+         <div class=\"meta\">Repository: {} · Generated by le-vibe ({})</div>\n\
+         </header>\n\
+         {sections_html}\n\
+         </body>\n\
+         </html>\n",
+        escape_html_str(repo),
+        escape_html_str(repo),
+        escape_html_str(model),
+    )
+}
+
+pub(crate) fn export_bug_report_pdf(
+    repo: &str,
+    model: &str,
+    body_md: &str,
+) -> Result<(PathBuf, bool), String> {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let html_path = std::env::temp_dir().join(format!("le-vibe-report-{ts}.html"));
+    let pdf_path = PathBuf::from(format!("bug-report-{ts}.pdf"));
+    let html = render_bug_report_html(repo, model, body_md);
+    fs::write(&html_path, &html).map_err(|e| e.to_string())?;
+
+    let browsers: &[&str] = if cfg!(target_os = "windows") {
+        &[
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            "msedge",
+            "chrome",
+        ]
+    } else if cfg!(target_os = "macos") {
+        &[
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        ]
+    } else {
+        &["chromium", "chromium-browser", "google-chrome", "microsoft-edge"]
+    };
+
+    let pdf_abs = std::env::current_dir()
+        .map(|d| d.join(&pdf_path))
+        .unwrap_or_else(|_| pdf_path.clone());
+    let file_url = format!(
+        "file:///{}",
+        html_path.to_string_lossy().replace('\\', "/")
+    );
+
+    for bin in browsers {
+        let status = Command::new(bin)
+            .args([
+                "--headless",
+                "--disable-gpu",
+                "--no-sandbox",
+                &format!("--print-to-pdf={}", pdf_abs.display()),
+                &file_url,
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if status.is_ok_and(|s| s.success()) && pdf_abs.exists() {
+            let _ = fs::remove_file(&html_path);
+            return Ok((pdf_path, true));
+        }
+    }
+
+    let fallback = PathBuf::from(format!("bug-report-{ts}.html"));
+    fs::write(&fallback, html).map_err(|e| e.to_string())?;
+    let _ = fs::remove_file(&html_path);
+    Ok((fallback, false))
+}
+
+pub(crate) fn build_optimization_digest(
+    sessions_root: &Path,
+    logs_dir: &Path,
+    self_repo: &str,
+) -> String {
+    let mut session_files: Vec<(u64, PathBuf)> = Vec::new();
+    let mut collect_jsonl = |dir: &Path| {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+                    let mtime = e
+                        .metadata()
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    session_files.push((mtime, p));
+                }
+            }
+        }
+    };
+    collect_jsonl(sessions_root);
+    if let Ok(dirs) = fs::read_dir(sessions_root) {
+        for d in dirs.flatten() {
+            if d.path().is_dir() {
+                collect_jsonl(&d.path());
+            }
+        }
+    }
+    session_files.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
+    session_files.truncate(12);
+
+    let mut total_user_turns = 0usize;
+    let mut interrupted_turns = 0usize;
+    let mut max_turn_hits = 0usize;
+    let mut tool_errors: BTreeMap<String, usize> = BTreeMap::new();
+    let mut recent_prompts: Vec<String> = Vec::new();
+
+    for (_, path) in &session_files {
+        let Ok(raw) = fs::read_to_string(path) else {
+            continue;
+        };
+        for line in raw.lines() {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let kind = v.get("kind").and_then(|x| x.as_str()).unwrap_or("message");
+            let role = v.get("role").and_then(|x| x.as_str()).unwrap_or("");
+            let content = v.get("content").and_then(|x| x.as_str()).unwrap_or("");
+            if kind == "message" && role == "user" {
+                total_user_turns += 1;
+                if recent_prompts.len() < 15 && !content.trim().is_empty() {
+                    let snippet: String = content.chars().take(90).collect();
+                    recent_prompts.push(snippet.replace('\n', " "));
+                }
+            }
+            if content.contains("[Turn interrupted:") || content.contains("[Interrupted by user]") {
+                interrupted_turns += 1;
+            }
+            if content.contains("max turns exceeded") {
+                max_turn_hits += 1;
+            }
+            if kind == "tool_result"
+                && (content.starts_with("Tool error:") || content.starts_with("Policy denied:"))
+            {
+                let tname = v
+                    .get("tool_name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                *tool_errors.entry(tname).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let mut slow_frames = 0usize;
+    let mut logged_errors: Vec<String> = Vec::new();
+    if let Ok(entries) = fs::read_dir(logs_dir) {
+        let mut logs: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("jsonl"))
+            .collect();
+        logs.sort();
+        for log_path in logs.iter().rev().take(5) {
+            if let Ok(raw) = fs::read_to_string(log_path) {
+                for line in raw.lines() {
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                        continue;
+                    };
+                    if v.get("event").and_then(|x| x.as_str()) == Some("slow_frame") {
+                        slow_frames += 1;
+                    }
+                    if v.get("category").and_then(|x| x.as_str()) == Some("error")
+                        && logged_errors.len() < 8
+                        && let Some(d) = v.get("detail").and_then(|x| x.as_str())
+                    {
+                        logged_errors.push(d.chars().take(100).collect());
+                    }
+                }
+            }
+        }
+    }
+
+    let err_summary = if tool_errors.is_empty() {
+        "none".to_string()
+    } else {
+        tool_errors
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    format!(
+        "Analyze my recent le-vibe sessions and event logs below, then propose 3-6 concrete, high-impact optimizations to le-vibe itself.\n\
+         Group suggestions into:\n\
+         1. **Hot-reloadable updates (apply + run `/reload`, no restart)**: `~/.le-vibe/SYSTEM.md`, `~/.le-vibe/policy.json`, `~/.le-vibe/settings.json`, `~/.le-vibe/extensions/*.py`, `.le-vibe/skills/*/SKILL.md`\n\
+         2. **Rust harness updates (`{self_repo}/crates/*`)**: exact file paths and changes.\n\
+         Number each suggestion (#1, #2, ...) so I can reply `apply #1` to have you edit le-vibe directly.\n\n\
+         <session_telemetry>\n\
+         sessions_analyzed: {}\n\
+         total_user_turns: {total_user_turns}\n\
+         interrupted_turns: {interrupted_turns}\n\
+         max_turn_hits: {max_turn_hits}\n\
+         tool_errors: {err_summary}\n\
+         slow_frames_gt_16ms: {slow_frames}\n\
+         recent_logged_errors: {}\n\
+         recent_user_prompts:\n- {}\n\
+         </session_telemetry>",
+        session_files.len(),
+        if logged_errors.is_empty() {
+            "none".to_string()
+        } else {
+            logged_errors.join(" | ")
+        },
+        if recent_prompts.is_empty() {
+            "(none yet)".to_string()
+        } else {
+            recent_prompts.join("\n- ")
+        }
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_loop_intervals_and_manages_scheduler() {
+        let (d1, p1) = parse_loop_spec("2m cargo test").unwrap();
+        assert_eq!(d1, Duration::from_secs(120));
+        assert_eq!(p1, "cargo test");
+
+        let (d2, p2) = parse_loop_spec("every 30 seconds git status").unwrap();
+        assert_eq!(d2, Duration::from_secs(30));
+        assert_eq!(p2, "git status");
+
+        let mut sched = LoopScheduler::default();
+        let id = sched.add(Duration::from_secs(60), "check".into());
+        assert_eq!(sched.len(), 1);
+        assert_eq!(sched.stop(&id.to_string()), 1);
+        assert_eq!(sched.len(), 0);
+    }
+
+    #[test]
+    fn sniffs_image_magic_bytes_and_encodes_base64() {
+        assert_eq!(
+            sniff_image_mime(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00]),
+            Some("image/png")
+        );
+        assert_eq!(sniff_image_mime(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("image/jpeg"));
+        assert_eq!(sniff_image_mime(b"hello"), None);
+        assert_eq!(base64_encode(b"hi!"), "aGkh");
+    }
+
+    #[test]
+    fn renders_bug_report_html_safely() {
+        let html = render_bug_report_html("le-vibe", "vibe/m", "# Title\n- item <x>\n```rs\nfn a(){}\n```");
+        assert!(html.contains("Software Defect &amp; Fix Report"));
+        assert!(html.contains("item &lt;x&gt;"));
+        assert!(html.contains("<pre><code>fn a(){}\n</code></pre>"));
+    }
+}

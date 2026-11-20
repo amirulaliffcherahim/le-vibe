@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Sequence
 import json
+import re
 from typing import Any
 
 import httpx
@@ -22,6 +23,24 @@ from le_vibe.providers.types import (
 )
 
 
+_ATTACHED_IMAGE_RE = re.compile(
+    r'\[attached_image name="[^"]*" mime="([^"]+)" data="(data:[^"]+)"\]'
+)
+
+
+def _split_multimodal_content(content: str) -> str | list[dict[str, Any]]:
+    matches = list(_ATTACHED_IMAGE_RE.finditer(content))
+    if not matches:
+        return content
+    parts: list[dict[str, Any]] = []
+    for m in matches:
+        parts.append({"type": "image_url", "image_url": {"url": m.group(2)}})
+    cleaned = _ATTACHED_IMAGE_RE.sub("", content).strip()
+    if cleaned:
+        parts.append({"type": "text", "text": cleaned})
+    return parts
+
+
 def build_vibe_payload(
     model: ModelSpec,
     context: TranscriptContext,
@@ -32,7 +51,8 @@ def build_vibe_payload(
         messages.append({"role": "system", "content": context.system_prompt})
 
     for msg in context.messages:
-        entry: dict[str, Any] = {"role": msg.role, "content": msg.content}
+        content: Any = _split_multimodal_content(msg.content) if msg.role == "user" else msg.content
+        entry: dict[str, Any] = {"role": msg.role, "content": content}
         if msg.role == "assistant" and msg.tool_calls:
             entry["tool_calls"] = [
                 {
@@ -142,6 +162,11 @@ class VibeProvider:
                 stop_reason = str(finish)
             delta = choice.get("delta") or {}
 
+            if reasoning := delta.get("reasoning_content"):
+                if isinstance(reasoning, str) and reasoning:
+                    reasoning_parts.append(reasoning)
+                    yield StreamEvent(type="thinking_delta", delta=reasoning)
+
             content = delta.get("content")
             if isinstance(content, str) and content:
                 text_parts.append(content)
@@ -172,7 +197,16 @@ class VibeProvider:
         tool_calls: list[ToolCall] = []
         for idx in sorted(tool_buffers):
             buf = tool_buffers[idx]
-            parsed_args = json.loads(buf["arguments"]) if buf["arguments"].strip() else {}
+            raw_args = buf["arguments"].strip()
+            if raw_args:
+                try:
+                    parsed_args = json.loads(raw_args)
+                    if not isinstance(parsed_args, dict):
+                        parsed_args = {"value": parsed_args}
+                except json.JSONDecodeError:
+                    parsed_args = {"_raw_arguments": raw_args}
+            else:
+                parsed_args = {}
             call = ToolCall(id=buf["id"] or f"call_{idx}", name=buf["name"], arguments=parsed_args)
             tool_calls.append(call)
             yield StreamEvent(type="tool_call", tool_call=call)

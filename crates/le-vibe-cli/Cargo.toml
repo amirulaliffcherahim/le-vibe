@@ -1,0 +1,18 @@
+[package]
+name = "le-vibe-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "le-vibe"
+path = "src/main.rs"
+
+[dependencies]
+le-vibe-agent = { path = "../le-vibe-agent" }
+le-vibe-durable = { path = "../le-vibe-durable" }
+le-vibe-pybridge = { path = "../le-vibe-pybridge" }
+le-vibe-telemetry = { path = "../le-vibe-telemetry" }
+le-vibe-tools = { path = "../le-vibe-tools" }
+le-vibe-tui = { path = "../le-vibe-tui" }
+serde_json = { workspace = true }

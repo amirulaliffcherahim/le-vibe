@@ -1,0 +1,12 @@
+[package]
+name = "le-vibe-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+le-vibe-pybridge = { path = "../le-vibe-pybridge" }
+le-vibe-schema = { path = "../le-vibe-schema" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

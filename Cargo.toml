@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/le-vibe-schema",
+    "crates/le-vibe-telemetry",
+    "crates/le-vibe-pybridge",
+    "crates/le-vibe-durable",
+    "crates/le-vibe-tools",
+    "crates/le-vibe-mcp",
+    "crates/le-vibe-agent",
+    "crates/le-vibe-tui",
+    "crates/le-vibe-cli",
+]
+
+[workspace.package]
+version = "0.1.0-beta.1"
+edition = "2024"
+license = "MIT"
+authors = ["Amirul Aliff"]
+repository = "https://github.com/amirulaliffcherahim/le-vibe"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"

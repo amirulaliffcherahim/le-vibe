@@ -1,0 +1,537 @@
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum BridgeError {
+    #[error("failed to spawn python bridge: {0}")]
+    Spawn(#[from] std::io::Error),
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("python bridge closed stdout unexpectedly")]
+    Closed,
+    #[error("python error ({kind}): {message}")]
+    Remote { kind: String, message: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub arguments: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChatMessage {
+    pub role: String,
+    #[serde(default)]
+    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Usage {
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+    #[serde(default)]
+    pub cost_usd: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AssistantMessage {
+    pub provider: String,
+    pub model: String,
+    pub content: String,
+    pub reasoning_content: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCall>,
+    pub stop_reason: String,
+    pub usage: Usage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelSpec {
+    pub id: String,
+    pub name: String,
+    pub provider: String,
+    pub base_url: String,
+    pub reasoning: bool,
+    pub context_window: u64,
+    pub max_tokens: u64,
+    #[serde(default)]
+    pub exhausted: bool,
+    #[serde(default = "default_medium_thinking")]
+    pub default_thinking: String,
+}
+
+fn default_medium_thinking() -> String {
+    "medium".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PolicyDecision {
+    pub action: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StreamEvent {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub delta: String,
+    pub tool_call: Option<ToolCall>,
+    pub message: Option<AssistantMessage>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolvedModel {
+    pub provider: String,
+    pub model: String,
+    pub thinking_level: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillInfo {
+    pub name: String,
+    pub description: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CompletionRequest {
+    pub provider: String,
+    pub model: String,
+    pub messages: Vec<ChatMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ToolDefinition>,
+    pub thinking_level: String,
+}
+
+pub trait ProviderPort {
+    fn list_providers(&mut self) -> Result<Vec<String>, BridgeError>;
+    fn list_models(&mut self, provider: Option<&str>) -> Result<Vec<ModelSpec>, BridgeError>;
+    fn complete(&mut self, request: CompletionRequest) -> Result<AssistantMessage, BridgeError>;
+    fn stream_complete(
+        &mut self,
+        request: CompletionRequest,
+        on_event: &mut dyn FnMut(StreamEvent),
+    ) -> Result<AssistantMessage, BridgeError> {
+        let msg = self.complete(request)?;
+        if !msg.content.is_empty() {
+            on_event(StreamEvent {
+                kind: "text_delta".to_string(),
+                delta: msg.content.clone(),
+                tool_call: None,
+                message: None,
+                error: None,
+            });
+        }
+        on_event(StreamEvent {
+            kind: "done".to_string(),
+            delta: String::new(),
+            tool_call: None,
+            message: Some(msg.clone()),
+            error: None,
+        });
+        Ok(msg)
+    }
+}
+
+impl PythonBridge {
+    pub fn save_api_key(&mut self, provider: &str, api_key: &str) -> Result<String, BridgeError> {
+        let val = self.call(
+            "providers.save_api_key",
+            json!({ "provider": provider, "api_key": api_key }),
+        )?;
+        Ok(val
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string())
+    }
+
+    pub fn login_vibe_oidc(&mut self) -> Result<String, BridgeError> {
+        let val = self.call("providers.login_vibe_oidc", json!({}))?;
+        Ok(val
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string())
+    }
+
+    pub fn login_agy_oauth(&mut self) -> Result<String, BridgeError> {
+        let val = self.call("providers.login_agy_oauth", json!({}))?;
+        Ok(val
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string())
+    }
+
+    pub fn auth_status(&mut self) -> Result<Value, BridgeError> {
+        self.call("providers.auth_status", json!({}))
+    }
+
+    pub fn logout(&mut self, provider: &str) -> Result<bool, BridgeError> {
+        let val = self.call("providers.logout", json!({ "provider": provider }))?;
+        Ok(val.get("removed").and_then(Value::as_bool).unwrap_or(false))
+    }
+}
+
+pub trait PolicyPort {
+    fn evaluate_tool_call(
+        &mut self,
+        tool_name: &str,
+        command: Option<&str>,
+        target_path: Option<&str>,
+    ) -> Result<PolicyDecision, BridgeError>;
+
+    fn set_yolo(&mut self, _enabled: bool) -> Result<(), BridgeError> {
+        Ok(())
+    }
+
+    fn grant_rule(
+        &mut self,
+        _tool_name: &str,
+        _command: Option<&str>,
+        _target_path: Option<&str>,
+    ) -> Result<(), BridgeError> {
+        Ok(())
+    }
+}
+
+pub trait ExtensionPort {
+    fn invoke_hook(&mut self, event: &str, payload: Value) -> Result<Value, BridgeError>;
+}
+
+pub struct PythonBridge {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    next_id: u64,
+}
+
+impl PythonBridge {
+    pub fn spawn(python_exe: &str, python_dir: &Path) -> Result<Self, BridgeError> {
+        let mut child = Command::new(python_exe)
+            .arg("-m")
+            .arg("le_vibe.bridge")
+            .env("PYTHONPATH", python_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()?;
+        let stdin = child.stdin.take().ok_or(BridgeError::Closed)?;
+        let stdout = BufReader::new(child.stdout.take().ok_or(BridgeError::Closed)?);
+        Ok(Self {
+            child,
+            stdin,
+            stdout,
+            next_id: 1,
+        })
+    }
+
+    pub fn call(&mut self, method: &str, params: Value) -> Result<Value, BridgeError> {
+        self.call_streaming(method, params, |_| {})
+    }
+
+    pub fn call_streaming(
+        &mut self,
+        method: &str,
+        params: Value,
+        mut on_stream: impl FnMut(Value),
+    ) -> Result<Value, BridgeError> {
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let req = json!({ "id": id, "method": method, "params": params });
+        let mut line = serde_json::to_string(&req)?;
+        line.push('\n');
+        self.stdin.write_all(line.as_bytes())?;
+        self.stdin.flush()?;
+
+        loop {
+            let mut resp_line = String::new();
+            let read = self.stdout.read_line(&mut resp_line)?;
+            if read == 0 {
+                return Err(BridgeError::Closed);
+            }
+
+            let resp: Value = serde_json::from_str(&resp_line)?;
+            if resp.get("stream").and_then(Value::as_bool) == Some(true) {
+                if let Some(ev) = resp.get("event").cloned() {
+                    on_stream(ev);
+                }
+                continue;
+            }
+            if let Some(err) = resp.get("error") {
+                return Err(BridgeError::Remote {
+                    kind: err
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Error")
+                        .to_string(),
+                    message: err
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown error")
+                        .to_string(),
+                });
+            }
+            return Ok(resp.get("result").cloned().unwrap_or(Value::Null));
+        }
+    }
+
+    pub fn resolve_model(
+        &mut self,
+        pattern: &str,
+        default_provider: &str,
+    ) -> Result<ResolvedModel, BridgeError> {
+        let val = self.call(
+            "providers.resolve_model",
+            json!({ "pattern": pattern, "default_provider": default_provider }),
+        )?;
+        Ok(serde_json::from_value(val)?)
+    }
+
+    pub fn list_extension_tools(&mut self) -> Result<Vec<ToolDefinition>, BridgeError> {
+        let val = self.call("extensions.list_tools", json!({}))?;
+        Ok(serde_json::from_value(val)?)
+    }
+
+    pub fn execute_extension_tool(
+        &mut self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<Value, BridgeError> {
+        self.call(
+            "extensions.execute_tool",
+            json!({ "name": name, "arguments": arguments }),
+        )
+    }
+
+    pub fn list_skills(&mut self, roots: &[&str]) -> Result<Vec<SkillInfo>, BridgeError> {
+        let val = self.call("extensions.list_skills", json!({ "roots": roots }))?;
+        Ok(serde_json::from_value(val)?)
+    }
+
+    pub fn refresh_models(
+        &mut self,
+        provider: Option<&str>,
+    ) -> Result<Vec<ModelSpec>, BridgeError> {
+        self.refresh_models_if(provider, true)
+    }
+
+    /// `force = false` leaves a catalog younger than the refresh interval untouched.
+    pub fn refresh_models_if(
+        &mut self,
+        provider: Option<&str>,
+        force: bool,
+    ) -> Result<Vec<ModelSpec>, BridgeError> {
+        let val = self.call(
+            "providers.refresh_models",
+            json!({ "provider": provider, "force": force }),
+        )?;
+        let models_val = val.get("models").cloned().unwrap_or_else(|| json!([]));
+        Ok(serde_json::from_value(models_val)?)
+    }
+
+    /// Seconds since the last catalog pull, and whether it is past the refresh interval.
+    pub fn catalog_state(&mut self) -> Result<(Option<f64>, bool), BridgeError> {
+        let val = self.call("providers.catalog_state", json!({}))?;
+        let age = val.get("age_seconds").and_then(Value::as_f64);
+        let stale = val.get("stale").and_then(Value::as_bool).unwrap_or(true);
+        Ok((age, stale))
+    }
+
+    pub fn fetch_usage(&mut self, provider: Option<&str>) -> Result<Value, BridgeError> {
+        self.call("providers.usage", json!({ "provider": provider }))
+    }
+
+    pub fn default_model(&mut self, provider: &str) -> Result<String, BridgeError> {
+        let val = self.call("providers.default_model", json!({ "provider": provider }))?;
+        Ok(val
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string())
+    }
+}
+
+impl Drop for PythonBridge {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl ProviderPort for PythonBridge {
+    fn list_providers(&mut self) -> Result<Vec<String>, BridgeError> {
+        let val = self.call("providers.list", json!({}))?;
+        Ok(serde_json::from_value(val)?)
+    }
+
+    fn list_models(&mut self, provider: Option<&str>) -> Result<Vec<ModelSpec>, BridgeError> {
+        let val = self.call("providers.list_models", json!({ "provider": provider }))?;
+        Ok(serde_json::from_value(val)?)
+    }
+
+    fn complete(&mut self, request: CompletionRequest) -> Result<AssistantMessage, BridgeError> {
+        let val = self.call("providers.complete", serde_json::to_value(request)?)?;
+        Ok(serde_json::from_value(val)?)
+    }
+
+    fn stream_complete(
+        &mut self,
+        request: CompletionRequest,
+        on_event: &mut dyn FnMut(StreamEvent),
+    ) -> Result<AssistantMessage, BridgeError> {
+        let val = self.call_streaming("providers.stream", serde_json::to_value(request)?, |ev_val| {
+            if let Ok(ev) = serde_json::from_value::<StreamEvent>(ev_val) {
+                on_event(ev);
+            }
+        })?;
+        Ok(serde_json::from_value(val)?)
+    }
+}
+
+impl PolicyPort for PythonBridge {
+    fn evaluate_tool_call(
+        &mut self,
+        tool_name: &str,
+        command: Option<&str>,
+        target_path: Option<&str>,
+    ) -> Result<PolicyDecision, BridgeError> {
+        let val = self.call(
+            "policy.evaluate",
+            json!({
+                "tool_name": tool_name,
+                "command": command,
+                "target_path": target_path,
+            }),
+        )?;
+        Ok(serde_json::from_value(val)?)
+    }
+
+    fn set_yolo(&mut self, enabled: bool) -> Result<(), BridgeError> {
+        let _ = self.call("policy.set_yolo", json!({ "enabled": enabled }))?;
+        Ok(())
+    }
+
+    fn grant_rule(
+        &mut self,
+        tool_name: &str,
+        command: Option<&str>,
+        target_path: Option<&str>,
+    ) -> Result<(), BridgeError> {
+        let _ = self.call(
+            "policy.grant_rule",
+            json!({
+                "tool_name": tool_name,
+                "command": command,
+                "target_path": target_path,
+            }),
+        )?;
+        Ok(())
+    }
+}
+
+impl ExtensionPort for PythonBridge {
+    fn invoke_hook(&mut self, event: &str, payload: Value) -> Result<Value, BridgeError> {
+        self.call(
+            "extensions.invoke_hook",
+            json!({ "event": event, "payload": payload }),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn roundtrip_with_real_python_bridge() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let python_dir = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root")
+            .join("python");
+        let venv_py = python_dir.join(".venv").join("Scripts").join("python.exe");
+        let python_exe = if venv_py.exists() {
+            venv_py.to_string_lossy().to_string()
+        } else {
+            "python".to_string()
+        };
+
+        let mut bridge = PythonBridge::spawn(&python_exe, &python_dir).expect("spawn bridge");
+        let providers = bridge.list_providers().expect("list providers");
+        assert_eq!(providers, vec!["vibe", "deepseek", "agy"]);
+
+        let _models = bridge.list_models(None).expect("list models");
+
+        let decision = bridge
+            .evaluate_tool_call("bash", Some("rm -rf /"), None)
+            .expect("evaluate policy");
+        assert_eq!(decision.action, "deny");
+
+        let (age, _stale) = bridge.catalog_state().expect("catalog state");
+        let _ = age;
+    }
+
+    #[test]
+    fn remote_errors_and_policy_yolo_roundtrip_over_bridge() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let python_dir = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root")
+            .join("python");
+        let venv_py = python_dir.join(".venv").join("Scripts").join("python.exe");
+        let python_exe = if venv_py.exists() {
+            venv_py.to_string_lossy().to_string()
+        } else {
+            "python".to_string()
+        };
+
+        let mut bridge = PythonBridge::spawn(&python_exe, &python_dir).expect("spawn bridge");
+        let err = bridge.call("unknown.method", json!({})).unwrap_err();
+        assert!(matches!(err, BridgeError::Remote { .. }));
+
+        bridge.set_yolo(true).expect("enable yolo");
+        let d = bridge
+            .evaluate_tool_call("write", None, Some("foo.txt"))
+            .expect("evaluate under yolo");
+        assert_eq!(d.action, "allow");
+    }
+}

@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Run Python provider, policy & extension tests
+        run: uv run --project python --with pytest --with pytest-asyncio --with httpx --with pyyaml --with pydantic pytest python/tests
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: astral-sh/setup-uv@v5
+      - name: Install Python deps for bridge test
+        run: uv sync --project python
+      - name: Run Rust workspace tests
+        run: cargo test --workspace
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets

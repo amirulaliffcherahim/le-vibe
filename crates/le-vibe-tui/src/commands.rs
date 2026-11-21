@@ -201,6 +201,12 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandSpec] = &[
         picker_on_bare: true,
     },
     SlashCommandSpec {
+        name: "/followup",
+        hint: "<prompt>",
+        description: "Queue a follow-up prompt after the current turn (or Alt+Enter / Ctrl+Enter)",
+        picker_on_bare: false,
+    },
+    SlashCommandSpec {
         name: "/trust",
         hint: "",
         description: "Trust current working directory in ~/.le-vibe/policy.json",

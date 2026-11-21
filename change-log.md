@@ -4,6 +4,19 @@ Chronological timeline of milestones on `master` (`https://github.com/amirulalif
 
 ---
 
+## 2026-11-21 — v0.3.0-beta.2: Steering vs. Follow-up, Queue Recovery, Project Trust Gate, External Editor, Prompt Templates & Exact Word-Wrap
+
+- **Exact Word-Wrap Visual Height (`crates/le-vibe-tui/src/transcript.rs`)**: Added `wrap_lines_exact` so every transcript line is pre-wrapped to `area.width` preserving span styles (`visual_lines.len()` matches screen rows 1:1 with zero `auto_scroll` clipping).
+- **Steering vs. Follow-up & `Esc`/`Alt+Up` Editor Recovery (`le-vibe-agent`, `le-vibe-tui`, `le-vibe-cli`)**:
+  - `Enter` while busy queues a steering message drained only after all `tool_call_id` results for the current assistant turn are appended, emitting `AgentEvent::SteeringInjected` at consumption time (zero ghost user blocks).
+  - `Alt+Enter`, `Ctrl+Enter`, and `/followup <prompt>` queue follow-ups; `Esc` and `Alt+Up` return unconsumed steering + follow-up text back into the editor.
+- **Project Trust Gate (`~/.le-vibe/trust.json`, `--approve`, `--no-approve`, `TrustModal`)**: Detects protected `.le-vibe/*` resources before loading, normalizes Windows paths, prompts interactively when unapproved, and hot-reloads via `WorkerCmd::ReloadProjectResources` on approval.
+- **External Editor (`Ctrl+G`) & Quick Copy (`Ctrl+X`)**: `TerminalGuard::suspend_for` cleanly leaves raw/alt-screen/mouse/paste modes to run `$VISUAL`/`$EDITOR` (Windows `.cmd`-safe via `cmd /C`, fallback `notepad.exe`) and clears ratatui's diff buffer on return; `Ctrl+X` copies the last assistant reply.
+- **Prompt Templates (`~/.le-vibe/prompts/*.md` & `.le-vibe/prompts/*.md`)**: Exposed automatically in `/` autocomplete with `$1..$9`, `$@`, and `$ARGUMENTS` expansion.
+- **Multi-Width TUI Layout Golden Tests (`crates/le-vibe-tui/tests/render_tests.rs`)**: `TestBackend` assertions across `60x20`, `120x35`, and `180x50` for wrapped prose, UTF-16LE shell errors, Draw.io diagrams, steering/follow-up pills, and `TrustModal`.
+
+---
+
 ## 2026-11-21 — v0.3.0-beta.1: Pi-Grade TUI Redesign, Curated Complementary Themes, XML/Draw.io Projection & Queue/Overflow Hardening
 
 - **Pi-Philosophy TUI Redesign (`crates/le-vibe-tui/src/{transcript.rs, markdown.rs, modal.rs}`)**:

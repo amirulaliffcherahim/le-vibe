@@ -575,6 +575,224 @@ pub(crate) fn build_optimization_digest(
     )
 }
 
+/// Normalize a directory path into a stable cross-platform trust key
+/// (strips Windows verbatim `\\?\` prefix and lowercases on Windows).
+pub(crate) fn canonical_folder_key(dir: &Path) -> String {
+    let raw = fs::canonicalize(dir)
+        .unwrap_or_else(|_| dir.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+    let stripped = raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_string();
+    if cfg!(windows) {
+        stripped.replace('\\', "/").to_lowercase()
+    } else {
+        stripped
+    }
+}
+
+/// Detect protected project resources under `.le-vibe/` that require project trust.
+pub(crate) fn detect_project_resources(cwd: &Path) -> Vec<String> {
+    let candidates = [
+        ".le-vibe/settings.json",
+        ".le-vibe/mcp.json",
+        ".le-vibe/policy.json",
+        ".le-vibe/SYSTEM.md",
+        ".le-vibe/APPEND_SYSTEM.md",
+        ".le-vibe/extensions",
+        ".le-vibe/prompts",
+    ];
+    let mut found = Vec::new();
+    for rel in candidates {
+        let p = cwd.join(rel);
+        if p.is_file() {
+            found.push(rel.to_string());
+        } else if p.is_dir()
+            && fs::read_dir(&p)
+                .map(|mut rd| rd.next().is_some())
+                .unwrap_or(false)
+        {
+            found.push(format!("{rel}/"));
+        }
+    }
+    found
+}
+
+fn trust_file_path() -> PathBuf {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".le-vibe").join("trust.json")
+}
+
+/// Look up saved trust decision in `~/.le-vibe/trust.json` for `cwd` or an ancestor.
+pub(crate) fn lookup_project_trust(cwd: &Path) -> Option<bool> {
+    let content = fs::read_to_string(trust_file_path()).ok()?;
+    let map: BTreeMap<String, bool> = serde_json::from_str(&content).ok()?;
+    let mut cur = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    loop {
+        let key = canonical_folder_key(&cur);
+        if let Some(&decision) = map.get(&key) {
+            return Some(decision);
+        }
+        if !cur.pop() {
+            break;
+        }
+    }
+    None
+}
+
+/// Persist a trust decision for `cwd` in `~/.le-vibe/trust.json`.
+pub(crate) fn save_project_trust(cwd: &Path, trusted: bool) {
+    let path = trust_file_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let mut map: BTreeMap<String, bool> = fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    map.insert(canonical_folder_key(cwd), trusted);
+    if let Ok(json) = serde_json::to_string_pretty(&map) {
+        let _ = fs::write(path, json);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PromptTemplate {
+    pub command: String,
+    pub description: String,
+    pub body: String,
+}
+
+/// Load Markdown prompt templates from `~/.le-vibe/prompts/*.md` and (when trusted) `.le-vibe/prompts/*.md`.
+pub(crate) fn load_prompt_templates(cwd: &Path, project_trusted: bool) -> Vec<PromptTemplate> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
+    let mut dirs = vec![PathBuf::from(home).join(".le-vibe").join("prompts")];
+    if project_trusted {
+        dirs.push(cwd.join(".le-vibe").join("prompts"));
+    }
+    let mut by_cmd: BTreeMap<String, PromptTemplate> = BTreeMap::new();
+    for dir in dirs {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Ok(body) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let trimmed = body.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let first_line = trimmed
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("Prompt template")
+                .trim_start_matches('#')
+                .trim();
+            let desc: String = first_line.chars().take(60).collect();
+            let cmd = format!("/{}", stem.trim());
+            by_cmd.insert(
+                cmd.clone(),
+                PromptTemplate {
+                    command: cmd,
+                    description: format!("[prompt] {desc}"),
+                    body: trimmed.to_string(),
+                },
+            );
+        }
+    }
+    by_cmd.into_values().collect()
+}
+
+/// Expand `$1`..`$9`, `$@`, and `$ARGUMENTS` placeholders in a prompt template.
+pub(crate) fn expand_prompt_template(body: &str, raw_args: &str) -> String {
+    let args: Vec<&str> = raw_args.split_whitespace().collect();
+    let mut out = body
+        .replace("$ARGUMENTS", raw_args.trim())
+        .replace("$@", raw_args.trim());
+    for idx in (1..=9).rev() {
+        let val = args.get(idx - 1).copied().unwrap_or("");
+        out = out.replace(&format!("${idx}"), val);
+    }
+    if !raw_args.trim().is_empty()
+        && !body.contains("$1")
+        && !body.contains("$@")
+        && !body.contains("$ARGUMENTS")
+    {
+        out.push_str("\n\n");
+        out.push_str(raw_args.trim());
+    }
+    out
+}
+
+/// Open `initial` text in `$VISUAL` / `$EDITOR` (Windows-safe `.cmd`/arg splitting, fallback `notepad.exe`/`vi`).
+pub(crate) fn run_external_editor(initial: &str) -> Result<String, String> {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let tmp = std::env::temp_dir().join(format!("le-vibe-edit-{ts}.md"));
+    fs::write(&tmp, initial).map_err(|e| format!("Failed writing temp file: {e}"))?;
+
+    let editor_env = std::env::var("VISUAL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("EDITOR").ok().filter(|s| !s.trim().is_empty()))
+        .unwrap_or_else(|| {
+            if cfg!(windows) {
+                "notepad.exe".to_string()
+            } else {
+                "vi".to_string()
+            }
+        });
+
+    let parts: Vec<&str> = editor_env.split_whitespace().collect();
+    let (prog, extra_args) = parts
+        .split_first()
+        .map(|(p, rest)| (*p, rest))
+        .unwrap_or(("notepad.exe", &[]));
+
+    let status = if cfg!(windows) {
+        let mut full_args: Vec<String> = vec!["/C".to_string(), prog.to_string()];
+        full_args.extend(extra_args.iter().map(|s| s.to_string()));
+        full_args.push(tmp.to_string_lossy().to_string());
+        Command::new("cmd")
+            .args(&full_args)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+    } else {
+        Command::new(prog)
+            .args(extra_args)
+            .arg(&tmp)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+    };
+
+    let result = match status {
+        Ok(s) if s.success() => fs::read_to_string(&tmp)
+            .map(|s| s.replace("\r\n", "\n"))
+            .map_err(|e| format!("Failed reading edited file: {e}")),
+        Ok(s) => Err(format!("Editor exited with status {s}")),
+        Err(e) => Err(format!("Failed launching editor `{editor_env}`: {e}")),
+    };
+    let _ = fs::remove_file(&tmp);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,5 +831,13 @@ mod tests {
         assert!(html.contains("Software Defect &amp; Fix Report"));
         assert!(html.contains("item &lt;x&gt;"));
         assert!(html.contains("<pre><code>fn a(){}\n</code></pre>"));
+    }
+
+    #[test]
+    fn expands_prompt_templates_and_normalizes_paths() {
+        let expanded = expand_prompt_template("Fix $1 in $2: $@", "bug main.rs asap");
+        assert_eq!(expanded, "Fix bug in main.rs: bug main.rs asap");
+        let appended = expand_prompt_template("Review this code", "src/lib.rs");
+        assert_eq!(appended, "Review this code\n\nsrc/lib.rs");
     }
 }

@@ -11,7 +11,9 @@ use le_vibe_tools::{
 };
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -36,6 +38,7 @@ pub enum AgentEvent {
     TextDelta { delta: String },
     ToolCallStart { id: String, name: String },
     ToolCallEnd { id: String, name: String, is_error: bool, output: String },
+    SteeringInjected { text: String },
     TurnEnd { stop_reason: String },
 }
 
@@ -64,6 +67,7 @@ pub struct AgentConfig {
     pub max_retries: usize,
     pub allowed_tools: Option<Vec<String>>,
     pub mode_name: Option<String>,
+    pub steering_queue: Option<Arc<Mutex<VecDeque<String>>>>,
 }
 
 impl Default for AgentConfig {
@@ -77,6 +81,7 @@ impl Default for AgentConfig {
             max_retries: 2,
             allowed_tools: None,
             mode_name: None,
+            steering_queue: None,
         }
     }
 }
@@ -782,6 +787,27 @@ pub fn run_turn_loop_cancellable<B: ProviderPort + PolicyPort + ExtensionPort>(
                 tool_call_id: Some(tc.id.clone()),
                 name: Some(tc.name.clone()),
             });
+        }
+
+        // Drain steering messages ONLY after all tool_call_id results for this turn are recorded
+        // (preserves OpenAI/Mistral/AGY message adjacency).
+        if let Some(sq) = &config.steering_queue
+            && let Ok(mut q) = sq.lock()
+        {
+            while let Some(steer_text) = q.pop_front() {
+                if !steer_text.trim().is_empty() {
+                    let _ = session.append("user", &steer_text);
+                    messages.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: steer_text.clone(),
+                        reasoning_content: None,
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                        name: None,
+                    });
+                    on_event(AgentEvent::SteeringInjected { text: steer_text });
+                }
+            }
         }
     }
 

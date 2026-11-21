@@ -16,17 +16,19 @@ use le_vibe_tui::{
     project_xml_diagram, render_status_bar,
 };
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, Write};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::cli::{CliAction, build_initial_prompt, help_text, parse_cli_args};
 use crate::debug_log::{DEBUG_ENABLED, EventLogger};
 use crate::features::{
     LoopScheduler, PastedItem, build_optimization_digest, classify_pasted_text,
-    grab_clipboard_item, parse_loop_spec,
+    detect_project_resources, expand_prompt_template, grab_clipboard_item, load_prompt_templates,
+    lookup_project_trust, parse_loop_spec, run_external_editor, save_project_trust,
 };
 use crate::rpc::{run_rpc_mode, run_streaming_prompt};
 use crate::settings::{
@@ -405,6 +407,7 @@ fn main() {
                         max_retries: 2,
                         allowed_tools,
                         mode_name: Some(agent_mode.name().to_string()),
+                        steering_queue: None,
                     };
                     run_streaming_prompt(&mut bridge, &mut session, &telemetry, &cfg, &prompt, json_mode);
                     return;
@@ -420,6 +423,7 @@ fn main() {
                 opts.yolo,
                 opts.offline,
                 opts.system_prompt_extra,
+                opts.trust_override,
             );
         }
         CliAction::Help | CliAction::Version | CliAction::ExportOffline { .. } => {}
@@ -436,6 +440,7 @@ fn run_interactive_tui(
     initial_yolo: bool,
     offline: bool,
     system_prompt_extra: Option<String>,
+    trust_override: Option<bool>,
 ) {
     let mut state = TuiState::new(
         initial_provider,
@@ -494,19 +499,46 @@ fn run_interactive_tui(
     state.status_text = Some("Syncing live model catalogs...".to_string());
     state.is_busy = true;
 
+    let cwd_path = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let detected_project_resources = detect_project_resources(&cwd_path);
+    let saved_trust = lookup_project_trust(&cwd_path);
+    let project_trusted = match trust_override {
+        Some(v) => v,
+        None if detected_project_resources.is_empty() => true,
+        None => saved_trust.unwrap_or(false),
+    };
+    let needs_trust_modal =
+        trust_override.is_none() && !detected_project_resources.is_empty() && saved_trust.is_none();
+
+    let mut prompt_templates = load_prompt_templates(&cwd_path, project_trusted);
+    for tpl in &prompt_templates {
+        state
+            .plugin_commands
+            .push((tpl.command.clone(), tpl.description.clone()));
+    }
+    if needs_trust_modal {
+        state.trust_prompt_path = cwd_path.display().to_string();
+        state.trust_prompt_resources = detected_project_resources;
+        state.modal = ActiveModal::TrustModal;
+        state.modal_idx = 0;
+    }
+
     let logger = EventLogger::new_default();
     logger.log(
         "ui",
         "tui_start",
         None,
-        format!("provider={} model={}", state.provider, state.model),
+        format!("provider={} model={} trusted={}", state.provider, state.model, project_trusted),
     );
     let cancel = Arc::new(AtomicBool::new(false));
+    let steering_queue: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
     let (cmd_tx, msg_rx, approval_tx, question_tx) = spawn_tui_worker(
         bridge,
         session,
         telemetry,
         Arc::clone(&cancel),
+        Arc::clone(&steering_queue),
+        project_trusted,
         Arc::clone(&logger),
         system_prompt_extra,
     );
@@ -649,6 +681,12 @@ fn run_interactive_tui(
                         } else {
                             state.blocks.push(TranscriptBlock::Assistant(delta));
                         }
+                    }
+                    AgentEvent::SteeringInjected { text } => {
+                        if state.steering_prompts.front().is_some_and(|s| s == &text) {
+                            state.steering_prompts.pop_front();
+                        }
+                        state.blocks.push(TranscriptBlock::User(text));
                     }
                     AgentEvent::ToolCallStart { name, .. } => {
                         turn_tools_count += 1;
@@ -812,6 +850,13 @@ fn run_interactive_tui(
                 }
                 WorkerMsg::PluginCommandsLoaded(cmds) => {
                     state.plugin_commands = cmds;
+                    for tpl in &prompt_templates {
+                        if !state.plugin_commands.iter().any(|(c, _)| c == &tpl.command) {
+                            state
+                                .plugin_commands
+                                .push((tpl.command.clone(), tpl.description.clone()));
+                        }
+                    }
                 }
                 WorkerMsg::SessionReplaced {
                     blocks,
@@ -1024,18 +1069,101 @@ fn run_interactive_tui(
                 logger.log("ui", "interrupt", None, "Esc pressed while busy");
                 cancel.store(true, Ordering::SeqCst);
                 state.usage_loading = false;
-                let cleared = state.queued_prompts.len();
-                state.queued_prompts.clear();
-                if cleared > 0 {
+                let mut recovered: Vec<String> = Vec::new();
+                if let Ok(mut sq) = steering_queue.lock() {
+                    recovered.extend(sq.drain(..));
+                }
+                state.steering_prompts.clear();
+                recovered.extend(state.queued_prompts.drain(..));
+                if !recovered.is_empty() {
+                    let count = recovered.len();
+                    let joined = recovered.join("\n");
+                    if state.input.is_empty() {
+                        state.input = joined;
+                    } else {
+                        state.input = format!("{}\n{}", joined, state.input);
+                    }
+                    state.cursor = state.input.len();
                     state.status_text = Some(format!(
-                        "Interrupting (cleared {cleared} queued prompt(s))..."
+                        "Interrupting (returned {count} queued prompt(s) to editor)..."
                     ));
-                    state.blocks.push(TranscriptBlock::System(format!(
-                        "Cleared {cleared} queued prompt(s) on Esc."
-                    )));
                 } else {
                     state.status_text = Some("Interrupting...".to_string());
                 }
+            }
+            TuiAction::RecallQueued => {
+                let mut recovered: Vec<String> = Vec::new();
+                if let Ok(mut sq) = steering_queue.lock() {
+                    recovered.extend(sq.drain(..));
+                }
+                state.steering_prompts.clear();
+                recovered.extend(state.queued_prompts.drain(..));
+                if !recovered.is_empty() {
+                    let count = recovered.len();
+                    let joined = recovered.join("\n");
+                    if state.input.is_empty() {
+                        state.input = joined;
+                    } else {
+                        state.input = format!("{}\n{}", joined, state.input);
+                    }
+                    state.cursor = state.input.len();
+                    state.status_text = Some(format!(
+                        "Returned {count} queued prompt(s) to editor."
+                    ));
+                }
+            }
+            TuiAction::OpenExternalEditor => {
+                let res = guard.suspend_for(|| run_external_editor(&state.input));
+                match res {
+                    Ok(edited) => {
+                        state.input = edited.trim_end_matches('\n').to_string();
+                        state.cursor = state.input.len();
+                    }
+                    Err(e) => {
+                        state.blocks.push(TranscriptBlock::System(format!(
+                            "External editor error: {e}"
+                        )));
+                    }
+                }
+            }
+            TuiAction::CopyLastReply => {
+                let last_msg = state.blocks.iter().rev().find_map(|b| match b {
+                    TranscriptBlock::Assistant(txt) if !txt.trim().is_empty() => Some(txt.clone()),
+                    _ => None,
+                });
+                if let Some(txt) = last_msg {
+                    if copy_to_clipboard(&txt) {
+                        state.status_text = Some(format!(
+                            "Copied last assistant reply ({} chars) to clipboard.",
+                            txt.len()
+                        ));
+                    } else {
+                        state.status_text = Some("Clipboard copy failed.".to_string());
+                    }
+                } else {
+                    state.status_text = Some("No assistant reply to copy yet.".to_string());
+                }
+            }
+            TuiAction::TrustDecision(allow) => {
+                save_project_trust(&cwd_path, allow);
+                if allow {
+                    prompt_templates = load_prompt_templates(&cwd_path, true);
+                    for tpl in &prompt_templates {
+                        if !state.plugin_commands.iter().any(|(c, _)| c == &tpl.command) {
+                            state
+                                .plugin_commands
+                                .push((tpl.command.clone(), tpl.description.clone()));
+                        }
+                    }
+                    let _ = cmd_tx.send(WorkerCmd::ReloadProjectResources);
+                } else {
+                    state.blocks.push(TranscriptBlock::System(
+                        "Project marked untrusted — skipped project .le-vibe resources.".to_string(),
+                    ));
+                }
+            }
+            TuiAction::SubmitFollowUp(text) => {
+                state.queued_prompts.push_back(text);
             }
             TuiAction::ToggleDebug => {
                 if DEBUG_ENABLED {
@@ -1249,8 +1377,29 @@ fn run_interactive_tui(
                 }
             }
             TuiAction::Submit(input) => {
+                if let Some(rest) = input.strip_prefix("/followup") {
+                    let msg = rest.trim().to_string();
+                    if msg.is_empty() {
+                        state.blocks.push(TranscriptBlock::System(
+                            "Usage: /followup <prompt> (or press Alt+Enter / Ctrl+Enter while busy)".to_string(),
+                        ));
+                    } else if state.is_busy {
+                        state.queued_prompts.push_back(msg);
+                    } else {
+                        state.queued_prompts.push_back(msg);
+                        let _ = cmd_tx.send(WorkerCmd::McpStatus);
+                    }
+                    continue;
+                }
                 if state.is_busy && !input.starts_with('/') {
-                    state.queued_prompts.push_back(input);
+                    if input.starts_with('!') {
+                        state.queued_prompts.push_back(input);
+                    } else {
+                        if let Ok(mut sq) = steering_queue.lock() {
+                            sq.push_back(input.clone());
+                        }
+                        state.steering_prompts.push_back(input);
+                    }
                     continue;
                 }
                 if state.is_busy
@@ -1862,12 +2011,31 @@ fn run_interactive_tui(
                     continue;
                 }
 
-                // Dispatch dynamic plugin/extension slash commands; reject unknown /commands locally
+                // Dispatch prompt templates and dynamic plugin/extension slash commands; reject unknown /commands locally
                 if input.starts_with('/') {
                     let mut parts = input.splitn(2, char::is_whitespace);
                     let cmd_name = parts.next().unwrap_or("");
                     let cmd_args = parts.next().unwrap_or("").trim().to_string();
-                    if state
+                    if let Some(tpl) = prompt_templates.iter().find(|t| t.command == cmd_name) {
+                        let expanded = expand_prompt_template(&tpl.body, &cmd_args);
+                        state.blocks.push(TranscriptBlock::User(expanded.clone()));
+                        state.is_busy = true;
+                        active_prompt = true;
+                        cancel.store(false, Ordering::SeqCst);
+                        state.scroll_offset = 0;
+                        state.active_started = Some(Instant::now());
+                        state.status_text = Some(format!("Working ({}/{})...", state.provider, state.model));
+                        let _ = cmd_tx.send(WorkerCmd::RunPrompt {
+                            provider: state.provider.clone(),
+                            model: state.model.clone(),
+                            thinking_level: state.thinking_level.clone(),
+                            mode: state.mode,
+                            shell: state.shell.clone(),
+                            max_turns: state.max_turns,
+                            retry_max: state.retry_max,
+                            prompt: expanded,
+                        });
+                    } else if state
                         .plugin_commands
                         .iter()
                         .any(|(name, _)| name == cmd_name)

@@ -96,6 +96,7 @@ pub enum ActiveModal {
     ChangelogModal,
     DebugModal,
     InfoModal,
+    TrustModal,
 }
 
 pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -154,6 +155,9 @@ pub struct TuiState {
     pub modal: ActiveModal,
     pub modal_idx: usize,
     pub queued_prompts: VecDeque<String>,
+    pub steering_prompts: VecDeque<String>,
+    pub trust_prompt_path: String,
+    pub trust_prompt_resources: Vec<String>,
     pub rewind_rows: Vec<(String, String, String)>,
     pub session_rows: Vec<(String, String, String)>,
     pub plugin_commands: Vec<(String, String)>,
@@ -242,6 +246,9 @@ impl TuiState {
             blocks: Vec::new(),
             available_models: Vec::new(),
             queued_prompts: VecDeque::new(),
+            steering_prompts: VecDeque::new(),
+            trust_prompt_path: String::new(),
+            trust_prompt_resources: Vec::new(),
             rewind_rows: Vec::new(),
             session_rows: Vec::new(),
             plugin_commands: Vec::new(),
@@ -511,6 +518,32 @@ impl TerminalGuard {
         let terminal = Terminal::new(backend)?;
         Ok(Self { terminal })
     }
+
+    /// Temporarily leave raw mode + alt-screen + mouse/paste capture to run an external
+    /// process (e.g. `$EDITOR`), then restore cleanly and clear ratatui's diff buffer.
+    pub fn suspend_for<F, R>(&mut self, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let mut out = io::stdout();
+        let _ = execute!(
+            out,
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
+        let _ = disable_raw_mode();
+        let res = f();
+        let _ = enable_raw_mode();
+        let _ = execute!(
+            out,
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            EnableMouseCapture
+        );
+        let _ = self.terminal.clear();
+        res
+    }
 }
 
 impl Drop for TerminalGuard {
@@ -531,6 +564,11 @@ pub enum TuiAction {
     None,
     Redraw,
     Submit(String),
+    SubmitFollowUp(String),
+    RecallQueued,
+    OpenExternalEditor,
+    CopyLastReply,
+    TrustDecision(bool),
     Interrupt,
     CycleModel,
     SaveScope,

@@ -114,6 +114,69 @@ struct SurfaceStyle {
     diff_err: Color,
 }
 
+/// Word-wrap any line wider than `max_width` while preserving span styles so
+/// `visual_lines.len()` matches rendered screen rows 1:1 (zero scroll undercount).
+fn wrap_lines_exact(lines: Vec<Line<'static>>, max_width: usize) -> Vec<Line<'static>> {
+    let w = max_width.max(8);
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        if line.width() <= w {
+            out.push(line);
+            continue;
+        }
+        let line_style = line.style;
+        let mut cur_spans: Vec<Span<'static>> = Vec::new();
+        let mut cur_w = 0usize;
+        for span in line.spans {
+            let st = span.style;
+            let text = span.content.into_owned();
+            // Tokenize keeping whitespace attached so spacing is preserved verbatim.
+            let mut idx = 0;
+            let bytes = text.as_bytes();
+            while idx < text.len() {
+                let is_ws = bytes[idx].is_ascii_whitespace();
+                let start = idx;
+                while idx < text.len() && bytes[idx].is_ascii_whitespace() == is_ws {
+                    idx += 1;
+                    while idx < text.len() && !text.is_char_boundary(idx) {
+                        idx += 1;
+                    }
+                }
+                let mut token = &text[start..idx];
+                while !token.is_empty() {
+                    let t_chars = token.chars().count();
+                    if cur_w + t_chars <= w {
+                        cur_spans.push(Span::styled(token.to_string(), st));
+                        cur_w += t_chars;
+                        break;
+                    }
+                    if cur_w > 0 && !is_ws {
+                        // Break onto a new visual line before this word
+                        out.push(Line::from(std::mem::take(&mut cur_spans)).style(line_style));
+                        cur_w = 0;
+                        continue;
+                    }
+                    // Single token longer than line width: hard-split cleanly by chars
+                    let avail = w.saturating_sub(cur_w).max(1);
+                    let chunk: String = token.chars().take(avail).collect();
+                    let consumed = chunk.len();
+                    cur_spans.push(Span::styled(chunk, st));
+                    cur_w += avail;
+                    token = &token[consumed..];
+                    if cur_w >= w && !token.is_empty() {
+                        out.push(Line::from(std::mem::take(&mut cur_spans)).style(line_style));
+                        cur_w = 0;
+                    }
+                }
+            }
+        }
+        if !cur_spans.is_empty() {
+            out.push(Line::from(cur_spans).style(line_style));
+        }
+    }
+    out
+}
+
 fn sanitize_display_line(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for ch in raw.chars() {
@@ -376,12 +439,8 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         }
     }
 
-    let wrap_w = (area.width as usize).max(1);
-    let total_visual: usize = lines
-        .iter()
-        .map(|l| l.width().max(1).div_ceil(wrap_w))
-        .sum();
-    let total_lines = total_visual.min(u16::MAX as usize) as u16;
+    let visual_lines = wrap_lines_exact(lines, area.width as usize);
+    let total_lines = visual_lines.len().min(u16::MAX as usize) as u16;
     let visible_height = area.height.max(1);
     let auto_scroll = total_lines.saturating_sub(visible_height);
     let clamped_offset = state.scroll_offset.min(auto_scroll);
@@ -398,9 +457,7 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     };
     state.rendered_scroll.set(next_scroll);
 
-    let paragraph = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((next_scroll, 0));
+    let paragraph = Paragraph::new(visual_lines).scroll((next_scroll, 0));
     frame.render_widget(paragraph, area);
 }
 
@@ -458,12 +515,21 @@ fn draw_status_strip(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             Style::default().fg(pal.muted),
         );
     }
-    if let Some(first_q) = state.queued_prompts.front() {
-        let one_line: String = first_q.lines().next().unwrap_or("").chars().take(42).collect();
+    if let Some(first_s) = state.steering_prompts.front() {
+        let one_line: String = first_s.lines().next().unwrap_or("").chars().take(36).collect();
         push_clamped(
             &mut spans,
             &mut used,
-            format!("  ↳ queued ({}): \"{one_line}\"", state.queued_prompts.len()),
+            format!("  ⚡ steer ({}): \"{one_line}\"", state.steering_prompts.len()),
+            Style::default().fg(pal.secondary),
+        );
+    }
+    if let Some(first_q) = state.queued_prompts.front() {
+        let one_line: String = first_q.lines().next().unwrap_or("").chars().take(36).collect();
+        push_clamped(
+            &mut spans,
+            &mut used,
+            format!("  ↳ follow-up ({}): \"{one_line}\"", state.queued_prompts.len()),
             Style::default().fg(pal.complementary),
         );
     }

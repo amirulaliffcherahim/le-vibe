@@ -25,6 +25,7 @@ pub(crate) struct CliOptions {
     pub no_extensions: bool,
     pub system_prompt_extra: Option<String>,
     pub offline: bool,
+    pub trust_override: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,7 +78,9 @@ OPTIONS:
   -e, --extension <path>       Load an extra Python extension file for this run
       --no-extensions          Start without loading any extensions/plugins
       --system-prompt <text>   Append custom system prompt instructions for this run
-      --offline                Skip startup live catalog/usage network requests"
+      --offline                Skip startup live catalog/usage network requests
+      --approve                Trust project .le-vibe resources for this run
+      --no-approve             Skip project .le-vibe resources for this run"
 }
 
 pub(crate) fn parse_cli_args(args: &[String]) -> CliAction {
@@ -118,6 +121,7 @@ pub(crate) fn parse_cli_args(args: &[String]) -> CliAction {
         no_extensions: false,
         system_prompt_extra: None,
         offline: false,
+        trust_override: None,
     };
     let mut positional: Vec<String> = Vec::new();
     let mut i = 0;
@@ -168,6 +172,16 @@ pub(crate) fn parse_cli_args(args: &[String]) -> CliAction {
                 }
                 "--offline" => {
                     opts.offline = true;
+                    i += 1;
+                    continue;
+                }
+                "--approve" => {
+                    opts.trust_override = Some(true);
+                    i += 1;
+                    continue;
+                }
+                "--no-approve" => {
+                    opts.trust_override = Some(false);
                     i += 1;
                     continue;
                 }

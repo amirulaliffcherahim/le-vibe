@@ -6,8 +6,9 @@ use le_vibe_telemetry::TelemetryRecorder;
 use le_vibe_tools::TodoStore;
 use le_vibe_tui::{AgentMode, TuiState, build_system_prompt, format_tokens};
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::debug_log::EventLogger;
@@ -382,6 +383,7 @@ pub(crate) enum WorkerCmd {
     PolicyStatus,
     PluginsStatus,
     ReloadPlugins,
+    ReloadProjectResources,
     RunPluginCommand {
         name: String,
         args: String,
@@ -666,11 +668,14 @@ pub(crate) fn collect_sync_payload(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_tui_worker(
     mut bridge: PythonBridge,
     mut session: SessionStore,
     telemetry: TelemetryRecorder,
     cancel: Arc<AtomicBool>,
+    steering_queue: Arc<Mutex<VecDeque<String>>>,
+    project_trusted: bool,
     logger: Arc<EventLogger>,
     system_prompt_extra: Option<String>,
 ) -> (
@@ -690,7 +695,10 @@ pub(crate) fn spawn_tui_worker(
         // Freeze `<memory_toc>` for the session so mid-session `memory_write` never busts prompt cache.
         let mut session_memory_toc = le_vibe_tools::memory::MemoryRagStore::open_default().build_toc(25);
         let mcp_started = Instant::now();
-        let mcp_paths = default_mcp_paths();
+        let mcp_paths: Vec<std::path::PathBuf> = default_mcp_paths()
+            .into_iter()
+            .filter(|p| project_trusted || p.is_absolute())
+            .collect();
         let mut mcp = McpManager::from_config_files(&mcp_paths);
         logger.log(
             "worker",
@@ -1339,6 +1347,19 @@ pub(crate) fn spawn_tui_worker(
                     }
                     let _ = msg_tx.send(WorkerMsg::Idle);
                 }
+                WorkerCmd::ReloadProjectResources => {
+                    let mcp_paths = default_mcp_paths();
+                    mcp = McpManager::from_config_files(&mcp_paths);
+                    let _ = bridge.reload_extensions();
+                    if let Ok(cmds) = bridge.list_extension_commands() {
+                        let _ = msg_tx.send(WorkerMsg::PluginCommandsLoaded(cmds));
+                    }
+                    let _ = msg_tx.send(WorkerMsg::Notice(format!(
+                        "Project trusted — loaded project MCP ({} server(s)) & extensions.",
+                        mcp.status_summary().len()
+                    )));
+                    let _ = msg_tx.send(WorkerMsg::Idle);
+                }
                 WorkerCmd::RunPluginCommand { name, args } => {
                     match bridge.run_extension_command(&name, &args) {
                         Ok(out) => {
@@ -1503,6 +1524,7 @@ pub(crate) fn spawn_tui_worker(
                         max_retries: retry_max,
                         allowed_tools: mode.allowed_tools(),
                         mode_name: Some(mode.name().to_string()),
+                        steering_queue: Some(Arc::clone(&steering_queue)),
                     };
                     let mut first_delta_at: Option<Instant> = None;
                     let mut last_delta_at: Option<Instant> = None;

@@ -168,6 +168,10 @@ pub(crate) fn draw_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         draw_usage_modal(frame, area, state);
         return;
     }
+    if state.modal == ActiveModal::TrustModal {
+        draw_trust_modal(frame, area, state);
+        return;
+    }
     if state.modal == ActiveModal::ApprovalModal {
         draw_approval_modal(frame, area, state);
         return;
@@ -192,7 +196,8 @@ pub(crate) fn draw_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         | ActiveModal::HelpModal
         | ActiveModal::ChangelogModal
         | ActiveModal::DebugModal
-        | ActiveModal::InfoModal => return,
+        | ActiveModal::InfoModal
+        | ActiveModal::TrustModal => return,
         ActiveModal::ModelPicker => {
             let base = if state.scope_view {
                 " Scoped Models · Tab: all · Space: pin · Ctrl+S: save · Type to filter · Esc "
@@ -773,6 +778,71 @@ fn draw_text_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                 .title(Span::styled(
                     truncate_ellipsis(&title, width.saturating_sub(2) as usize),
                     Style::default().fg(pal.complementary).add_modifier(Modifier::BOLD),
+                )),
+        );
+    frame.render_widget(paragraph, popup_area);
+}
+
+fn draw_trust_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let pal = state.theme.palette();
+    let width = ((area.width as f32 * 0.78) as u16)
+        .max(44)
+        .min(area.width.saturating_sub(2));
+    let height = (11 + state.trust_prompt_resources.len().min(6) as u16)
+        .min(area.height.saturating_sub(2));
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    let popup_area = Rect { x, y, width, height };
+    frame.render_widget(Clear, popup_area);
+
+    let mut lines: Vec<Line<'_>> = vec![
+        Line::from(Span::styled(
+            format!(" Folder: {}", state.trust_prompt_path),
+            Style::default().fg(pal.fg).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            " Protected project resources detected (not yet loaded):",
+            Style::default().fg(pal.muted),
+        )),
+    ];
+    for res in state.trust_prompt_resources.iter().take(6) {
+        lines.push(Line::from(Span::styled(
+            format!("   • {res}"),
+            Style::default().fg(pal.complementary),
+        )));
+    }
+    lines.push(Line::from(""));
+    let choices = [
+        ("1. Trust this folder", "Load project settings, MCP, extensions & prompts (saved to ~/.le-vibe/trust.json)"),
+        ("2. Keep untrusted", "Skip project resources for this session (user-level settings still apply)"),
+    ];
+    for (idx, (label, desc)) in choices.iter().enumerate() {
+        let selected = state.modal_idx == idx;
+        let marker = if selected { " ▸ " } else { "   " };
+        let style = if selected {
+            Style::default()
+                .fg(pal.accent)
+                .bg(pal.card_quiet_bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(pal.fg)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{marker}{label}  "), style),
+            Span::styled(*desc, Style::default().fg(pal.muted)),
+        ]));
+    }
+    let paragraph = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .style(Style::default().bg(pal.modal_bg))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(pal.warning))
+                .style(Style::default().bg(pal.modal_bg))
+                .title(Span::styled(
+                    " Project Trust Check (y/1 Trust · n/Esc Skip) ",
+                    Style::default().fg(pal.warning).add_modifier(Modifier::BOLD),
                 )),
         );
     frame.render_widget(paragraph, popup_area);

@@ -28,6 +28,7 @@ fn modal_len(state: &TuiState) -> usize {
         ActiveModal::RewindPicker => state.rewind_rows.len().max(1),
         ActiveModal::SessionPicker => state.filtered_session_rows().len().max(1),
         ActiveModal::ApprovalModal => 4,
+        ActiveModal::TrustModal => 2,
         ActiveModal::QuestionModal => state
             .question_prompt
             .as_ref()
@@ -120,6 +121,28 @@ fn handle_key_event(state: &mut TuiState, key: crossterm::event::KeyEvent) -> io
             KeyCode::Down => state.help_scroll = state.help_scroll.saturating_add(1),
             KeyCode::PageUp => state.help_scroll = state.help_scroll.saturating_sub(10),
             KeyCode::PageDown => state.help_scroll = state.help_scroll.saturating_add(10),
+            _ => {}
+        }
+        return Ok(TuiAction::None);
+    }
+
+    if state.modal == ActiveModal::TrustModal {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('1') => {
+                state.modal = ActiveModal::None;
+                return Ok(TuiAction::TrustDecision(true));
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('2') => {
+                state.modal = ActiveModal::None;
+                return Ok(TuiAction::TrustDecision(false));
+            }
+            KeyCode::Up => state.modal_idx = 0,
+            KeyCode::Down => state.modal_idx = 1,
+            KeyCode::Enter => {
+                let allow = state.modal_idx == 0;
+                state.modal = ActiveModal::None;
+                return Ok(TuiAction::TrustDecision(allow));
+            }
             _ => {}
         }
         return Ok(TuiAction::None);
@@ -392,7 +415,8 @@ fn handle_key_event(state: &mut TuiState, key: crossterm::event::KeyEvent) -> io
                     | ActiveModal::HelpModal
                     | ActiveModal::ChangelogModal
                     | ActiveModal::DebugModal
-                    | ActiveModal::InfoModal => {}
+                    | ActiveModal::InfoModal
+                    | ActiveModal::TrustModal => {}
                 }
             }
             _ => {}
@@ -411,6 +435,8 @@ fn handle_key_event(state: &mut TuiState, key: crossterm::event::KeyEvent) -> io
                 return Ok(TuiAction::None);
             }
             KeyCode::Char('d') => return Ok(TuiAction::Quit),
+            KeyCode::Char('g') => return Ok(TuiAction::OpenExternalEditor),
+            KeyCode::Char('x') => return Ok(TuiAction::CopyLastReply),
             KeyCode::Char('l') => return Ok(TuiAction::Submit("/clear".to_string())),
             KeyCode::Char('v') => return Ok(TuiAction::PasteClipboard),
             KeyCode::Char('p') => return Ok(TuiAction::CycleModel),
@@ -470,6 +496,12 @@ fn handle_key_event(state: &mut TuiState, key: crossterm::event::KeyEvent) -> io
         KeyCode::BackTab => {
             state.mode = state.mode.next();
             return Ok(TuiAction::None);
+        }
+        KeyCode::Up
+            if key.modifiers.contains(KeyModifiers::ALT)
+                && (!state.queued_prompts.is_empty() || !state.steering_prompts.is_empty()) =>
+        {
+            return Ok(TuiAction::RecallQueued);
         }
         KeyCode::Up => {
             if !matches.is_empty() || !file_matches.is_empty() {
@@ -547,6 +579,20 @@ fn handle_key_event(state: &mut TuiState, key: crossterm::event::KeyEvent) -> io
                 state.input.replace_range(at_pos..state.cursor, &replacement);
                 state.cursor = at_pos + replacement.len();
                 state.selected_slash_idx = 0;
+            }
+        }
+        KeyCode::Enter
+            if state.is_busy
+                && (key.modifiers.contains(KeyModifiers::ALT)
+                    || key.modifiers.contains(KeyModifiers::CONTROL)) =>
+        {
+            let text = state.input.trim().to_string();
+            if !text.is_empty() {
+                state.input.clear();
+                state.cursor = 0;
+                state.history_idx = None;
+                state.selected_slash_idx = 0;
+                return Ok(TuiAction::SubmitFollowUp(text));
             }
         }
         KeyCode::Enter

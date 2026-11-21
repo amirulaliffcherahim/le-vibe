@@ -4,6 +4,14 @@ Chronological timeline of milestones on `master` (`https://github.com/amirulalif
 
 ---
 
+## 2026-11-21 — v0.3.1: Windows ConPTY Mouse-Wheel Scrolling Fix, SGR Escape Guard & Right-Edge Scrollbar
+
+- **Windows ConPTY Mouse-Wheel Fix (`crates/le-vibe-tui/src/state.rs`)**: Adopted Mistral Vibe's Win32 `CONIN$` fix — clears `ENABLE_VIRTUAL_TERMINAL_INPUT` (`0x0200`) before enabling `EnableMouseCapture` + `\x1b[?1006h`, re-verifies on every `poll_tui_action` tick (`keep_vt_input_off`) in case child `bash.exe`/`powershell.exe` tools flip it back on, and restores cleanly on exit/suspend. Eliminates `[<35;x;yM` mouse escapes leaking into keyboard input.
+- **Belt-and-Suspenders SGR Key-Burst Filter & Full Modal Wheel Scrolling (`crates/le-vibe-tui/src/input.rs`)**: Swallows any leaked `\x1b[<Cb;Cx;CyM/m` key burst silently, maps wheel buttons `64`/`65` to `ScrollUp`/`ScrollDown`, and routes wheel scrolling to both text modals and picker modals (`/model`, `/theme`, `/config`, `/tree`, `/sessions`).
+- **Right-Edge Scrollbar Thumb (`crates/le-vibe-tui/src/transcript.rs`)**: Draws a subtle themed scrollbar (`┃`/`│`) whenever the transcript exceeds viewport height.
+
+---
+
 ## 2026-11-21 — v0.3.0: Full Pi-Grade TUI, DAG `/tree`, `le-vibe doctor`, Cross-Session BM25 `/search`, SSE Watchdog & `/hotkeys`
 
 Includes everything from `v0.3.0-beta.1` and `v0.3.0-beta.2`, plus Phase B:

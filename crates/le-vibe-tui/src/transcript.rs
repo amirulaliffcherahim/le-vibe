@@ -469,6 +469,25 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 
     let paragraph = Paragraph::new(visual_lines).scroll((next_scroll, 0));
     frame.render_widget(paragraph, area);
+
+    // Subtle right-edge scrollbar thumb when transcript exceeds viewport height (Pi/Vibe style)
+    if total_lines > visible_height && area.width >= 8 {
+        let track_h = area.height as usize;
+        let thumb_h = ((visible_height as usize * track_h) / total_lines as usize)
+            .clamp(1, track_h);
+        let max_scroll = auto_scroll.max(1) as usize;
+        let thumb_top = ((next_scroll as usize) * track_h.saturating_sub(thumb_h)) / max_scroll;
+        let x = area.x + area.width - 1;
+        let pal = state.theme.palette();
+        let buf = frame.buffer_mut();
+        for row in 0..track_h {
+            let y = area.y + row as u16;
+            let in_thumb = row >= thumb_top && row < thumb_top + thumb_h;
+            let cell = &mut buf[(x, y)];
+            cell.set_symbol(if in_thumb { "┃" } else { "│" });
+            cell.set_fg(if in_thumb { pal.accent } else { pal.card_quiet_bg });
+        }
+    }
 }
 
 fn draw_status_strip(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {

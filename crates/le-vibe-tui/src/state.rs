@@ -2,6 +2,7 @@ use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
 };
 use crossterm::execute;
+use crossterm::style::Print;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -490,8 +491,83 @@ impl TuiState {
     }
 }
 
+#[cfg(windows)]
+mod win_console {
+    use std::fs::{File, OpenOptions};
+    use std::os::windows::io::AsRawHandle;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
+    static OWNED: AtomicBool = AtomicBool::new(false);
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetConsoleMode(h_console_handle: *mut std::ffi::c_void, lp_mode: *mut u32) -> i32;
+        fn SetConsoleMode(h_console_handle: *mut std::ffi::c_void, dw_mode: u32) -> i32;
+    }
+
+    fn open_conin() -> Option<File> {
+        OpenOptions::new().read(true).write(true).open("CONIN$").ok()
+    }
+
+    fn set_vt_input(file: &File, on: bool) -> bool {
+        let handle = file.as_raw_handle();
+        let mut mode: u32 = 0;
+        // SAFETY: `handle` is a valid console input handle opened from CONIN$.
+        unsafe {
+            GetConsoleMode(handle, &mut mode) != 0
+                && ((mode & ENABLE_VIRTUAL_TERMINAL_INPUT) != 0) != on
+                && SetConsoleMode(handle, mode ^ ENABLE_VIRTUAL_TERMINAL_INPUT) != 0
+        }
+    }
+
+    pub fn disable_vt_input() -> bool {
+        OWNED.store(true, Ordering::SeqCst);
+        open_conin().is_some_and(|f| set_vt_input(&f, false))
+    }
+
+    pub fn restore_vt_input(was_on: bool) {
+        OWNED.store(false, Ordering::SeqCst);
+        if was_on
+            && let Some(f) = open_conin()
+        {
+            let _ = set_vt_input(&f, true);
+        }
+    }
+
+    /// Re-clear ENABLE_VIRTUAL_TERMINAL_INPUT if a child process (bash.exe / powershell)
+    /// flipped it back on mid-session, preventing ConPTY from leaking SGR mouse escapes as keys.
+    pub fn keep_vt_input_off() {
+        if !OWNED.load(Ordering::Relaxed) {
+            return;
+        }
+        thread_local! {
+            static CONIN: Option<File> = open_conin();
+        }
+        CONIN.with(|f| {
+            if let Some(file) = f {
+                let _ = set_vt_input(file, false);
+            }
+        });
+    }
+}
+
+#[cfg(not(windows))]
+mod win_console {
+    pub fn disable_vt_input() -> bool {
+        false
+    }
+    pub fn restore_vt_input(_was_on: bool) {}
+    pub fn keep_vt_input_off() {}
+}
+
+pub fn keep_vt_input_off() {
+    win_console::keep_vt_input_off();
+}
+
 pub struct TerminalGuard {
     pub terminal: Terminal<CrosstermBackend<Stdout>>,
+    vt_input_was_on: bool,
 }
 
 impl TerminalGuard {
@@ -502,13 +578,17 @@ impl TerminalGuard {
             let mut out = io::stdout();
             let _ = execute!(
                 out,
-                DisableBracketedPaste,
                 DisableMouseCapture,
+                DisableBracketedPaste,
                 LeaveAlternateScreen
             );
+            if cfg!(windows) {
+                let _ = execute!(out, Print("\x1b[?1006l"));
+            }
             prev_hook(info);
         }));
         enable_raw_mode()?;
+        let vt_input_was_on = win_console::disable_vt_input();
         let mut stdout = io::stdout();
         execute!(
             stdout,
@@ -516,9 +596,15 @@ impl TerminalGuard {
             EnableBracketedPaste,
             EnableMouseCapture
         )?;
+        if cfg!(windows) {
+            execute!(stdout, Print("\x1b[?1006h"))?;
+        }
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
-        Ok(Self { terminal })
+        Ok(Self {
+            terminal,
+            vt_input_was_on,
+        })
     }
 
     /// Temporarily leave raw mode + alt-screen + mouse/paste capture to run an external
@@ -534,15 +620,23 @@ impl TerminalGuard {
             DisableBracketedPaste,
             LeaveAlternateScreen
         );
+        if cfg!(windows) {
+            let _ = execute!(out, Print("\x1b[?1006l"));
+        }
         let _ = disable_raw_mode();
+        win_console::restore_vt_input(self.vt_input_was_on);
         let res = f();
         let _ = enable_raw_mode();
+        self.vt_input_was_on = win_console::disable_vt_input();
         let _ = execute!(
             out,
             EnterAlternateScreen,
             EnableBracketedPaste,
             EnableMouseCapture
         );
+        if cfg!(windows) {
+            let _ = execute!(out, Print("\x1b[?1006h"));
+        }
         let _ = self.terminal.clear();
         res
     }
@@ -553,11 +647,15 @@ impl Drop for TerminalGuard {
         let _ = disable_raw_mode();
         let _ = execute!(
             self.terminal.backend_mut(),
-            DisableBracketedPaste,
             DisableMouseCapture,
+            DisableBracketedPaste,
             LeaveAlternateScreen
         );
+        if cfg!(windows) {
+            let _ = execute!(self.terminal.backend_mut(), Print("\x1b[?1006l"));
+        }
         let _ = self.terminal.show_cursor();
+        win_console::restore_vt_input(self.vt_input_was_on);
     }
 }
 

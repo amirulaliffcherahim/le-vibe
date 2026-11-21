@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use crate::commands::filter_slash_commands_with_dynamic;
 use crate::editor::{next_char_boundary, prev_char_boundary};
 use crate::mode::{ALL_MODES, ALL_SHELLS};
-use crate::state::{ActiveModal, TuiAction, TuiState};
+use crate::state::{ActiveModal, TuiAction, TuiState, keep_vt_input_off};
 use crate::theme::ALL_THEMES;
 
 fn modal_len(state: &TuiState) -> usize {
@@ -37,7 +37,109 @@ fn modal_len(state: &TuiState) -> usize {
     }
 }
 
+fn apply_wheel_scroll(state: &mut TuiState, up: bool) {
+    match state.modal {
+        ActiveModal::None => {
+            if up {
+                state.scroll_offset = state.scroll_offset.saturating_add(3);
+            } else {
+                state.scroll_offset = state.scroll_offset.saturating_sub(3);
+            }
+        }
+        ActiveModal::UsageModal => {
+            if up {
+                state.usage_scroll = state.usage_scroll.saturating_sub(3);
+            } else {
+                state.usage_scroll = state.usage_scroll.saturating_add(3);
+            }
+        }
+        ActiveModal::HelpModal
+        | ActiveModal::ChangelogModal
+        | ActiveModal::DebugModal
+        | ActiveModal::InfoModal => {
+            if up {
+                state.help_scroll = state.help_scroll.saturating_sub(3);
+            } else {
+                state.help_scroll = state.help_scroll.saturating_add(3);
+            }
+        }
+        _ => {
+            let len = modal_len(state);
+            if len > 0 {
+                if up {
+                    state.modal_idx = state.modal_idx.saturating_sub(1);
+                } else if state.modal_idx + 1 < len {
+                    state.modal_idx += 1;
+                }
+            }
+        }
+    }
+}
+
+/// Parse a leaked SGR mouse CSI payload (after `[<`) like `35;82;17M` or `64;50;12M`.
+/// Returns `Some(Some(true))` for wheel up, `Some(Some(false))` for wheel down,
+/// `Some(None)` for motion/click to swallow, or `None` if not a valid SGR mouse payload.
+fn parse_sgr_mouse_payload(payload: &str) -> Option<Option<bool>> {
+    let body = payload.strip_suffix('M').or_else(|| payload.strip_suffix('m'))?;
+    let mut parts = body.split(';');
+    let btn: u32 = parts.next()?.parse().ok()?;
+    let _x: u32 = parts.next()?.parse().ok()?;
+    let _y: u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    match btn {
+        64 => Some(Some(true)),
+        65 => Some(Some(false)),
+        _ => Some(None),
+    }
+}
+
+/// Drain a leaked `\x1b[<Cb;Cx;CyM` sequence if `Esc` arrived as part of a rapid key burst
+/// (e.g. ConPTY race with a child process or MSYS2/SSH). Returns `Some(wheel_opt)` if swallowed.
+fn try_swallow_leaked_sgr_mouse() -> Option<Option<bool>> {
+    if !event::poll(Duration::ZERO).unwrap_or(false) {
+        return None;
+    }
+    let Ok(Event::Key(k1)) = event::read() else {
+        return None;
+    };
+    if k1.kind != KeyEventKind::Press || k1.code != KeyCode::Char('[') {
+        return None;
+    }
+    if !event::poll(Duration::from_millis(2)).unwrap_or(false) {
+        return None;
+    }
+    let Ok(Event::Key(k2)) = event::read() else {
+        return None;
+    };
+    if k2.kind != KeyEventKind::Press || k2.code != KeyCode::Char('<') {
+        return None;
+    }
+    let mut buf = String::with_capacity(16);
+    for _ in 0..24 {
+        if !event::poll(Duration::from_millis(2)).unwrap_or(false) {
+            break;
+        }
+        if let Ok(Event::Key(k)) = event::read() {
+            if k.kind != KeyEventKind::Press {
+                continue;
+            }
+            if let KeyCode::Char(c) = k.code {
+                buf.push(c);
+                if c == 'M' || c == 'm' {
+                    return parse_sgr_mouse_payload(&buf);
+                }
+            } else {
+                break;
+            }
+        }
+    }
+    Some(None)
+}
+
 pub fn poll_tui_action(state: &mut TuiState, timeout: Duration) -> io::Result<TuiAction> {
+    keep_vt_input_off();
     let deadline = Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -53,35 +155,11 @@ pub fn poll_tui_action(state: &mut TuiState, timeout: Duration) -> io::Result<Tu
             }
             Event::Mouse(mouse) => match mouse.kind {
                 MouseEventKind::ScrollUp => {
-                    if state.modal == ActiveModal::UsageModal {
-                        state.usage_scroll = state.usage_scroll.saturating_sub(3);
-                    } else if matches!(
-                        state.modal,
-                        ActiveModal::HelpModal
-                            | ActiveModal::ChangelogModal
-                            | ActiveModal::DebugModal
-                            | ActiveModal::InfoModal
-                    ) {
-                        state.help_scroll = state.help_scroll.saturating_sub(3);
-                    } else if state.modal == ActiveModal::None {
-                        state.scroll_offset = state.scroll_offset.saturating_add(3);
-                    }
+                    apply_wheel_scroll(state, true);
                     return Ok(TuiAction::Redraw);
                 }
                 MouseEventKind::ScrollDown => {
-                    if state.modal == ActiveModal::UsageModal {
-                        state.usage_scroll = state.usage_scroll.saturating_add(3);
-                    } else if matches!(
-                        state.modal,
-                        ActiveModal::HelpModal
-                            | ActiveModal::ChangelogModal
-                            | ActiveModal::DebugModal
-                            | ActiveModal::InfoModal
-                    ) {
-                        state.help_scroll = state.help_scroll.saturating_add(3);
-                    } else if state.modal == ActiveModal::None {
-                        state.scroll_offset = state.scroll_offset.saturating_sub(3);
-                    }
+                    apply_wheel_scroll(state, false);
                     return Ok(TuiAction::Redraw);
                 }
                 // Ignore mouse move/click noise immediately so it causes zero lag or redraws.
@@ -89,6 +167,15 @@ pub fn poll_tui_action(state: &mut TuiState, timeout: Duration) -> io::Result<Tu
             },
             Event::Resize(_, _) => return Ok(TuiAction::Redraw),
             Event::Key(key) if key.kind == KeyEventKind::Press => {
+                if key.code == KeyCode::Esc
+                    && let Some(wheel) = try_swallow_leaked_sgr_mouse()
+                {
+                    if let Some(up) = wheel {
+                        apply_wheel_scroll(state, up);
+                        return Ok(TuiAction::Redraw);
+                    }
+                    continue;
+                }
                 let action = handle_key_event(state, key)?;
                 if matches!(action, TuiAction::None) {
                     return Ok(TuiAction::Redraw);
@@ -684,5 +771,18 @@ fn handle_key_event(state: &mut TuiState, key: crossterm::event::KeyEvent) -> io
     }
 
     Ok(TuiAction::None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_leaked_sgr_mouse_sequences() {
+        assert_eq!(parse_sgr_mouse_payload("35;82;17M"), Some(None));
+        assert_eq!(parse_sgr_mouse_payload("64;50;12M"), Some(Some(true)));
+        assert_eq!(parse_sgr_mouse_payload("65;50;12m"), Some(Some(false)));
+        assert_eq!(parse_sgr_mouse_payload("not-mouse"), None);
+    }
 }
 

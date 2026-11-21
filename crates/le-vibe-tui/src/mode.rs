@@ -172,17 +172,47 @@ pub fn build_system_prompt(
                 cap_utf8(&raw, 4000)
             ));
         }
+        // Pi-compatible APPEND_SYSTEM.md: project file takes precedence over user file
+        let project_append = std::path::Path::new(cwd)
+            .join(".le-vibe")
+            .join("APPEND_SYSTEM.md");
+        let user_append = std::path::Path::new(&home)
+            .join(".le-vibe")
+            .join("APPEND_SYSTEM.md");
+        let append_path = if project_append.is_file() {
+            Some(project_append)
+        } else if user_append.is_file() {
+            Some(user_append)
+        } else {
+            None
+        };
+        if let Some(ap) = append_path
+            && let Ok(raw) = std::fs::read_to_string(&ap)
+            && !raw.trim().is_empty()
+        {
+            prompt.push_str(&format!(
+                "\n\n<append_system path=\"{}\">\n{}\n</append_system>",
+                ap.display(),
+                cap_utf8(&raw, 4000)
+            ));
+        }
     }
 
-    let agents_path = std::path::Path::new(cwd).join("AGENTS.md");
-    if let Ok(agents_md) = std::fs::read_to_string(&agents_path)
-        && !agents_md.trim().is_empty()
-    {
-        prompt.push_str(&format!(
-            "\n\n<project_instructions path=\"{}\">\n{}\n</project_instructions>",
-            agents_path.display(),
-            cap_utf8(&agents_md, 4000)
-        ));
+    // Pi-compatible context file discovery: AGENTS.override.md replaces AGENTS.md/CLAUDE.md in cwd
+    let cwd_dir = std::path::Path::new(cwd);
+    let context_candidates = ["AGENTS.override.md", "AGENTS.md", "CLAUDE.md"];
+    for name in context_candidates {
+        let candidate = cwd_dir.join(name);
+        if let Ok(agents_md) = std::fs::read_to_string(&candidate)
+            && !agents_md.trim().is_empty()
+        {
+            prompt.push_str(&format!(
+                "\n\n<project_instructions path=\"{}\">\n{}\n</project_instructions>",
+                candidate.display(),
+                cap_utf8(&agents_md, 4000)
+            ));
+            break;
+        }
     }
 
     prompt

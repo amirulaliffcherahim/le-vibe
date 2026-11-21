@@ -123,6 +123,24 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandSpec] = &[
         picker_on_bare: true,
     },
     SlashCommandSpec {
+        name: "/search",
+        hint: "<query>",
+        description: "BM25 search across all saved past sessions",
+        picker_on_bare: false,
+    },
+    SlashCommandSpec {
+        name: "/hotkeys",
+        hint: "",
+        description: "Show active keyboard shortcuts (and ~/.le-vibe/keybindings.json)",
+        picker_on_bare: true,
+    },
+    SlashCommandSpec {
+        name: "/tree",
+        hint: "",
+        description: "Navigate session DAG branches & jump to any user/assistant node",
+        picker_on_bare: true,
+    },
+    SlashCommandSpec {
         name: "/rewind",
         hint: "",
         description: "Rewind to an earlier user-input checkpoint",

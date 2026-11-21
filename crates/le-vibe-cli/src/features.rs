@@ -793,6 +793,153 @@ pub(crate) fn run_external_editor(initial: &str) -> Result<String, String> {
     result
 }
 
+/// Pure-Rust BM25 search across saved session JSONL files (zero extra deps).
+pub(crate) fn search_past_sessions(session_dirs: &[PathBuf], query: &str, limit: usize) -> Vec<String> {
+    let q_terms: Vec<String> = query
+        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+        .map(|s| s.to_lowercase())
+        .filter(|s| s.len() >= 2)
+        .collect();
+    if q_terms.is_empty() {
+        return vec!["Enter at least one search term (min 2 chars).".to_string()];
+    }
+
+    struct Hit {
+        file: String,
+        role: String,
+        snippet: String,
+        score: f64,
+    }
+    let mut hits: Vec<Hit> = Vec::new();
+    for dir in session_dirs {
+        let Ok(rd) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Ok(raw) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let fname = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("session.jsonl")
+                .to_string();
+            for line in raw.lines() {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                let role = v.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                if !matches!(role, "user" | "assistant") {
+                    continue;
+                }
+                let content = v.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                if content.trim().is_empty() {
+                    continue;
+                }
+                let lower = content.to_lowercase();
+                let dl = lower.split_whitespace().count().max(1) as f64;
+                let mut score = 0.0f64;
+                for term in &q_terms {
+                    let tf = lower.matches(term.as_str()).count() as f64;
+                    if tf > 0.0 {
+                        let k1 = 1.2;
+                        let b = 0.75;
+                        let avgdl = 80.0;
+                        score += (tf * (k1 + 1.0)) / (tf + k1 * (1.0 - b + b * (dl / avgdl)));
+                    }
+                }
+                if score > 0.0 {
+                    let snippet: String = content
+                        .replace('\n', " ")
+                        .chars()
+                        .take(120)
+                        .collect();
+                    hits.push(Hit {
+                        file: fname.clone(),
+                        role: role.to_string(),
+                        snippet,
+                        score,
+                    });
+                }
+            }
+        }
+    }
+    hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    if hits.is_empty() {
+        return vec![format!("No matches found for \"{query}\" across saved sessions.")];
+    }
+    let mut lines = vec![format!("Session Search: \"{query}\" (top {} hit(s))", hits.len().min(limit)), String::new()];
+    for h in hits.into_iter().take(limit) {
+        lines.push(format!("• [{:.2}] {} ({})", h.score, h.file, h.role));
+        lines.push(format!("    {}", h.snippet));
+    }
+    lines
+}
+
+/// Build the active `/hotkeys` reference lines, merging any overrides in `~/.le-vibe/keybindings.json`.
+pub(crate) fn format_hotkeys_lines() -> Vec<String> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
+    let kb_path = PathBuf::from(&home).join(".le-vibe").join("keybindings.json");
+    let custom: BTreeMap<String, String> = fs::read_to_string(&kb_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let resolve = |action: &str, default_key: &str| -> String {
+        custom
+            .get(action)
+            .cloned()
+            .unwrap_or_else(|| default_key.to_string())
+    };
+    let mut lines = vec![
+        format!("Keybindings config: {}", kb_path.display()),
+        String::new(),
+        "Core Controls:".to_string(),
+        format!("  • {:<18} Submit prompt (or inject steering while busy)", resolve("submit", "Enter")),
+        format!("  • {:<18} Queue follow-up while busy", resolve("followup", "Alt+Enter / Ctrl+Enter")),
+        format!("  • {:<18} Return queued/steering prompts to editor", resolve("recall_queued", "Alt+Up")),
+        format!("  • {:<18} Interrupt turn & return queued prompts (or double-Esc /rewind)", resolve("interrupt", "Esc")),
+        format!("  • {:<18} Insert newline in editor", resolve("newline", "Shift+Enter / Ctrl+J")),
+        format!("  • {:<18} Open input in external editor ($VISUAL/$EDITOR)", resolve("external_editor", "Ctrl+G")),
+        format!("  • {:<18} Copy last assistant reply to clipboard", resolve("copy_last", "Ctrl+X")),
+        format!("  • {:<18} Paste text / image / file attachment", resolve("paste", "Ctrl+V")),
+        String::new(),
+        "Navigation & Views:".to_string(),
+        format!("  • {:<18} Cycle agent mode (normal/plan/ask/rea/cyber)", resolve("cycle_mode", "Shift+Tab")),
+        format!("  • {:<18} Cycle scoped models", resolve("cycle_model", "Ctrl+P")),
+        format!("  • {:<18} Toggle thinking blocks", resolve("toggle_thinking", "Ctrl+T")),
+        format!("  • {:<18} Toggle expanded tool & raw XML blocks", resolve("toggle_tools", "Ctrl+O")),
+        format!("  • {:<18} Cycle prompt history", resolve("history", "Up / Down")),
+        format!("  • {:<18} Scroll transcript / modals", resolve("scroll", "Mouse Wheel / PgUp / PgDn")),
+        format!("  • {:<18} Clear input (or exit on double press)", resolve("quit", "Ctrl+C / Ctrl+D")),
+    ];
+    if !custom.is_empty() {
+        lines.push(String::new());
+        lines.push(format!("Custom overrides loaded ({} key(s) from keybindings.json).", custom.len()));
+    }
+    let themes_dir = PathBuf::from(&home).join(".le-vibe").join("themes");
+    if let Ok(rd) = fs::read_dir(&themes_dir) {
+        let user_themes: Vec<String> = rd
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                (p.extension().and_then(|x| x.to_str()) == Some("json"))
+                    .then(|| p.file_stem().and_then(|s| s.to_str()).map(str::to_string))
+                    .flatten()
+            })
+            .collect();
+        if !user_themes.is_empty() {
+            lines.push(format!("User theme files (~/.le-vibe/themes/): {}", user_themes.join(", ")));
+        }
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

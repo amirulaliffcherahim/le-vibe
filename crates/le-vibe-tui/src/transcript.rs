@@ -104,6 +104,16 @@ fn push_startup_banner(lines: &mut Vec<Line<'static>>, state: &TuiState) {
             Style::default().fg(Color::DarkGray),
         ),
     ]));
+    if !state.loaded_resources.is_empty() {
+        lines.push(Line::from(vec![
+            Span::raw("         "),
+            Span::styled("loaded: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                state.loaded_resources.join(" · "),
+                Style::default().fg(state.theme.palette().muted),
+            ),
+        ]));
+    }
 }
 
 struct SurfaceStyle {

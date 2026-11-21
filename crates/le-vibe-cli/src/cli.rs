@@ -54,6 +54,7 @@ SUBCOMMANDS:
   remove <name>                Remove an installed extension
   list                         List installed extensions
   update                       Pull latest main & reinstall le-vibe binary
+  doctor                       Run local environment, auth, MCP & config health check
 
 OPTIONS:
   -h, --help                   Show this help and exit
@@ -93,7 +94,7 @@ pub(crate) fn parse_cli_args(args: &[String]) -> CliAction {
     if let Some(first) = args.first().map(String::as_str)
         && matches!(
             first,
-            "login" | "auth" | "mcp" | "config" | "install" | "remove" | "list" | "update"
+            "login" | "auth" | "mcp" | "config" | "install" | "remove" | "list" | "update" | "doctor"
         )
     {
         return CliAction::Subcommand(first.to_string(), args[1..].to_vec());

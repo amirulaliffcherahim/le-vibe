@@ -367,6 +367,7 @@ pub(crate) enum WorkerCmd {
         goal: Option<String>,
     },
     ListRewindCheckpoints,
+    ListTreeNodes,
     RewindTo(String),
     ListSessions,
     ResumeSession(String),
@@ -1089,30 +1090,143 @@ pub(crate) fn spawn_tui_worker(
                     let _ = msg_tx.send(WorkerMsg::RewindLoaded(rows));
                     let _ = msg_tx.send(WorkerMsg::Idle);
                 }
+                WorkerCmd::ListTreeNodes => {
+                    let entries = session.entries();
+                    let active_leaf = session.leaf_id().map(str::to_string);
+                    let mut children: std::collections::HashMap<Option<String>, Vec<usize>> =
+                        std::collections::HashMap::new();
+                    for (idx, e) in entries.iter().enumerate() {
+                        if matches!(e.kind, EntryKind::Message | EntryKind::CompactionSummary)
+                            && matches!(e.role.as_str(), "user" | "assistant" | "system")
+                        {
+                            children.entry(e.parent_id.clone()).or_default().push(idx);
+                        }
+                    }
+                    // Also include roots whose parent_id wasn't a message (e.g. tool_result or session_meta)
+                    let entry_by_id: std::collections::HashMap<&str, usize> = entries
+                        .iter()
+                        .enumerate()
+                        .map(|(i, e)| (e.id.as_str(), i))
+                        .collect();
+                    let mut rows: Vec<(String, String, String)> = Vec::new();
+                    let mut visited = std::collections::HashSet::new();
+                    let mut stack: Vec<(usize, usize)> = Vec::new();
+                    for (idx, e) in entries.iter().enumerate() {
+                        if !matches!(e.kind, EntryKind::Message | EntryKind::CompactionSummary)
+                            || !matches!(e.role.as_str(), "user" | "assistant" | "system")
+                        {
+                            continue;
+                        }
+                        let parent_is_msg = e
+                            .parent_id
+                            .as_deref()
+                            .and_then(|pid| entry_by_id.get(pid))
+                            .is_some_and(|&pi| {
+                                matches!(
+                                    entries[pi].kind,
+                                    EntryKind::Message | EntryKind::CompactionSummary
+                                ) && matches!(
+                                    entries[pi].role.as_str(),
+                                    "user" | "assistant" | "system"
+                                )
+                            });
+                        if !parent_is_msg {
+                            stack.push((idx, 0));
+                        }
+                    }
+                    stack.reverse();
+                    while let Some((idx, depth)) = stack.pop() {
+                        if !visited.insert(idx) {
+                            continue;
+                        }
+                        let e = &entries[idx];
+                        let is_leaf = active_leaf.as_deref() == Some(e.id.as_str());
+                        let indent = "  ".repeat(depth.min(6));
+                        let branch_glyph = if depth == 0 { "" } else { "└─ " };
+                        let star = if is_leaf { "★ " } else { "" };
+                        let role_tag = if e.kind == EntryKind::CompactionSummary {
+                            "summary"
+                        } else {
+                            e.role.as_str()
+                        };
+                        let preview: String = e
+                            .content
+                            .replace('\n', " ")
+                            .chars()
+                            .take(64)
+                            .collect();
+                        rows.push((
+                            e.id.clone(),
+                            format!("{indent}{branch_glyph}{star}{role_tag}"),
+                            preview,
+                        ));
+                        // Walk through any intermediate tool_result children to find descendant messages
+                        let mut next_children: Vec<usize> = Vec::new();
+                        let mut frontier = vec![e.id.clone()];
+                        while let Some(pid) = frontier.pop() {
+                            for (ci, ce) in entries.iter().enumerate() {
+                                if ce.parent_id.as_deref() == Some(pid.as_str()) {
+                                    if matches!(
+                                        ce.kind,
+                                        EntryKind::Message | EntryKind::CompactionSummary
+                                    ) && matches!(
+                                        ce.role.as_str(),
+                                        "user" | "assistant" | "system"
+                                    ) {
+                                        next_children.push(ci);
+                                    } else {
+                                        frontier.push(ce.id.clone());
+                                    }
+                                }
+                            }
+                        }
+                        let next_depth = if next_children.len() > 1 { depth + 1 } else { depth };
+                        for ci in next_children.into_iter().rev() {
+                            stack.push((ci, next_depth));
+                        }
+                    }
+                    let _ = children; // silence unused if empty
+                    let _ = msg_tx.send(WorkerMsg::RewindLoaded(rows));
+                    let _ = msg_tx.send(WorkerMsg::Idle);
+                }
                 WorkerCmd::RewindTo(id) => {
                     let target = session.entries().iter().find(|e| e.id == id).cloned();
                     match target {
                         Some(entry) => {
-                            let prefill = Some(entry.content.clone());
-                            let branch_res = if let Some(parent_id) = entry.parent_id.as_deref() {
-                                session.branch_from(parent_id)
+                            let is_user = entry.kind == EntryKind::Message && entry.role == "user";
+                            let prefill = if is_user {
+                                Some(entry.content.clone())
                             } else {
-                                session.reset_leaf();
-                                Ok(())
+                                None
+                            };
+                            let branch_res = if is_user {
+                                if let Some(parent_id) = entry.parent_id.as_deref() {
+                                    session.branch_from(parent_id)
+                                } else {
+                                    session.reset_leaf();
+                                    Ok(())
+                                }
+                            } else {
+                                session.branch_from(&entry.id)
                             };
                             match branch_res {
                                 Ok(()) => {
+                                    let note = if is_user {
+                                        format!(
+                                            "Switched branch before {id}. Prompt loaded into editor — edit or press Enter to branch."
+                                        )
+                                    } else {
+                                        format!("Switched active branch to node {id}.")
+                                    };
                                     let _ = msg_tx.send(WorkerMsg::SessionReplaced {
                                         blocks: session_blocks(&session),
-                                        notice: format!(
-                                            "Rewound to checkpoint {id}. Prompt loaded into editor — edit or press Enter to re-run."
-                                        ),
+                                        notice: note,
                                         prefill_input: prefill,
                                         reset_usage: false,
                                     });
                                 }
                                 Err(err) => {
-                                    let _ = msg_tx.send(WorkerMsg::Notice(format!("Rewind failed: {err}")));
+                                    let _ = msg_tx.send(WorkerMsg::Notice(format!("Branch switch failed: {err}")));
                                 }
                             }
                         }

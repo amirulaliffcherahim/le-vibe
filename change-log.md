@@ -4,6 +4,19 @@ Chronological timeline of milestones on `master` (`https://github.com/amirulalif
 
 ---
 
+## 2026-11-21 — v0.3.0: Full Pi-Grade TUI, DAG `/tree`, `le-vibe doctor`, Cross-Session BM25 `/search`, SSE Watchdog & `/hotkeys`
+
+Includes everything from `v0.3.0-beta.1` and `v0.3.0-beta.2`, plus Phase B:
+- **`/tree` Pure-Rust DAG Branch Navigator (`worker.rs`, `commands.rs`, `main.rs`)**: Interactive tree view of all user, assistant, and summary nodes in `SessionStore` with `★` active leaf indicator; jump cleanly to any branch without losing abandoned branches.
+- **`APPEND_SYSTEM.md`, `AGENTS.override.md` & Startup Loaded-Resources Banner (`mode.rs`, `state.rs`, `transcript.rs`)**: Append project/user instructions without replacing defaults, override `AGENTS.md` per directory, and display loaded context/templates in the scrollable startup banner.
+- **Zero-Bloat Reliability & Recall (`pybridge`, `features.rs`, `cli.rs`, `main.rs`)**:
+  - `le-vibe doctor` single-command environment, auth, trust, MCP, and config health check.
+  - `/search <query>` pure-Rust BM25 search across all saved past sessions.
+  - 90s SSE stream watchdog in `le-vibe-pybridge` to fail fast and recover from stalled streams.
+- **`/hotkeys`, `~/.le-vibe/keybindings.json` & `~/.le-vibe/themes/*.json`**: Floating `/hotkeys` reference modal with custom keybinding overrides and user theme discovery.
+
+---
+
 ## 2026-11-21 — v0.3.0-beta.2: Steering vs. Follow-up, Queue Recovery, Project Trust Gate, External Editor, Prompt Templates & Exact Word-Wrap
 
 - **Exact Word-Wrap Visual Height (`crates/le-vibe-tui/src/transcript.rs`)**: Added `wrap_lines_exact` so every transcript line is pre-wrapped to `area.width` preserving span styles (`visual_lines.len()` matches screen rows 1:1 with zero `auto_scroll` clipping).

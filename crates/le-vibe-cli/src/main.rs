@@ -27,8 +27,9 @@ use crate::cli::{CliAction, build_initial_prompt, help_text, parse_cli_args};
 use crate::debug_log::{DEBUG_ENABLED, EventLogger};
 use crate::features::{
     LoopScheduler, PastedItem, build_optimization_digest, classify_pasted_text,
-    detect_project_resources, expand_prompt_template, grab_clipboard_item, load_prompt_templates,
-    lookup_project_trust, parse_loop_spec, run_external_editor, save_project_trust,
+    detect_project_resources, expand_prompt_template, format_hotkeys_lines, grab_clipboard_item,
+    load_prompt_templates, lookup_project_trust, parse_loop_spec, run_external_editor,
+    save_project_trust, search_past_sessions,
 };
 use crate::rpc::{run_rpc_mode, run_streaming_prompt};
 use crate::settings::{
@@ -144,7 +145,7 @@ fn main() {
             return;
         }
         CliAction::Subcommand(ref sub, ref sub_args)
-            if matches!(sub.as_str(), "install" | "remove" | "list" | "update") =>
+            if matches!(sub.as_str(), "install" | "remove" | "list" | "update" | "doctor") =>
         {
             let home = std::env::var_os("USERPROFILE")
                 .or_else(|| std::env::var_os("HOME"))
@@ -230,6 +231,33 @@ fn main() {
                         eprintln!("Extension not found: {name}");
                         std::process::exit(1);
                     }
+                }
+                "doctor" => {
+                    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    println!("le-vibe doctor (v{})", env!("CARGO_PKG_VERSION"));
+                    println!("  python_dir : {}", resolve_python_dir().display());
+                    println!("  python_exe : {}", resolve_python_exe(&resolve_python_dir()));
+                    println!("  settings   : {} (exists={})", settings_file().display(), settings_file().is_file());
+                    let proj_res = detect_project_resources(&cwd);
+                    let trust = lookup_project_trust(&cwd);
+                    println!(
+                        "  trust      : {:?} ({} protected project resource(s))",
+                        trust,
+                        proj_res.len()
+                    );
+                    let mcp_paths = default_mcp_paths();
+                    let mcp = le_vibe_mcp::McpManager::from_config_files(&mcp_paths);
+                    println!("  mcp        : {} server(s) configured", mcp.status_summary().len());
+                    let tpls = load_prompt_templates(&cwd, trust.unwrap_or(true));
+                    println!("  prompts    : {} template(s) loaded", tpls.len());
+                    let py_dir = resolve_python_dir();
+                    let py_exe = resolve_python_exe(&py_dir);
+                    if let Ok(mut bridge) = PythonBridge::spawn(&py_exe, &py_dir)
+                        && let Ok(auth) = bridge.auth_status()
+                    {
+                        println!("  auth       : {}", serde_json::to_string(&auth).unwrap_or_default());
+                    }
+                    return;
                 }
                 "update" => {
                     let repo = self_repo_path();
@@ -515,6 +543,20 @@ fn run_interactive_tui(
         state
             .plugin_commands
             .push((tpl.command.clone(), tpl.description.clone()));
+    }
+    for ctx_name in ["AGENTS.override.md", "AGENTS.md", "CLAUDE.md"] {
+        if cwd_path.join(ctx_name).is_file() {
+            state.loaded_resources.push(ctx_name.to_string());
+            break;
+        }
+    }
+    if cwd_path.join(".le-vibe/APPEND_SYSTEM.md").is_file() {
+        state.loaded_resources.push("APPEND_SYSTEM.md".to_string());
+    }
+    if !prompt_templates.is_empty() {
+        state
+            .loaded_resources
+            .push(format!("{} prompt template(s)", prompt_templates.len()));
     }
     if needs_trust_modal {
         state.trust_prompt_path = cwd_path.display().to_string();
@@ -1405,7 +1447,7 @@ fn run_interactive_tui(
                 if state.is_busy
                     && matches!(
                         input.split_whitespace().next().unwrap_or(""),
-                        "/compact" | "/handover" | "/clear" | "/new" | "/rewind" | "/resume"
+                        "/compact" | "/handover" | "/clear" | "/new" | "/rewind" | "/tree" | "/resume"
                     )
                 {
                     state.blocks.push(TranscriptBlock::System(
@@ -1562,6 +1604,32 @@ fn run_interactive_tui(
                         model: state.model.clone(),
                         instructions: Some(arg.trim().to_string()),
                     });
+                    continue;
+                }
+                if input == "/hotkeys" {
+                    state.info_modal_title = "Active Keybindings (/hotkeys)".to_string();
+                    state.info_modal_lines = format_hotkeys_lines();
+                    state.help_scroll = 0;
+                    state.modal = ActiveModal::InfoModal;
+                    continue;
+                }
+                if let Some(rest) = input.strip_prefix("/search") {
+                    let q = rest.trim();
+                    if q.is_empty() {
+                        state.blocks.push(TranscriptBlock::System(
+                            "Usage: /search <query> — BM25 search across saved sessions.".to_string(),
+                        ));
+                    } else {
+                        let dirs = vec![sessions_dir(), crate::settings::project_sessions_dir()];
+                        state.info_modal_title = format!("Session Search: {q}");
+                        state.info_modal_lines = search_past_sessions(&dirs, q, 18);
+                        state.help_scroll = 0;
+                        state.modal = ActiveModal::InfoModal;
+                    }
+                    continue;
+                }
+                if input == "/tree" {
+                    let _ = cmd_tx.send(WorkerCmd::ListTreeNodes);
                     continue;
                 }
                 if input == "/rewind" {

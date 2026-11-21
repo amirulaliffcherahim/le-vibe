@@ -47,17 +47,12 @@ Cross-referenced against `goal.md`, `earendil-works/pi`, `mistralai/mistral-vibe
 
 ---
 
-## Phase B — `v0.3.0` (Power Features)
+## Phase B — `v0.3.0` (Power Features) — COMPLETED
 
-6. **`/tree` Branch Navigator (Deterministic Pure-Rust DAG)**:
-   - Interactive DAG tree picker over `le-vibe-durable::SessionStore` (user + assistant nodes).
-   - Keep switching instant and zero-cost; make abandoned-branch LLM summarization an explicit opt-in action (`S` key or `/tree summarize`), never automatic on navigation.
-7. **`APPEND_SYSTEM.md`, `AGENTS.override.md` & Startup Loaded-Resources Banner**:
-   - Append instructions without replacing defaults (`APPEND_SYSTEM.md`), override `AGENTS.md` per directory (`AGENTS.override.md`), and list loaded context/skills/extensions/prompts in the scrollable startup banner.
-8. **Custom Keybindings (`~/.le-vibe/keybindings.json`) + `/hotkeys` + Custom Themes (`~/.le-vibe/themes/*.json`)**:
-   - User-remappable shortcuts, `/hotkeys` modal, and drop-in JSON color palettes alongside the 8 built-in themes.
-9. **Structured `--mode json` Event Stream**:
-   - Unified JSONL event stream (`le-vibe-schema`) for scripts and CI pipelines.
+- [x] **B1 — `/tree` Branch Navigator (Deterministic Pure-Rust DAG)**: Interactive DAG tree picker over `le-vibe-durable::SessionStore` (`ListTreeNodes` + user/assistant branch jump in `RewindTo`, `★` active leaf indicator).
+- [x] **B2 — `APPEND_SYSTEM.md`, `AGENTS.override.md` & Startup Loaded-Resources Banner**: Project/user `APPEND_SYSTEM.md` precedence, `AGENTS.override.md` > `AGENTS.md` > `CLAUDE.md` discovery, and `loaded:` summary in scrollable startup banner.
+- [x] **B3 — Zero-Bloat Hermes Wins**: `le-vibe doctor` CLI health check, cross-session pure-Rust BM25 `/search <query>`, and 90s SSE stream watchdog in `le-vibe-pybridge`.
+- [x] **B4 — Custom Keybindings (`~/.le-vibe/keybindings.json`) + `/hotkeys` + User Themes (`~/.le-vibe/themes/*.json`)**.
 
 ---
 

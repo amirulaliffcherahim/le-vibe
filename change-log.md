@@ -4,6 +4,13 @@ Chronological timeline of milestones on `master` (`https://github.com/amirulalif
 
 ---
 
+## 2026-11-21 — v0.4.2: `ResyncBackend` Wide-Unicode Cursor Guard & Pi Knowledge Transfer Guide
+
+- **`ResyncBackend` (`crates/le-vibe-tui/src/{resync_backend.rs, state.rs}`)**: Wraps `CrosstermBackend<Stdout>` and issues an explicit `MoveTo(x + 1, y)` cursor resync after wide/ambiguous Unicode and emoji glyphs so Windows Terminal borders never drift.
+- **Pi → le-vibe Migration Docs (`docs/pi-knowledge-transfer.md`)**: Step-by-step guide for transferring Pi system prompts, on-demand skills, Hybrid RAG memory, and past JSONL sessions into `le-vibe`.
+
+---
+
 ## 2026-11-21 — v0.4.1: On-Demand `load_skill` (97% Lower Startup Skill Bloat) & Parallel Read-Only Tool Execution
 
 - **On-Demand Skills (`crates/le-vibe-tui/src/mode.rs`, `crates/le-vibe-tools/src/lib.rs`, `python/le_vibe/policy`)**: Replaced verbose startup skill descriptions (~2,184 tok) with a compact 1-line name index (~65 tok) and added built-in `load_skill(name)` tool (`ToolPermission.ALWAYS`), cutting total initial startup context to ~3,300 tokens.

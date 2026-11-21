@@ -4,7 +4,6 @@ use crossterm::event::{
 use crossterm::execute;
 use crossterm::style::Print;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
@@ -12,6 +11,7 @@ use std::io::{self, Stdout};
 use std::time::Instant;
 
 use crate::mode::AgentMode;
+use crate::resync_backend::ResyncBackend;
 use crate::theme::ThemeId;
 
 #[derive(Debug, Default)]
@@ -573,7 +573,7 @@ pub fn keep_vt_input_off() {
 }
 
 pub struct TerminalGuard {
-    pub terminal: Terminal<CrosstermBackend<Stdout>>,
+    pub terminal: Terminal<ResyncBackend<Stdout>>,
     vt_input_was_on: bool,
 }
 
@@ -606,7 +606,7 @@ impl TerminalGuard {
         if cfg!(windows) {
             execute!(stdout, Print("\x1b[?1006h"))?;
         }
-        let backend = CrosstermBackend::new(stdout);
+        let backend = ResyncBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
         Ok(Self {
             terminal,

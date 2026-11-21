@@ -6,6 +6,7 @@ pub mod input;
 pub mod markdown;
 pub mod modal;
 pub mod mode;
+pub mod resync_backend;
 pub mod state;
 pub mod theme;
 pub mod transcript;

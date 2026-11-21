@@ -130,6 +130,7 @@ class PermissionStore:
             "memory_read": ToolPermission.ALWAYS,
             "memory_write": ToolPermission.ALWAYS,
             "memory_delete": ToolPermission.ALWAYS,
+            "load_skill": ToolPermission.ALWAYS,
             "spawn_agent": ToolPermission.ALWAYS,
             "write": ToolPermission.ASK,
             "edit": ToolPermission.ASK,

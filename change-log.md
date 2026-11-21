@@ -4,6 +4,13 @@ Chronological timeline of milestones on `master` (`https://github.com/amirulalif
 
 ---
 
+## 2026-11-21 — v0.4.1: On-Demand `load_skill` (97% Lower Startup Skill Bloat) & Parallel Read-Only Tool Execution
+
+- **On-Demand Skills (`crates/le-vibe-tui/src/mode.rs`, `crates/le-vibe-tools/src/lib.rs`, `python/le_vibe/policy`)**: Replaced verbose startup skill descriptions (~2,184 tok) with a compact 1-line name index (~65 tok) and added built-in `load_skill(name)` tool (`ToolPermission.ALWAYS`), cutting total initial startup context to ~3,300 tokens.
+- **Parallel Read-Only Tool Execution (`crates/le-vibe-agent/src/lib.rs`)**: Batches of 2+ read-only tool calls (`read`, `grep`, `find`, `ls`, `load_skill`) now execute concurrently via `std::thread::scope` while preserving policy checks, `PreToolUse`/`PostToolUse` hooks, and exact `tool_call_id` ordering.
+
+---
+
 ## 2026-11-21 — v0.4.0: Codemode, Lifecycle Hooks, Scoped Policy Rules, Subagents, Global Skills & Mistral Vibe UX Guards
 
 - **Pi-Style `codemode` Setting & Runner (`crates/le-vibe-tools/src/codemode.rs`, `/config`)**: Toggle `off` / `on` / `only` in `/config`; lets the model run policy- and hook-checked Python scripts calling `tools.<name>(**kwargs)` (`read`, `grep`, `find`, `ls`, `write`, `edit`, `bash`, `powershell`), `text()`, `store()`, and `load()` to collapse multi-tool loops into 1 turn.

@@ -154,11 +154,11 @@ pub fn build_system_prompt(
     }
 
     if !skills.is_empty() {
-        prompt.push_str("\n\n<skills>\nAvailable skills (use `read` on the path or `/skill:<name>` to load):\n");
-        for (name, desc, path) in skills {
-            prompt.push_str(&format!("- {name}: {desc} ({path})\n"));
-        }
-        prompt.push_str("</skills>");
+        let names: Vec<&str> = skills.iter().map(|(n, _, _)| n.as_str()).collect();
+        prompt.push_str(&format!(
+            "\n\n<skills>\nOn-demand skills (call `load_skill` with a skill name only when relevant to the task): {}\n</skills>",
+            names.join(", ")
+        ));
     }
 
     if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {

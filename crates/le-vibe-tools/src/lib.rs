@@ -224,6 +224,17 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "load_skill".to_string(),
+            description: "Load the full SKILL.md instructions for an on-demand skill by name only when relevant to the current task.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                    "name": { "type": "string", "description": "Skill name from the <skills> index (e.g. diagram-design, reverse-engineer)" }
+                }
+            }),
+        },
+        ToolDefinition {
             name: "codemode".to_string(),
             description: "Execute a Python script that calls tools.<name>(**kwargs) (read, grep, find, ls, write, edit, bash, powershell) and prints/returns filtered output in one turn. Globals: tools, text(v), print(...), store(k,v), load(k), json.".to_string(),
             parameters: json!({
@@ -835,8 +846,49 @@ pub fn execute_builtin_tool_approved(name: &str, args: &Value) -> Result<String,
         "memory_search" | "memory_write" | "memory_read" | "memory_delete" => {
             memory::execute_memory_tool(name, args).map_err(ToolError::Edit)
         }
+        "load_skill" => load_skill_by_name(args),
         _ => Err(ToolError::UnknownTool(name.to_string())),
     }
+}
+
+fn load_skill_by_name(args: &Value) -> Result<String, ToolError> {
+    let raw = args
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if raw.is_empty() || raw.contains("..") || raw.contains('/') || raw.contains('\\') {
+        return Err(ToolError::Edit("Invalid skill name".to_string()));
+    }
+    let mut roots = vec![
+        std::path::PathBuf::from(".le-vibe/skills"),
+        std::path::PathBuf::from(".pi/skills"),
+    ];
+    if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
+        let h = std::path::PathBuf::from(home);
+        roots.push(h.join(".le-vibe").join("skills"));
+        roots.push(h.join(".pi").join("agent").join("skills"));
+        roots.push(h.join(".agents").join("skills"));
+    }
+    for root in roots {
+        for cand in [
+            root.join(raw).join("SKILL.md"),
+            root.join(format!("{raw}.md")),
+        ] {
+            if cand.is_file()
+                && let Ok(body) = fs::read_to_string(&cand)
+            {
+                return Ok(format!(
+                    "# Skill: {raw} ({})\n\n{}",
+                    cand.display(),
+                    body.trim()
+                ));
+            }
+        }
+    }
+    Err(ToolError::Edit(format!(
+        "Skill `{raw}` not found in project or global skill directories."
+    )))
 }
 
 #[cfg(test)]

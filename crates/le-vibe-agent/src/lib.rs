@@ -611,6 +611,140 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
             name: None,
         });
 
+        // Fast path: execute pure read-only batches in parallel via std::thread::scope
+        // (preserves exact tool_call_id ordering, policy checks, and PreToolUse/PostToolUse hooks).
+        let is_parallel_readonly_batch = reply.tool_calls.len() >= 2
+            && reply.tool_calls.iter().all(|tc| {
+                matches!(
+                    tc.name.as_str(),
+                    "read" | "grep" | "find" | "ls" | "load_skill"
+                )
+            });
+
+        if is_parallel_readonly_batch {
+            let mut prepared: Vec<(&ToolCall, String, Option<String>)> =
+                Vec::with_capacity(reply.tool_calls.len());
+            for tc in &reply.tool_calls {
+                if is_cancelled(cancel) {
+                    let note = if last_partial_text.trim().is_empty() {
+                        "[Interrupted by user]".to_string()
+                    } else {
+                        format!("{last_partial_text}\n\n[Interrupted by user]")
+                    };
+                    let _ = session.append("assistant", &note);
+                    return Err(AgentError::Cancelled);
+                }
+                on_event(AgentEvent::ToolCallStart {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                });
+                let args_json_str = tc.arguments.to_string();
+                let hook_res = bridge
+                    .invoke_hook(
+                        "before_tool_call",
+                        serde_json::json!({ "tool": tc.name, "arguments": tc.arguments }),
+                    )
+                    .unwrap_or(Value::Null);
+                let mut blocked = if hook_res.get("blocked").and_then(Value::as_bool) == Some(true)
+                {
+                    Some(
+                        hook_res
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Blocked by extension hook.")
+                            .to_string(),
+                    )
+                } else {
+                    hooks.run_pre_tool(&tc.name, &args_json_str).err()
+                };
+                if blocked.is_none() {
+                    let target_path = tc.arguments.get("path").and_then(Value::as_str);
+                    match bridge.evaluate_tool_call(&tc.name, None, target_path) {
+                        Ok(dec) if dec.action == "deny" => {
+                            blocked = Some(format!("Policy denied: {}", dec.reason));
+                        }
+                        Ok(dec) if dec.action == "ask" => {
+                            let choice = on_approval(ApprovalRequest {
+                                tool_name: tc.name.clone(),
+                                command: None,
+                                target_path: target_path.map(ToString::to_string),
+                                reason: dec.reason,
+                            });
+                            match choice {
+                                ApprovalChoice::Deny => {
+                                    blocked = Some("Tool call denied by user.".to_string());
+                                }
+                                ApprovalChoice::AllowSession => {
+                                    let _ = bridge.grant_rule(&tc.name, None, target_path);
+                                }
+                                ApprovalChoice::AllowYolo => {
+                                    let _ = bridge.set_yolo(true);
+                                }
+                                ApprovalChoice::AllowOnce => {}
+                            }
+                        }
+                        Err(err) => {
+                            blocked = Some(format!("Policy error: {err}"));
+                        }
+                        Ok(_) => {}
+                    }
+                }
+                prepared.push((tc, args_json_str, blocked));
+            }
+
+            let results: Vec<(String, bool)> = std::thread::scope(|s| {
+                let handles: Vec<_> = prepared
+                    .iter()
+                    .map(|(tc, _args_str, blocked)| {
+                        s.spawn(move || {
+                            if let Some(reason) = blocked {
+                                return (reason.clone(), true);
+                            }
+                            match execute_builtin_tool_approved(&tc.name, &tc.arguments) {
+                                Ok(out) => (out, false),
+                                Err(err) => (format!("Tool error: {err}"), true),
+                            }
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join()
+                            .unwrap_or_else(|_| ("Tool error: worker panicked".to_string(), true))
+                    })
+                    .collect()
+            });
+
+            for ((tc, args_json_str, _), (mut output, is_error)) in prepared.into_iter().zip(results)
+            {
+                if !is_error
+                    && let Some(post_note) = hooks.run_post_tool(&tc.name, &args_json_str)
+                {
+                    if !output.is_empty() {
+                        output.push('\n');
+                    }
+                    output.push_str("[PostToolUse hook]\n");
+                    output.push_str(&post_note);
+                }
+                let capped_output = cap_tool_output(&output);
+                let _ = session.append_tool_result(&tc.id, &tc.name, &capped_output);
+                on_event(AgentEvent::ToolCallEnd {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    is_error,
+                    output,
+                });
+                messages.push(ChatMessage {
+                    role: "tool".to_string(),
+                    content: capped_output,
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    tool_call_id: Some(tc.id.clone()),
+                    name: Some(tc.name.clone()),
+                });
+            }
+        } else {
         for tc in &reply.tool_calls {
             if is_cancelled(cancel) {
                 let note = if last_partial_text.trim().is_empty() {
@@ -923,6 +1057,7 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                 tool_call_id: Some(tc.id.clone()),
                 name: Some(tc.name.clone()),
             });
+        }
         }
 
         // Drain steering messages ONLY after all tool_call_id results for this turn are recorded

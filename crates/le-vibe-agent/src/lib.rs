@@ -5,6 +5,8 @@ use le_vibe_pybridge::{
     ProviderPort, ToolCall,
 };
 use le_vibe_telemetry::TelemetryRecorder;
+use le_vibe_tools::codemode::run_codemode_script;
+use le_vibe_tools::hooks::HookRegistry;
 use le_vibe_tools::{
     TodoStore, ToolError, builtin_tool_definitions, execute_builtin_tool,
     execute_builtin_tool_approved, execute_todo_tool,
@@ -67,6 +69,7 @@ pub struct AgentConfig {
     pub max_retries: usize,
     pub allowed_tools: Option<Vec<String>>,
     pub mode_name: Option<String>,
+    pub codemode: String,
     pub steering_queue: Option<Arc<Mutex<VecDeque<String>>>>,
 }
 
@@ -81,6 +84,7 @@ impl Default for AgentConfig {
             max_retries: 2,
             allowed_tools: None,
             mode_name: None,
+            codemode: "off".to_string(),
             steering_queue: None,
         }
     }
@@ -308,13 +312,42 @@ pub fn run_turn_loop_cancellable<B: ProviderPort + PolicyPort + ExtensionPort>(
     session: &mut SessionStore,
     telemetry: &TelemetryRecorder,
     todos: &mut TodoStore,
-    mut mcp: Option<&mut McpManager>,
+    mcp: Option<&mut McpManager>,
     cancel: Option<&AtomicBool>,
     config: &AgentConfig,
     user_prompt: &str,
     mut on_event: impl FnMut(AgentEvent),
     mut on_approval: impl FnMut(ApprovalRequest) -> ApprovalChoice,
     mut on_ask_user: impl FnMut(Value) -> String,
+) -> Result<AssistantMessage, AgentError> {
+    run_turn_loop_inner(
+        bridge,
+        session,
+        telemetry,
+        todos,
+        mcp,
+        cancel,
+        config,
+        user_prompt,
+        &mut on_event,
+        &mut on_approval,
+        &mut on_ask_user,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
+    bridge: &mut B,
+    session: &mut SessionStore,
+    telemetry: &TelemetryRecorder,
+    todos: &mut TodoStore,
+    mut mcp: Option<&mut McpManager>,
+    cancel: Option<&AtomicBool>,
+    config: &AgentConfig,
+    user_prompt: &str,
+    on_event: &mut dyn FnMut(AgentEvent),
+    on_approval: &mut dyn FnMut(ApprovalRequest) -> ApprovalChoice,
+    on_ask_user: &mut dyn FnMut(Value) -> String,
 ) -> Result<AssistantMessage, AgentError> {
     // Determine prior active mode from session before appending user turn
     let prev_mode = session
@@ -419,9 +452,18 @@ pub fn run_turn_loop_cancellable<B: ProviderPort + PolicyPort + ExtensionPort>(
 
     let ext_tools = bridge.list_extension_tools().unwrap_or_default();
     let ext_tool_names: Vec<String> = ext_tools.iter().map(|t| t.name.clone()).collect();
+    let codemode_setting = config.codemode.trim().to_lowercase();
     let mut tools: Vec<_> = builtin_tool_definitions()
         .into_iter()
         .filter(|t| {
+            if t.name == "codemode" {
+                return codemode_setting == "on" || codemode_setting == "only";
+            }
+            if codemode_setting == "only"
+                && !matches!(t.name.as_str(), "todo" | "ask_user_question")
+            {
+                return false;
+            }
             config
                 .allowed_tools
                 .as_ref()
@@ -443,6 +485,8 @@ pub fn run_turn_loop_cancellable<B: ProviderPort + PolicyPort + ExtensionPort>(
         }
     }
 
+    let cwd_for_hooks = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let hooks = HookRegistry::load_default(&cwd_for_hooks, true);
     let mut last_partial_text = String::new();
     for turn in 0..config.max_turns {
         if is_cancelled(cancel) {
@@ -554,6 +598,7 @@ pub fn run_turn_loop_cancellable<B: ProviderPort + PolicyPort + ExtensionPort>(
             on_event(AgentEvent::TurnEnd {
                 stop_reason: reply.stop_reason.clone(),
             });
+            hooks.run_stop();
             return Ok(reply);
         }
 
@@ -580,6 +625,7 @@ pub fn run_turn_loop_cancellable<B: ProviderPort + PolicyPort + ExtensionPort>(
                 id: tc.id.clone(),
                 name: tc.name.clone(),
             });
+            let args_json_str = tc.arguments.to_string();
             let hook_res = bridge
                 .invoke_hook(
                     "before_tool_call",
@@ -595,10 +641,91 @@ pub fn run_turn_loop_cancellable<B: ProviderPort + PolicyPort + ExtensionPort>(
                         .to_string(),
                 )
             } else {
-                None
+                hooks.run_pre_tool(&tc.name, &args_json_str).err()
             };
-            let (output, is_error) = if let Some(reason) = blocked_reason {
+            let (mut output, is_error) = if let Some(reason) = blocked_reason {
                 (reason, true)
+            } else if tc.name == "codemode" {
+                let script = tc
+                    .arguments
+                    .get("script")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let timeout_ms = tc
+                    .arguments
+                    .get("timeout_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(60_000);
+                if script.trim().is_empty() {
+                    ("Tool error: codemode requires non-empty `script`".to_string(), true)
+                } else {
+                    on_event(AgentEvent::Status {
+                        text: "Running codemode script...".to_string(),
+                    });
+                    match run_codemode_script(script, timeout_ms, |sub_tool, sub_args| {
+                        let sub_args_str = sub_args.to_string();
+                        hooks.run_pre_tool(sub_tool, &sub_args_str)?;
+                        execute_builtin_tool(bridge, sub_tool, &sub_args)
+                            .map_err(|e| e.to_string())
+                    }) {
+                        Ok(out) => (out, false),
+                        Err(err) => (err, true),
+                    }
+                }
+            } else if tc.name == "spawn_agent" {
+                let task = tc
+                    .arguments
+                    .get("task")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                if task.is_empty() {
+                    ("Tool error: spawn_agent requires non-empty `task`".to_string(), true)
+                } else {
+                    on_event(AgentEvent::Status {
+                        text: format!("Subagent researching: {}...", task.chars().take(48).collect::<String>()),
+                    });
+                    let mut child_session = SessionStore::in_memory();
+                    let mut child_todos = TodoStore::new();
+                    let child_cfg = AgentConfig {
+                        provider: config.provider.clone(),
+                        model: config.model.clone(),
+                        system_prompt: Some(
+                            "You are an isolated read-only research subagent. Use read, grep, find, and ls to investigate the task thoroughly, then return a concise, concrete answer with exact file paths and line numbers.".to_string(),
+                        ),
+                        thinking_level: config.thinking_level.clone(),
+                        max_turns: 12,
+                        max_retries: config.max_retries,
+                        allowed_tools: Some(vec![
+                            "read".to_string(),
+                            "grep".to_string(),
+                            "find".to_string(),
+                            "ls".to_string(),
+                        ]),
+                        mode_name: Some("ask".to_string()),
+                        codemode: "off".to_string(),
+                        steering_queue: None,
+                    };
+                    let mut noop_ev = |_: AgentEvent| {};
+                    let mut deny_all = |_: ApprovalRequest| ApprovalChoice::Deny;
+                    let mut empty_q = |_: Value| String::new();
+                    match run_turn_loop_inner(
+                        bridge,
+                        &mut child_session,
+                        telemetry,
+                        &mut child_todos,
+                        None,
+                        cancel,
+                        &child_cfg,
+                        task,
+                        &mut noop_ev,
+                        &mut deny_all,
+                        &mut empty_q,
+                    ) {
+                        Ok(child_reply) => (child_reply.content, false),
+                        Err(err) => (format!("Subagent error: {err}"), true),
+                    }
+                }
             } else if tc.name == "todo" {
                 match execute_todo_tool(todos, &tc.arguments) {
                     Ok(out) => (out, false),
@@ -771,6 +898,15 @@ pub fn run_turn_loop_cancellable<B: ProviderPort + PolicyPort + ExtensionPort>(
                 &tc.name,
                 serde_json::to_string(&tc.arguments).unwrap_or_else(|_| "{}".to_string()),
             );
+            if !is_error
+                && let Some(post_note) = hooks.run_post_tool(&tc.name, &args_json_str)
+            {
+                if !output.is_empty() {
+                    output.push('\n');
+                }
+                output.push_str("[PostToolUse hook]\n");
+                output.push_str(&post_note);
+            }
             let capped_output = cap_tool_output(&output);
             let _ = session.append_tool_result(&tc.id, &tc.name, &capped_output);
             on_event(AgentEvent::ToolCallEnd {

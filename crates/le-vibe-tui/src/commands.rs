@@ -195,6 +195,12 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandSpec] = &[
         picker_on_bare: true,
     },
     SlashCommandSpec {
+        name: "/skill-save",
+        hint: "<name> [focus]",
+        description: "Distill this workflow into .le-vibe/skills/<name>/SKILL.md (agentskills.io)",
+        picker_on_bare: false,
+    },
+    SlashCommandSpec {
         name: "/diagram",
         hint: "",
         description: "Project latest XML / draw.io diagram (or local .xml/.drawio file) in modal",

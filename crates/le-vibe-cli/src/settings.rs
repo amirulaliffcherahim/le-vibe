@@ -335,6 +335,17 @@ pub(crate) fn default_mcp_paths() -> Vec<PathBuf> {
     paths
 }
 
+pub(crate) fn default_skill_dirs() -> Vec<String> {
+    let mut dirs = vec![".le-vibe/skills".to_string(), ".pi/skills".to_string()];
+    if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
+        let h = PathBuf::from(home);
+        dirs.push(h.join(".le-vibe").join("skills").display().to_string());
+        dirs.push(h.join(".pi").join("agent").join("skills").display().to_string());
+        dirs.push(h.join(".agents").join("skills").display().to_string());
+    }
+    dirs
+}
+
 pub(crate) fn history_file() -> PathBuf {
     let home = std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))

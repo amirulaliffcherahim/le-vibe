@@ -236,33 +236,42 @@ fn handle_key_event(state: &mut TuiState, key: crossterm::event::KeyEvent) -> io
     }
 
     if state.modal == ActiveModal::ApprovalModal {
+        // 400ms typing grace period (Mistral Vibe pattern): prevent accidental mid-sentence approval.
+        let in_grace = state
+            .approval_opened_at
+            .is_some_and(|t| t.elapsed() < Duration::from_millis(400));
         match key.code {
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('4') => {
                 state.modal = ActiveModal::None;
                 state.approval_prompt = None;
+                state.approval_opened_at = None;
                 return Ok(TuiAction::ApprovalDecision(3));
             }
-            KeyCode::Char('1') | KeyCode::Char('y') => {
+            KeyCode::Char('1') | KeyCode::Char('y') if !in_grace => {
                 state.modal = ActiveModal::None;
                 state.approval_prompt = None;
+                state.approval_opened_at = None;
                 return Ok(TuiAction::ApprovalDecision(0));
             }
-            KeyCode::Char('2') | KeyCode::Char('s') => {
+            KeyCode::Char('2') | KeyCode::Char('s') if !in_grace => {
                 state.modal = ActiveModal::None;
                 state.approval_prompt = None;
+                state.approval_opened_at = None;
                 return Ok(TuiAction::ApprovalDecision(1));
             }
-            KeyCode::Char('3') | KeyCode::Char('a') => {
+            KeyCode::Char('3') | KeyCode::Char('a') if !in_grace => {
                 state.modal = ActiveModal::None;
                 state.approval_prompt = None;
+                state.approval_opened_at = None;
                 return Ok(TuiAction::ApprovalDecision(2));
             }
             KeyCode::Up => state.modal_idx = state.modal_idx.saturating_sub(1),
             KeyCode::Down if state.modal_idx + 1 < 4 => state.modal_idx += 1,
-            KeyCode::Enter => {
+            KeyCode::Enter if !in_grace => {
                 let idx = state.modal_idx.min(3);
                 state.modal = ActiveModal::None;
                 state.approval_prompt = None;
+                state.approval_opened_at = None;
                 return Ok(TuiAction::ApprovalDecision(idx));
             }
             _ => {}
@@ -584,7 +593,7 @@ fn handle_key_event(state: &mut TuiState, key: crossterm::event::KeyEvent) -> io
             state.mode = state.mode.next();
             return Ok(TuiAction::None);
         }
-        KeyCode::Up
+        KeyCode::Up | KeyCode::Char('q') | KeyCode::Char('Q')
             if key.modifiers.contains(KeyModifiers::ALT)
                 && (!state.queued_prompts.is_empty() || !state.steering_prompts.is_empty()) =>
         {

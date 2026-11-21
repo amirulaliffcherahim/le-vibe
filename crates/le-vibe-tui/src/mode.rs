@@ -198,20 +198,34 @@ pub fn build_system_prompt(
         }
     }
 
-    // Pi-compatible context file discovery: AGENTS.override.md replaces AGENTS.md/CLAUDE.md in cwd
-    let cwd_dir = std::path::Path::new(cwd);
-    let context_candidates = ["AGENTS.override.md", "AGENTS.md", "CLAUDE.md"];
-    for name in context_candidates {
-        let candidate = cwd_dir.join(name);
-        if let Ok(agents_md) = std::fs::read_to_string(&candidate)
-            && !agents_md.trim().is_empty()
-        {
-            prompt.push_str(&format!(
-                "\n\n<project_instructions path=\"{}\">\n{}\n</project_instructions>",
-                candidate.display(),
-                cap_utf8(&agents_md, 4000)
-            ));
+    // Pi/Claude-compatible context discovery: walk cwd up to git root (or 4 levels),
+    // applying root-to-cwd order; AGENTS.override.md replaces AGENTS.md/CLAUDE.md in the same dir.
+    let mut dirs_to_check: Vec<std::path::PathBuf> = Vec::new();
+    let mut cur = std::path::Path::new(cwd).to_path_buf();
+    for _ in 0..5 {
+        dirs_to_check.push(cur.clone());
+        if cur.join(".git").exists() {
             break;
+        }
+        if !cur.pop() {
+            break;
+        }
+    }
+    dirs_to_check.reverse();
+    let context_candidates = ["AGENTS.override.md", "AGENTS.md", "CLAUDE.md"];
+    for dir in dirs_to_check {
+        for name in context_candidates {
+            let candidate = dir.join(name);
+            if let Ok(agents_md) = std::fs::read_to_string(&candidate)
+                && !agents_md.trim().is_empty()
+            {
+                prompt.push_str(&format!(
+                    "\n\n<project_instructions path=\"{}\">\n{}\n</project_instructions>",
+                    candidate.display(),
+                    cap_utf8(&agents_md, 4000)
+                ));
+                break;
+            }
         }
     }
 

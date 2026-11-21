@@ -14,6 +14,13 @@
   },
   "allowed_commands": [],
   "allowed_paths": [],
+  "deny_patterns": [
+    "write(.env*)",
+    "edit(.env*)",
+    "edit(*.pem)"
+  ],
+  "require_read_before_edit": true,
+  "guard_dirty_repo": true,
   "blocked_commands": [
     "rm -rf",
     "del /s"

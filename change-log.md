@@ -4,6 +4,21 @@ Chronological timeline of milestones on `master` (`https://github.com/amirulalif
 
 ---
 
+## 2026-11-21 — v0.4.0: Codemode, Lifecycle Hooks, Scoped Policy Rules, Subagents, Global Skills & Mistral Vibe UX Guards
+
+- **Pi-Style `codemode` Setting & Runner (`crates/le-vibe-tools/src/codemode.rs`, `/config`)**: Toggle `off` / `on` / `only` in `/config`; lets the model run policy- and hook-checked Python scripts calling `tools.<name>(**kwargs)` (`read`, `grep`, `find`, `ls`, `write`, `edit`, `bash`, `powershell`), `text()`, `store()`, and `load()` to collapse multi-tool loops into 1 turn.
+- **Declarative Lifecycle Hooks (`crates/le-vibe-tools/src/hooks.rs`, `crates/le-vibe-agent/src/lib.rs`)**: `PreToolUse`, `PostToolUse`, and `Stop` hooks loaded from `~/.le-vibe/hooks.json` and `.le-vibe/hooks.json` with pipe-separated tool matchers.
+- **Scoped Policy Patterns & Safety Guards (`python/le_vibe/policy/__init__.py`)**:
+  - `allow_patterns` & `deny_patterns` (e.g. `bash(cargo test*)`, `write(src/**)`, `bash(*--force*)`) with Windows backslash normalization (`deny_patterns` enforced even in `yolo`).
+  - Native `require_read_before_edit` (blocks blind `edit` on unread files) and `guard_dirty_repo` (blocks destructive git commands when `git status` is dirty).
+- **Isolated `spawn_agent` Subagent Tool & `/skill-save`**: Read-only isolated child turn loop (max 12 turns) keeping main context clean; `/skill-save <name>` distills solved workflows into `.le-vibe/skills/<name>/SKILL.md` (`agentskills.io`).
+- **Global Skill Discovery & Ancestor `AGENTS.md` Walk**: Scans `.le-vibe/skills`, `.pi/skills`, `~/.le-vibe/skills`, `~/.pi/agent/skills`, and `~/.agents/skills`; walks `cwd` up to `.git` root for `AGENTS.override.md` / `AGENTS.md` / `CLAUDE.md`.
+- **New Extensions, Prompt Templates, Installers & TUI Polish**:
+  - Added `examples/extensions/{advise.py, security_guidance.py}`, `examples/prompts/{deslop.md, review.md, commit-push-pr.md}`, and `scripts/{install.ps1, install.sh}`.
+  - Added `Alt+Q` steering/follow-up retraction, 400ms `ApprovalModal` typing grace period, and long-paste collapse pills (`[pasted #N: M lines]`).
+
+---
+
 ## 2026-11-21 — v0.3.1: Windows ConPTY Mouse-Wheel Scrolling Fix, SGR Escape Guard & Right-Edge Scrollbar
 
 - **Windows ConPTY Mouse-Wheel Fix (`crates/le-vibe-tui/src/state.rs`)**: Adopted Mistral Vibe's Win32 `CONIN$` fix — clears `ENABLE_VIRTUAL_TERMINAL_INPUT` (`0x0200`) before enabling `EnableMouseCapture` + `\x1b[?1006h`, re-verifies on every `poll_tui_action` tick (`keep_vt_input_off`) in case child `bash.exe`/`powershell.exe` tools flip it back on, and restores cleanly on exit/suspend. Eliminates `[<35;x;yM` mouse escapes leaking into keyboard input.

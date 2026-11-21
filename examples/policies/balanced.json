@@ -21,6 +21,18 @@
     "pytest *"
   ],
   "allowed_paths": [],
+  "allow_patterns": [
+    "bash(cargo test*)",
+    "bash(cargo clippy*)",
+    "powershell(cargo test*)"
+  ],
+  "deny_patterns": [
+    "write(.env*)",
+    "edit(.env*)",
+    "bash(*--force*)"
+  ],
+  "require_read_before_edit": true,
+  "guard_dirty_repo": true,
   "blocked_commands": [
     "git push --force",
     "git reset --hard"

@@ -902,7 +902,7 @@ pub(crate) fn format_hotkeys_lines() -> Vec<String> {
         "Core Controls:".to_string(),
         format!("  • {:<18} Submit prompt (or inject steering while busy)", resolve("submit", "Enter")),
         format!("  • {:<18} Queue follow-up while busy", resolve("followup", "Alt+Enter / Ctrl+Enter")),
-        format!("  • {:<18} Return queued/steering prompts to editor", resolve("recall_queued", "Alt+Up")),
+        format!("  • {:<18} Return queued/steering prompts to editor", resolve("recall_queued", "Alt+Q / Alt+Up")),
         format!("  • {:<18} Interrupt turn & return queued prompts (or double-Esc /rewind)", resolve("interrupt", "Esc")),
         format!("  • {:<18} Insert newline in editor", resolve("newline", "Shift+Enter / Ctrl+J")),
         format!("  • {:<18} Open input in external editor ($VISUAL/$EDITOR)", resolve("external_editor", "Ctrl+G")),

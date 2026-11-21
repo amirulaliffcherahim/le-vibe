@@ -1,3 +1,5 @@
+pub mod codemode;
+pub mod hooks;
 pub mod memory;
 
 use le_vibe_pybridge::{PolicyPort, ToolDefinition};
@@ -207,6 +209,29 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {
                     "id_or_key": { "type": "string" },
                     "scope": { "type": "string" }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "spawn_agent".to_string(),
+            description: "Spawn an isolated read-only subagent with its own clean context window to research or inspect code and return a concise summary.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "required": ["task"],
+                "properties": {
+                    "task": { "type": "string", "description": "Focused research or analysis task for the isolated subagent" }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "codemode".to_string(),
+            description: "Execute a Python script that calls tools.<name>(**kwargs) (read, grep, find, ls, write, edit, bash, powershell) and prints/returns filtered output in one turn. Globals: tools, text(v), print(...), store(k,v), load(k), json.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "required": ["script"],
+                "properties": {
+                    "script": { "type": "string", "description": "Raw Python script calling tools.<name>(**kwargs) and text()/print()" },
+                    "timeout_ms": { "type": "integer", "description": "Optional timeout in milliseconds (default 60000)" }
                 }
             }),
         },

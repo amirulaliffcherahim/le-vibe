@@ -56,14 +56,9 @@ Cross-referenced against `goal.md`, `earendil-works/pi`, `mistralai/mistral-vibe
 
 ---
 
-## Phase C — Post-`v0.3.0` (Claude Code, Hermes & Distribution Ergonomics — Zero Bloat)
+## Phase C — `v0.4.0` (Claude Code, Hermes & Distribution Ergonomics — Zero Bloat) — COMPLETED
 
-10. **Declarative Lifecycle Hooks (`PreToolUse` / `PostToolUse` / `Stop` in `settings.json`)** *(Claude Code)*
-11. **Scoped Tool Permission Patterns in `python/le_vibe/policy` (`bash(cargo *)`, `write(src/**)`)** *(Claude Code + Mistral Vibe)*
-12. **Closed Learning Loop — Zero-Bloat Subset** *(Hermes Agent)*:
-    - **Cross-session BM25 search (`session_search` tool / `/search <query>`)** reusing our existing pure-Rust BM25 scorer over `~/.le-vibe/projects/*/sessions/*.jsonl` (0 new deps).
-    - **Skill distillation (`skill_write` / `/skill-save`)** saving proven multi-step procedures to `.le-vibe/skills/<name>/SKILL.md` (`agentskills.io` standard).
-    - **`le-vibe doctor`** single-command health check (Python/uv, provider auth, MCP, `trust.json`, `settings.json`, `models-cache.json`).
-    - **SSE Stream Watchdog** in `le-vibe-pybridge` (fail fast on stalled streams instead of hanging forever).
-    - *Explicitly skipped from Hermes (bloat)*: messaging gateway daemons (Telegram/Discord/WhatsApp), 6 cloud VM backends, desktop app, voice transcription, Honcho cloud server.
-13. **Isolated `spawn_agent` Subagent Tool + One-Liner Installers (`install.ps1` / `install.sh`)**
+- [x] **C1 — Scoped Tool Permission Patterns (`python/le_vibe/policy/__init__.py`)**: `allow_patterns` & `deny_patterns` (`bash(cargo test*)`, `write(src/**)`), Windows path normalization, `deny_patterns` enforced even in `yolo`.
+- [x] **C2 — Declarative Lifecycle Hooks (`crates/le-vibe-tools/src/hooks.rs`, `crates/le-vibe-agent/src/lib.rs`)**: `PreToolUse`, `PostToolUse`, `Stop` loaded from `~/.le-vibe/hooks.json` and `.le-vibe/hooks.json`.
+- [x] **C3 — Skill Distillation (`/skill-save`) & Isolated `spawn_agent` Subagent Tool**: `/skill-save <name>` distills sessions into `.le-vibe/skills/<name>/SKILL.md` (`agentskills.io`); `spawn_agent` runs an isolated read-only child turn loop (12 turns max) returning a concise summary.
+- [x] **C4 — One-Liner Installers (`scripts/install.ps1`, `scripts/install.sh`)**: Zero-friction installation from GitHub Releases.

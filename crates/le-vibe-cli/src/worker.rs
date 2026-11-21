@@ -14,9 +14,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use crate::debug_log::EventLogger;
 use crate::features::export_bug_report_pdf;
 use crate::settings::{
-    current_git_branch, cwd_string, default_mcp_paths, default_model_for, format_cwd,
-    project_sessions_dir, run_shell_command, scan_workspace_files, self_repo_path, sessions_dir,
-    summarize_git_status,
+    current_git_branch, cwd_string, default_mcp_paths, default_model_for, default_skill_dirs,
+    format_cwd, project_sessions_dir, run_shell_command, scan_workspace_files, self_repo_path,
+    sessions_dir, summarize_git_status,
 };
 
 pub(crate) fn humanize_age(seconds: f64) -> String {
@@ -356,6 +356,7 @@ pub(crate) enum WorkerCmd {
         include_in_context: bool,
     },
     SetYolo(bool),
+    SetCodemode(String),
     Compact {
         provider: String,
         model: String,
@@ -693,6 +694,7 @@ pub(crate) fn spawn_tui_worker(
     std::thread::spawn(move || {
         bridge.set_cancel_token(Arc::clone(&cancel));
         let mut todos = TodoStore::new();
+        let mut codemode_setting = "off".to_string();
         // Freeze `<memory_toc>` for the session so mid-session `memory_write` never busts prompt cache.
         let mut session_memory_toc = le_vibe_tools::memory::MemoryRagStore::open_default().build_toc(25);
         let mcp_started = Instant::now();
@@ -736,6 +738,9 @@ pub(crate) fn spawn_tui_worker(
                 WorkerCmd::SetYolo(enabled) => {
                     let _ = bridge.set_yolo(enabled);
                 }
+                WorkerCmd::SetCodemode(mode_val) => {
+                    codemode_setting = mode_val;
+                }
                 WorkerCmd::RefreshCatalog {
                     live,
                     announce,
@@ -765,8 +770,10 @@ pub(crate) fn spawn_tui_worker(
                             .and_then(|(age, _)| age)
                             .map(humanize_age)
                             .unwrap_or_else(|| "just now".to_string());
+                        let skill_dirs = default_skill_dirs();
+                        let skill_refs: Vec<&str> = skill_dirs.iter().map(String::as_str).collect();
                         let skill_count = bridge
-                            .list_skills(&[".le-vibe/skills", ".pi/skills"])
+                            .list_skills(&skill_refs)
                             .map(|s| s.len())
                             .unwrap_or(0);
                         Some(format!(
@@ -1535,8 +1542,10 @@ pub(crate) fn spawn_tui_worker(
                     context_window,
                     last_input_tokens,
                 } => {
+                    let skill_dirs = default_skill_dirs();
+                    let skill_refs: Vec<&str> = skill_dirs.iter().map(String::as_str).collect();
                     let skills: Vec<(String, String, String)> = bridge
-                        .list_skills(&[".le-vibe/skills", ".pi/skills"])
+                        .list_skills(&skill_refs)
                         .unwrap_or_default()
                         .into_iter()
                         .map(|s| (s.name, s.description, s.path))
@@ -1563,9 +1572,11 @@ pub(crate) fn spawn_tui_worker(
                     let _ = msg_tx.send(WorkerMsg::Idle);
                 }
                 WorkerCmd::Skills => {
-                    let lines = match bridge.list_skills(&[".le-vibe/skills", ".pi/skills"]) {
+                    let skill_dirs = default_skill_dirs();
+                    let skill_refs: Vec<&str> = skill_dirs.iter().map(String::as_str).collect();
+                    let lines = match bridge.list_skills(&skill_refs) {
                         Ok(skills) if skills.is_empty() => {
-                            vec!["No SKILL.md files discovered in .le-vibe/skills or .pi/skills.".to_string()]
+                            vec!["No SKILL.md files discovered in project or global skill directories.".to_string()]
                         }
                         Ok(skills) => skills
                             .into_iter()
@@ -1610,8 +1621,10 @@ pub(crate) fn spawn_tui_worker(
                     prompt,
                 } => {
                     cancel.store(false, Ordering::SeqCst);
+                    let skill_dirs = default_skill_dirs();
+                    let skill_refs: Vec<&str> = skill_dirs.iter().map(String::as_str).collect();
                     let discovered_skills: Vec<(String, String, String)> = bridge
-                        .list_skills(&[".le-vibe/skills", ".pi/skills"])
+                        .list_skills(&skill_refs)
                         .unwrap_or_default()
                         .into_iter()
                         .map(|s| (s.name, s.description, s.path))
@@ -1638,6 +1651,7 @@ pub(crate) fn spawn_tui_worker(
                         max_retries: retry_max,
                         allowed_tools: mode.allowed_tools(),
                         mode_name: Some(mode.name().to_string()),
+                        codemode: codemode_setting.clone(),
                         steering_queue: Some(Arc::clone(&steering_queue)),
                     };
                     let mut first_delta_at: Option<Instant> = None;

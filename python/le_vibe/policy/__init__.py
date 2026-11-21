@@ -8,6 +8,7 @@ from enum import StrEnum
 import fnmatch
 import json
 from pathlib import Path
+import subprocess
 from typing import Any, Literal
 
 
@@ -43,10 +44,29 @@ class PolicyDecision:
     reason: str = ""
 
 
+def parse_scoped_pattern(spec: str) -> tuple[str, str] | None:
+    """Parse Claude-Code-style scoped rule like `bash(cargo test*)` or `write(src/**)`."""
+    s = spec.strip()
+    open_idx = s.find("(")
+    if open_idx <= 0 or not s.endswith(")"):
+        return None
+    tool = s[:open_idx].strip().lower()
+    pat = s[open_idx + 1 : -1].strip()
+    if not tool or not pat:
+        return None
+    return tool, pat
+
+
 def wildcard_match(text: str, pattern: str) -> bool:
-    if fnmatch.fnmatch(text, pattern):
+    norm_text = text.replace("\\", "/")
+    norm_pat = pattern.replace("\\", "/")
+    if fnmatch.fnmatch(norm_text, norm_pat):
         return True
-    if pattern.endswith(" *") and fnmatch.fnmatch(text, pattern[:-2]):
+    if norm_pat.endswith(" *") and fnmatch.fnmatch(norm_text, norm_pat[:-2]):
+        return True
+    if norm_pat.endswith("/**") and (
+        norm_text.startswith(norm_pat[:-2]) or norm_text == norm_pat[:-3]
+    ):
         return True
     return False
 
@@ -60,6 +80,32 @@ _DANGEROUS_SHELL_PATTERNS: tuple[str, ...] = (
     "shutdown",
     "reboot",
 )
+
+
+_DIRTY_REPO_DESTRUCTIVE_GIT: tuple[str, ...] = (
+    "git reset --hard",
+    "git checkout .",
+    "git checkout --",
+    "git clean -f",
+    "git clean -fd",
+    "git stash drop",
+    "git restore .",
+    "git rebase ",
+)
+
+
+def is_dirty_git_repo() -> bool:
+    try:
+        proc = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        return proc.returncode == 0 and bool(proc.stdout.strip())
+    except Exception:
+        return False
 
 
 def is_command_blocked(command: str) -> str | None:
@@ -84,6 +130,7 @@ class PermissionStore:
             "memory_read": ToolPermission.ALWAYS,
             "memory_write": ToolPermission.ALWAYS,
             "memory_delete": ToolPermission.ALWAYS,
+            "spawn_agent": ToolPermission.ALWAYS,
             "write": ToolPermission.ASK,
             "edit": ToolPermission.ASK,
             "bash": ToolPermission.ASK,
@@ -92,6 +139,11 @@ class PermissionStore:
         self._trusted_folders: tuple[Path, ...] = tuple(p.resolve() for p in trusted_folders)
         self._blocked_commands: list[str] = []
         self._allowed_paths: list[str] = []
+        self._allow_patterns: list[tuple[str, str]] = []
+        self._deny_patterns: list[tuple[str, str]] = []
+        self._read_paths: set[str] = set()
+        self.require_read_before_edit: bool = False
+        self.guard_dirty_repo: bool = False
         self.loaded_files: list[str] = []
         self.yolo: bool = yolo
 
@@ -100,6 +152,11 @@ class PermissionStore:
         self._tool_permissions.clear()
         self._blocked_commands.clear()
         self._allowed_paths.clear()
+        self._allow_patterns.clear()
+        self._deny_patterns.clear()
+        self._read_paths.clear()
+        self.require_read_before_edit = False
+        self.guard_dirty_repo = False
         self.loaded_files.clear()
 
     def apply_policy(self, data: dict[str, Any], *, base_dir: Path | None = None) -> None:
@@ -141,6 +198,24 @@ class PermissionStore:
             if isinstance(blocked, list):
                 self._blocked_commands.extend(str(b).strip().lower() for b in blocked if str(b).strip())
 
+        if allow_pats := data.get("allow_patterns"):
+            if isinstance(allow_pats, list):
+                for spec in allow_pats:
+                    if parsed := parse_scoped_pattern(str(spec)):
+                        self._allow_patterns.append(parsed)
+
+        if deny_pats := data.get("deny_patterns"):
+            if isinstance(deny_pats, list):
+                for spec in deny_pats:
+                    if parsed := parse_scoped_pattern(str(spec)):
+                        self._deny_patterns.append(parsed)
+
+        if "require_read_before_edit" in data:
+            self.require_read_before_edit = bool(data["require_read_before_edit"])
+
+        if "guard_dirty_repo" in data:
+            self.guard_dirty_repo = bool(data["guard_dirty_repo"])
+
     @classmethod
     def load_from_files(cls, paths: Sequence[Path], *, yolo: bool = False) -> PermissionStore:
         store = cls(yolo=yolo)
@@ -158,6 +233,10 @@ class PermissionStore:
             "trusted_folders": [str(p) for p in self._trusted_folders],
             "tool_permissions": {k: v.value for k, v in sorted(self._tool_permissions.items())},
             "allowed_paths": list(self._allowed_paths),
+            "allow_patterns": [f"{t}({p})" for t, p in self._allow_patterns],
+            "deny_patterns": [f"{t}({p})" for t, p in self._deny_patterns],
+            "require_read_before_edit": self.require_read_before_edit,
+            "guard_dirty_repo": self.guard_dirty_repo,
             "blocked_commands": list(self._blocked_commands),
             "session_rules": [
                 {"tool": r.tool_name, "scope": r.scope.value, "pattern": r.session_pattern}
@@ -227,6 +306,12 @@ class PermissionStore:
         command: str | None = None,
         target_path: str | None = None,
     ) -> PolicyDecision:
+        if tool_name == "read" and target_path is not None:
+            try:
+                self._read_paths.add(str(Path(target_path).resolve()).lower())
+            except Exception:
+                self._read_paths.add(target_path.replace("\\", "/").lower())
+
         if command is not None:
             if reason := is_command_blocked(command):
                 return PolicyDecision(action="deny", reason=reason)
@@ -234,9 +319,43 @@ class PermissionStore:
             for pat in self._blocked_commands:
                 if pat in lowered:
                     return PolicyDecision(action="deny", reason=f"Blocked by policy rule: {pat}")
+            if self.guard_dirty_repo and any(p in lowered for p in _DIRTY_REPO_DESTRUCTIVE_GIT):
+                if is_dirty_git_repo():
+                    return PolicyDecision(
+                        action="deny",
+                        reason="Blocked destructive git command while working tree has uncommitted changes (guard_dirty_repo policy)",
+                    )
+
+        if self.require_read_before_edit and tool_name == "edit" and target_path is not None:
+            try:
+                norm_target = str(Path(target_path).resolve()).lower()
+            except Exception:
+                norm_target = target_path.replace("\\", "/").lower()
+            if norm_target not in self._read_paths:
+                return PolicyDecision(
+                    action="deny",
+                    reason=f"Read {target_path!r} first before editing (require_read_before_edit policy)",
+                )
+
+        target_val = command if command is not None else target_path
+        if target_val is not None:
+            for pat_tool, pat in self._deny_patterns:
+                if pat_tool == tool_name.lower() and wildcard_match(target_val, pat):
+                    return PolicyDecision(
+                        action="deny",
+                        reason=f"Denied by policy pattern: {pat_tool}({pat})",
+                    )
 
         if self.yolo:
             return PolicyDecision(action="allow", reason="Auto-approved (yolo)")
+
+        if target_val is not None:
+            for pat_tool, pat in self._allow_patterns:
+                if pat_tool == tool_name.lower() and wildcard_match(target_val, pat):
+                    return PolicyDecision(
+                        action="allow",
+                        reason=f"Allowed by policy pattern: {pat_tool}({pat})",
+                    )
 
         if target_path is not None and not self.is_path_trusted(target_path):
             rp = RequiredPermission(scope=PermissionScope.OUTSIDE_DIRECTORY, invocation_pattern=target_path)

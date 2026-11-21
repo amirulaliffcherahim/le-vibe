@@ -435,6 +435,11 @@ fn main() {
                         max_retries: 2,
                         allowed_tools,
                         mode_name: Some(agent_mode.name().to_string()),
+                        codemode: load_layered_settings()
+                            .0
+                            .get("codemode")
+                            .cloned()
+                            .unwrap_or_else(|| "off".to_string()),
                         steering_queue: None,
                     };
                     run_streaming_prompt(&mut bridge, &mut session, &telemetry, &cfg, &prompt, json_mode);
@@ -503,6 +508,11 @@ fn run_interactive_tui(
     }
     if !initial_yolo {
         state.yolo = parse_bool("yolo", false);
+    }
+    if let Some(cm) = layered.get("codemode")
+        && matches!(cm.as_str(), "off" | "on" | "only")
+    {
+        state.codemode = cm.clone();
     }
     state.show_thinking = parse_bool("show_thinking", true);
     state.expand_tools = parse_bool("expand_tools", false);
@@ -584,6 +594,9 @@ fn run_interactive_tui(
         Arc::clone(&logger),
         system_prompt_extra,
     );
+    if state.codemode != "off" {
+        let _ = cmd_tx.send(WorkerCmd::SetCodemode(state.codemode.clone()));
+    }
     let _ = cmd_tx.send(WorkerCmd::RefreshCatalog {
         live: false,
         announce: false,
@@ -777,6 +790,7 @@ fn run_interactive_tui(
                         let _ = io::stdout().flush();
                     }
                     state.approval_prompt = Some((tool, detail, reason));
+                    state.approval_opened_at = Some(Instant::now());
                     state.modal = ActiveModal::ApprovalModal;
                     state.modal_idx = 0;
                 }
@@ -1283,8 +1297,17 @@ fn run_interactive_tui(
                 }
                 PastedItem::PlainText(txt) => {
                     let norm = txt.replace("\r\n", "\n").replace('\r', "\n");
-                    state.input.insert_str(state.cursor, &norm);
-                    state.cursor += norm.len();
+                    let line_count = norm.lines().count();
+                    if norm.chars().count() > 1000 || line_count > 10 {
+                        let idx = state.collapsed_pastes.len() + 1;
+                        let pill = format!("[pasted #{idx}: {line_count} lines]");
+                        state.collapsed_pastes.push((pill.clone(), norm));
+                        state.input.insert_str(state.cursor, &pill);
+                        state.cursor += pill.len();
+                    } else {
+                        state.input.insert_str(state.cursor, &norm);
+                        state.cursor += norm.len();
+                    }
                     state.selected_slash_idx = 0;
                 }
             },
@@ -1360,6 +1383,13 @@ fn run_interactive_tui(
                         state.yolo = !state.yolo;
                         let _ = cmd_tx.send(WorkerCmd::SetYolo(state.yolo));
                         Some(state.yolo.to_string())
+                    }
+                    "codemode" => {
+                        let modes = ["off", "on", "only"];
+                        let cur = modes.iter().position(|m| *m == state.codemode).unwrap_or(0);
+                        state.codemode = modes[(cur + 1) % modes.len()].to_string();
+                        let _ = cmd_tx.send(WorkerCmd::SetCodemode(state.codemode.clone()));
+                        Some(state.codemode.clone())
                     }
                     "show_thinking" => {
                         state.show_thinking = !state.show_thinking;
@@ -1867,6 +1897,46 @@ fn run_interactive_tui(
                     let _ = cmd_tx.send(WorkerCmd::ReloadPlugins);
                     continue;
                 }
+                if let Some(rest) = input.strip_prefix("/skill-save") {
+                    let trimmed = rest.trim();
+                    let mut parts = trimmed.splitn(2, char::is_whitespace);
+                    let raw_name = parts.next().unwrap_or("").trim();
+                    let extra = parts.next().unwrap_or("").trim();
+                    let slug: String = raw_name
+                        .to_lowercase()
+                        .chars()
+                        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+                        .collect();
+                    let slug = slug.trim_matches('-').to_string();
+                    if slug.is_empty() {
+                        state.blocks.push(TranscriptBlock::System(
+                            "Usage: /skill-save <skill-name> [optional focus]".to_string(),
+                        ));
+                    } else {
+                        let target = format!(".le-vibe/skills/{slug}/SKILL.md");
+                        let distill_prompt = format!(
+                            "Distill the reusable workflow/procedure from this session into `{target}` using the agentskills.io format (YAML frontmatter with `name: {slug}` and concise `description:`, followed by clear step-by-step instructions, commands, and gotchas). {extra}\nWrite `{target}` directly using the `write` tool."
+                        );
+                        state.blocks.push(TranscriptBlock::User(format!("/skill-save {slug}")));
+                        state.is_busy = true;
+                        active_prompt = true;
+                        cancel.store(false, Ordering::SeqCst);
+                        state.scroll_offset = 0;
+                        state.active_started = Some(Instant::now());
+                        state.status_text = Some(format!("Distilling skill {slug}..."));
+                        let _ = cmd_tx.send(WorkerCmd::RunPrompt {
+                            provider: state.provider.clone(),
+                            model: state.model.clone(),
+                            thinking_level: state.thinking_level.clone(),
+                            mode: state.mode,
+                            shell: state.shell.clone(),
+                            max_turns: state.max_turns,
+                            retry_max: state.retry_max,
+                            prompt: distill_prompt,
+                        });
+                    }
+                    continue;
+                }
                 if input == "/skills" {
                     let _ = cmd_tx.send(WorkerCmd::Skills);
                     continue;
@@ -2121,6 +2191,13 @@ fn run_interactive_tui(
                 }
 
                 let mut prompt_text = input;
+                if !state.collapsed_pastes.is_empty() {
+                    for (pill, full) in state.collapsed_pastes.drain(..) {
+                        if prompt_text.contains(&pill) {
+                            prompt_text = prompt_text.replace(&pill, &full);
+                        }
+                    }
+                }
                 if !state.pending_attachments.is_empty() {
                     let mut att_blocks = Vec::new();
                     for (name, mime, b64) in state.pending_attachments.drain(..) {

@@ -32,6 +32,7 @@ pub(crate) fn humanize_age(seconds: f64) -> String {
 }
 
 
+#[allow(dead_code)]
 pub(crate) fn refresh_state(bridge: &mut PythonBridge, state: &mut TuiState, live_network: bool) {
     state.cwd = format_cwd();
     state.git_branch = current_git_branch();
@@ -448,6 +449,10 @@ pub(crate) enum WorkerMsg {
     },
     TurnError(String),
     Notice(String),
+    InfoModal {
+        title: String,
+        lines: Vec<String>,
+    },
     RewindLoaded(Vec<(String, String, String)>),
     SessionsLoaded(Vec<(String, String, String)>),
     WorkspaceFilesLoaded(Vec<String>),
@@ -667,6 +672,7 @@ pub(crate) fn spawn_tui_worker(
     telemetry: TelemetryRecorder,
     cancel: Arc<AtomicBool>,
     logger: Arc<EventLogger>,
+    system_prompt_extra: Option<String>,
 ) -> (
     mpsc::Sender<WorkerCmd>,
     mpsc::Receiver<WorkerMsg>,
@@ -1243,7 +1249,10 @@ pub(crate) fn spawn_tui_worker(
                             {
                                 lines.push(format!("Approved rules: {} rule(s)", rules.len()));
                             }
-                            let _ = msg_tx.send(WorkerMsg::Notice(lines.join("\n")));
+                            let _ = msg_tx.send(WorkerMsg::InfoModal {
+                                title: "Active Policies (/policy)".to_string(),
+                                lines,
+                            });
                         }
                         Err(err) => {
                             let _ = msg_tx.send(WorkerMsg::Notice(format!("Policy query failed: {err}")));
@@ -1298,7 +1307,10 @@ pub(crate) fn spawn_tui_worker(
                             if !errs.is_empty() {
                                 lines.push(format!("Load errors: {}", errs.join(" | ")));
                             }
-                            let _ = msg_tx.send(WorkerMsg::Notice(lines.join("\n")));
+                            let _ = msg_tx.send(WorkerMsg::InfoModal {
+                                title: "Extensions & Plugins (/plugins)".to_string(),
+                                lines,
+                            });
                         }
                         Err(err) => {
                             let _ = msg_tx.send(WorkerMsg::Notice(format!("Plugins status failed: {err}")));
@@ -1416,18 +1428,20 @@ pub(crate) fn spawn_tui_worker(
                     let _ = msg_tx.send(WorkerMsg::Idle);
                 }
                 WorkerCmd::Skills => {
-                    if let Ok(skills) = bridge.list_skills(&[".le-vibe/skills", ".pi/skills"]) {
-                        let msg = if skills.is_empty() {
-                            "No SKILL.md files discovered.".to_string()
-                        } else {
-                            skills
-                                .into_iter()
-                                .map(|s| format!("{} — {} ({})", s.name, s.description, s.path))
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        };
-                        let _ = msg_tx.send(WorkerMsg::Notice(msg));
-                    }
+                    let lines = match bridge.list_skills(&[".le-vibe/skills", ".pi/skills"]) {
+                        Ok(skills) if skills.is_empty() => {
+                            vec!["No SKILL.md files discovered in .le-vibe/skills or .pi/skills.".to_string()]
+                        }
+                        Ok(skills) => skills
+                            .into_iter()
+                            .map(|s| format!("• {} — {} ({})", s.name, s.description, s.path))
+                            .collect(),
+                        Err(err) => vec![format!("Failed to list skills: {err}")],
+                    };
+                    let _ = msg_tx.send(WorkerMsg::InfoModal {
+                        title: "Discovered Skills (/skills)".to_string(),
+                        lines,
+                    });
                     let _ = msg_tx.send(WorkerMsg::Idle);
                 }
                 WorkerCmd::McpStatus => {
@@ -1467,7 +1481,7 @@ pub(crate) fn spawn_tui_worker(
                         .into_iter()
                         .map(|s| (s.name, s.description, s.path))
                         .collect();
-                    let sys = build_system_prompt(
+                    let mut sys = build_system_prompt(
                         mode,
                         &shell,
                         &cwd_string(),
@@ -1475,6 +1489,11 @@ pub(crate) fn spawn_tui_worker(
                         &discovered_skills,
                         &session_memory_toc,
                     );
+                    if let Some(extra) = &system_prompt_extra
+                        && !extra.trim().is_empty()
+                    {
+                        sys.push_str(&format!("\n\n<cli_instructions>\n{}\n</cli_instructions>", extra.trim()));
+                    }
                     let cfg = AgentConfig {
                         provider: provider.clone(),
                         model,

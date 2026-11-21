@@ -2,7 +2,7 @@ use crossterm::event::{
     self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::commands::filter_slash_commands_with_dynamic;
 use crate::editor::{next_char_boundary, prev_char_boundary};
@@ -16,7 +16,8 @@ fn modal_len(state: &TuiState) -> usize {
         | ActiveModal::UsageModal
         | ActiveModal::HelpModal
         | ActiveModal::ChangelogModal
-        | ActiveModal::DebugModal => 0,
+        | ActiveModal::DebugModal
+        | ActiveModal::InfoModal => 0,
         ActiveModal::ModelPicker => state.picker_rows().len(),
         ActiveModal::LoginPicker | ActiveModal::LogoutPicker => 3,
         ActiveModal::ModePicker => ALL_MODES.len(),
@@ -36,37 +37,65 @@ fn modal_len(state: &TuiState) -> usize {
 }
 
 pub fn poll_tui_action(state: &mut TuiState, timeout: Duration) -> io::Result<TuiAction> {
-    if !event::poll(timeout)? {
-        return Ok(TuiAction::None);
-    }
-    match event::read()? {
-        Event::Paste(text) => {
-            if state.modal == ActiveModal::None {
-                return Ok(TuiAction::Pasted(text));
-            }
-            Ok(TuiAction::Redraw)
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if !event::poll(remaining)? {
+            return Ok(TuiAction::None);
         }
-        Event::Mouse(mouse) => match mouse.kind {
-            MouseEventKind::ScrollUp => {
-                state.scroll_offset = state.scroll_offset.saturating_add(3);
-                Ok(TuiAction::Redraw)
+        match event::read()? {
+            Event::Paste(text) => {
+                if state.modal == ActiveModal::None {
+                    return Ok(TuiAction::Pasted(text));
+                }
+                return Ok(TuiAction::Redraw);
             }
-            MouseEventKind::ScrollDown => {
-                state.scroll_offset = state.scroll_offset.saturating_sub(3);
-                Ok(TuiAction::Redraw)
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    if state.modal == ActiveModal::UsageModal {
+                        state.usage_scroll = state.usage_scroll.saturating_sub(3);
+                    } else if matches!(
+                        state.modal,
+                        ActiveModal::HelpModal
+                            | ActiveModal::ChangelogModal
+                            | ActiveModal::DebugModal
+                            | ActiveModal::InfoModal
+                    ) {
+                        state.help_scroll = state.help_scroll.saturating_sub(3);
+                    } else if state.modal == ActiveModal::None {
+                        state.scroll_offset = state.scroll_offset.saturating_add(3);
+                    }
+                    return Ok(TuiAction::Redraw);
+                }
+                MouseEventKind::ScrollDown => {
+                    if state.modal == ActiveModal::UsageModal {
+                        state.usage_scroll = state.usage_scroll.saturating_add(3);
+                    } else if matches!(
+                        state.modal,
+                        ActiveModal::HelpModal
+                            | ActiveModal::ChangelogModal
+                            | ActiveModal::DebugModal
+                            | ActiveModal::InfoModal
+                    ) {
+                        state.help_scroll = state.help_scroll.saturating_add(3);
+                    } else if state.modal == ActiveModal::None {
+                        state.scroll_offset = state.scroll_offset.saturating_sub(3);
+                    }
+                    return Ok(TuiAction::Redraw);
+                }
+                // Ignore mouse move/click noise immediately so it causes zero lag or redraws.
+                _ => continue,
+            },
+            Event::Resize(_, _) => return Ok(TuiAction::Redraw),
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                let action = handle_key_event(state, key)?;
+                if matches!(action, TuiAction::None) {
+                    return Ok(TuiAction::Redraw);
+                }
+                return Ok(action);
             }
-            _ => Ok(TuiAction::None),
-        },
-        Event::Resize(_, _) => Ok(TuiAction::Redraw),
-        Event::Key(key) if key.kind == KeyEventKind::Press => {
-            let action = handle_key_event(state, key)?;
-            if matches!(action, TuiAction::None) {
-                Ok(TuiAction::Redraw)
-            } else {
-                Ok(action)
-            }
+            _ => continue,
         }
-        _ => Ok(TuiAction::None),
     }
 }
 
@@ -189,7 +218,10 @@ fn handle_key_event(state: &mut TuiState, key: crossterm::event::KeyEvent) -> io
         return Ok(TuiAction::None);
     }
 
-    if state.modal == ActiveModal::HelpModal || state.modal == ActiveModal::ChangelogModal {
+    if state.modal == ActiveModal::HelpModal
+        || state.modal == ActiveModal::ChangelogModal
+        || state.modal == ActiveModal::InfoModal
+    {
         match key.code {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
                 state.modal = ActiveModal::None;
@@ -359,7 +391,8 @@ fn handle_key_event(state: &mut TuiState, key: crossterm::event::KeyEvent) -> io
                     | ActiveModal::QuestionModal
                     | ActiveModal::HelpModal
                     | ActiveModal::ChangelogModal
-                    | ActiveModal::DebugModal => {}
+                    | ActiveModal::DebugModal
+                    | ActiveModal::InfoModal => {}
                 }
             }
             _ => {}
@@ -441,10 +474,9 @@ fn handle_key_event(state: &mut TuiState, key: crossterm::event::KeyEvent) -> io
         KeyCode::Up => {
             if !matches.is_empty() || !file_matches.is_empty() {
                 state.selected_slash_idx = state.selected_slash_idx.saturating_sub(1);
-            } else if (state.input.is_empty() || state.history_idx.is_some())
-                && !state.history.is_empty()
-                && !key.modifiers.contains(KeyModifiers::SHIFT)
-            {
+            } else if key.modifiers.contains(KeyModifiers::SHIFT) {
+                state.scroll_offset = state.scroll_offset.saturating_add(3);
+            } else if !state.history.is_empty() {
                 let next_idx = match state.history_idx {
                     None => state.history.len() - 1,
                     Some(i) => i.saturating_sub(1),
@@ -452,8 +484,6 @@ fn handle_key_event(state: &mut TuiState, key: crossterm::event::KeyEvent) -> io
                 state.history_idx = Some(next_idx);
                 state.input = state.history[next_idx].clone();
                 state.cursor = state.input.len();
-            } else {
-                state.scroll_offset = state.scroll_offset.saturating_add(1);
             }
         }
         KeyCode::Down => {
@@ -465,9 +495,9 @@ fn handle_key_event(state: &mut TuiState, key: crossterm::event::KeyEvent) -> io
                 if state.selected_slash_idx + 1 < file_matches.len() {
                     state.selected_slash_idx += 1;
                 }
-            } else if let Some(idx) = state.history_idx
-                && !key.modifiers.contains(KeyModifiers::SHIFT)
-            {
+            } else if key.modifiers.contains(KeyModifiers::SHIFT) {
+                state.scroll_offset = state.scroll_offset.saturating_sub(3);
+            } else if let Some(idx) = state.history_idx {
                 if idx + 1 < state.history.len() {
                     let next_idx = idx + 1;
                     state.history_idx = Some(next_idx);
@@ -478,8 +508,6 @@ fn handle_key_event(state: &mut TuiState, key: crossterm::event::KeyEvent) -> io
                     state.input.clear();
                     state.cursor = 0;
                 }
-            } else {
-                state.scroll_offset = state.scroll_offset.saturating_sub(1);
             }
         }
         KeyCode::Home => {
@@ -530,6 +558,14 @@ fn handle_key_event(state: &mut TuiState, key: crossterm::event::KeyEvent) -> io
             state.selected_slash_idx = 0;
         }
         KeyCode::Enter => {
+            // If more input events are already queued at the exact same instant, this Enter came
+            // from an unbracketed multi-line paste burst — insert a newline instead of submitting.
+            if event::poll(Duration::ZERO).unwrap_or(false) {
+                state.input.insert(state.cursor, '\n');
+                state.cursor += 1;
+                state.selected_slash_idx = 0;
+                return Ok(TuiAction::None);
+            }
             if !file_matches.is_empty()
                 && let Some((at_pos, _)) = state.active_at_query()
             {

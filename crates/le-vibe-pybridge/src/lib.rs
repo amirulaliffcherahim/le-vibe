@@ -418,7 +418,14 @@ impl PythonBridge {
         params: Value,
         mut on_stream: impl FnMut(Value),
     ) -> Result<Value, BridgeError> {
-        let is_cancellable = method == "providers.stream" || method == "providers.complete";
+        let is_cancellable = matches!(
+            method,
+            "providers.stream"
+                | "providers.complete"
+                | "providers.refresh_models"
+                | "providers.usage"
+                | "providers.resolve_model"
+        );
         let id = self.next_id;
         self.next_id += 1;
 

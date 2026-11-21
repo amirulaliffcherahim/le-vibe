@@ -687,6 +687,27 @@ fn run_ls(args: &Value) -> Result<String, ToolError> {
     Ok(truncate_output(&entries.join("\n")))
 }
 
+fn decode_shell_output(bytes: &[u8]) -> String {
+    if bytes.len() >= 2
+        && bytes.len().is_multiple_of(2)
+        && bytes
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .take(16)
+            .filter(|&&b| b == 0)
+            .count()
+            >= 4
+    {
+        let u16s: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        return String::from_utf16_lossy(&u16s).replace(['\0', '\r'], "");
+    }
+    String::from_utf8_lossy(bytes).replace(['\0', '\r'], "")
+}
+
 fn run_shell(shell: &str, args: &Value) -> Result<String, ToolError> {
     let cmd = args.get("command").and_then(Value::as_str).expect("validated");
     let timeout_secs = args
@@ -728,14 +749,16 @@ fn run_shell(shell: &str, args: &Value) -> Result<String, ToolError> {
         std::thread::sleep(Duration::from_millis(50));
     };
 
-    let mut stdout_buf = String::new();
-    let mut stderr_buf = String::new();
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
     if let Some(mut out) = child.stdout.take() {
-        let _ = out.read_to_string(&mut stdout_buf);
+        let _ = out.read_to_end(&mut stdout_bytes);
     }
     if let Some(mut err) = child.stderr.take() {
-        let _ = err.read_to_string(&mut stderr_buf);
+        let _ = err.read_to_end(&mut stderr_bytes);
     }
+    let stdout_buf = decode_shell_output(&stdout_bytes);
+    let stderr_buf = decode_shell_output(&stderr_bytes);
     let combined = if stderr_buf.is_empty() {
         stdout_buf
     } else if stdout_buf.is_empty() {

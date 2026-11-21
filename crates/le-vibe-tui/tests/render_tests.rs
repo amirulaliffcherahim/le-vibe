@@ -65,6 +65,7 @@ fn renders_all_modals_at_minimum_and_desktop_sizes() {
         ActiveModal::HelpModal,
         ActiveModal::ChangelogModal,
         ActiveModal::DebugModal,
+        ActiveModal::InfoModal,
     ];
 
     for modal in modals {

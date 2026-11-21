@@ -21,6 +21,10 @@ pub(crate) struct CliOptions {
     pub allowed_tools: Option<Vec<String>>,
     pub prompt: Option<String>,
     pub at_files: Vec<String>,
+    pub extra_extensions: Vec<String>,
+    pub no_extensions: bool,
+    pub system_prompt_extra: Option<String>,
+    pub offline: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,7 +42,17 @@ pub(crate) fn help_text() -> &'static str {
 
 USAGE:
   le-vibe [OPTIONS] [--] [@files...] [prompt...]
-  le-vibe <login|logout|auth|usage|mcp> [OPTIONS]
+  le-vibe <login|auth|mcp|config|install|remove|list|update> [OPTIONS]
+
+SUBCOMMANDS:
+  login [--provider ...]       Authenticate provider (OIDC / OAuth / API key)
+  auth                         Print JSON auth status for all providers
+  mcp list                     List configured MCP servers and status
+  config [path|set <k> <v>]    Inspect or update layered settings
+  install <file.py|git-url>    Install a Python extension into ~/.le-vibe/extensions/
+  remove <name>                Remove an installed extension
+  list                         List installed extensions
+  update                       Pull latest main & reinstall le-vibe binary
 
 OPTIONS:
   -h, --help                   Show this help and exit
@@ -48,7 +62,7 @@ OPTIONS:
       --provider <name>        Provider (vibe | deepseek | agy)
       --model <spec>           Model (id or provider/id[:thinking])
       --thinking <level>       off | minimal | low | medium | high | xhigh | max
-      --agent-mode <mode>      normal | plan | execute | ask | rea
+      --agent-mode <mode>      normal | plan | ask | rea | cyber
       --tools <csv>            Comma-separated tool allowlist (e.g. read,grep,ls)
       --yolo, --auto-approve   Auto-approve non-blocked tools
   -c, --continue               Continue latest session
@@ -59,7 +73,11 @@ OPTIONS:
       --no-session             Run ephemeral in-memory session
   -n, --name <name>            Set session display name
       --list-models [query]    List available live models and exit
-      --export <jsonl> [out]   Export a session .jsonl to .md or .html and exit"
+      --export <jsonl> [out]   Export a session .jsonl to .md or .html and exit
+  -e, --extension <path>       Load an extra Python extension file for this run
+      --no-extensions          Start without loading any extensions/plugins
+      --system-prompt <text>   Append custom system prompt instructions for this run
+      --offline                Skip startup live catalog/usage network requests"
 }
 
 pub(crate) fn parse_cli_args(args: &[String]) -> CliAction {
@@ -70,7 +88,10 @@ pub(crate) fn parse_cli_args(args: &[String]) -> CliAction {
         return CliAction::Version;
     }
     if let Some(first) = args.first().map(String::as_str)
-        && matches!(first, "login" | "logout" | "auth" | "usage" | "mcp")
+        && matches!(
+            first,
+            "login" | "auth" | "mcp" | "config" | "install" | "remove" | "list" | "update"
+        )
     {
         return CliAction::Subcommand(first.to_string(), args[1..].to_vec());
     }
@@ -93,6 +114,10 @@ pub(crate) fn parse_cli_args(args: &[String]) -> CliAction {
         allowed_tools: None,
         prompt: None,
         at_files: Vec::new(),
+        extra_extensions: Vec::new(),
+        no_extensions: false,
+        system_prompt_extra: None,
+        offline: false,
     };
     let mut positional: Vec<String> = Vec::new();
     let mut i = 0;
@@ -134,6 +159,26 @@ pub(crate) fn parse_cli_args(args: &[String]) -> CliAction {
                 "--no-session" => {
                     opts.no_session = true;
                     i += 1;
+                    continue;
+                }
+                "--no-extensions" => {
+                    opts.no_extensions = true;
+                    i += 1;
+                    continue;
+                }
+                "--offline" => {
+                    opts.offline = true;
+                    i += 1;
+                    continue;
+                }
+                "-e" | "--extension" if i + 1 < args.len() => {
+                    opts.extra_extensions.push(args[i + 1].clone());
+                    i += 2;
+                    continue;
+                }
+                "--system-prompt" if i + 1 < args.len() => {
+                    opts.system_prompt_extra = Some(args[i + 1].clone());
+                    i += 2;
                     continue;
                 }
                 "-r" | "--resume" => {
@@ -299,5 +344,31 @@ mod tests {
         assert_eq!(opts.allowed_tools, Some(vec!["read".into(), "grep".into()]));
         assert_eq!(opts.at_files, vec!["README.md".to_string()]);
         assert_eq!(opts.prompt.as_deref(), Some("explain this"));
+    }
+
+    #[test]
+    fn parses_new_subcommands_and_extension_offline_flags() {
+        assert!(matches!(
+            parse_cli_args(&vec_s(&["config"])),
+            CliAction::Subcommand(s, _) if s == "config"
+        ));
+        assert!(matches!(
+            parse_cli_args(&vec_s(&["install", "my_ext.py"])),
+            CliAction::Subcommand(s, _) if s == "install"
+        ));
+        let CliAction::Run(opts) = parse_cli_args(&vec_s(&[
+            "-e",
+            "a.py",
+            "--no-extensions",
+            "--offline",
+            "--system-prompt",
+            "be terse",
+        ])) else {
+            panic!("expected Run");
+        };
+        assert_eq!(opts.extra_extensions, vec!["a.py"]);
+        assert!(opts.no_extensions);
+        assert!(opts.offline);
+        assert_eq!(opts.system_prompt_extra.as_deref(), Some("be terse"));
     }
 }

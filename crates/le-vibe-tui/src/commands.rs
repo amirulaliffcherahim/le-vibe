@@ -177,6 +177,12 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandSpec] = &[
         picker_on_bare: true,
     },
     SlashCommandSpec {
+        name: "/diagram",
+        hint: "",
+        description: "Project latest XML / draw.io diagram (or local .xml/.drawio file) in modal",
+        picker_on_bare: true,
+    },
+    SlashCommandSpec {
         name: "/loop",
         hint: "",
         description: "Schedule recurring prompts (e.g. /loop 2m cargo test · /loop stop)",

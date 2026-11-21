@@ -59,6 +59,7 @@ pub(crate) fn default_model_for(bridge: &mut PythonBridge, provider: &str) -> St
     bridge.default_model(provider).unwrap_or_default()
 }
 
+#[allow(dead_code)]
 pub(crate) fn provider_arg(args: &[String]) -> String {
     arg_value(args, "--provider").unwrap_or_else(|| "vibe".to_string())
 }

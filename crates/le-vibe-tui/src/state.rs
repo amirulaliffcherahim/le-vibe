@@ -1,4 +1,6 @@
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
 use ratatui::backend::CrosstermBackend;
@@ -93,6 +95,7 @@ pub enum ActiveModal {
     HelpModal,
     ChangelogModal,
     DebugModal,
+    InfoModal,
 }
 
 pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -164,6 +167,8 @@ pub struct TuiState {
     pub modal_filter: String,
     pub help_scroll: u16,
     pub changelog_lines: Vec<String>,
+    pub info_modal_title: String,
+    pub info_modal_lines: Vec<String>,
     pub workspace_files: Vec<String>,
     pub debug_lines: Vec<String>,
     pub debug_filter: String,
@@ -250,6 +255,8 @@ impl TuiState {
             modal_filter: String::new(),
             help_scroll: 0,
             changelog_lines: Vec::new(),
+            info_modal_title: String::new(),
+            info_modal_lines: Vec::new(),
             workspace_files: Vec::new(),
             debug_lines: Vec::new(),
             debug_filter: "all".to_string(),
@@ -484,12 +491,22 @@ impl TerminalGuard {
         std::panic::set_hook(Box::new(move |info| {
             let _ = disable_raw_mode();
             let mut out = io::stdout();
-            let _ = execute!(out, DisableBracketedPaste, LeaveAlternateScreen);
+            let _ = execute!(
+                out,
+                DisableBracketedPaste,
+                DisableMouseCapture,
+                LeaveAlternateScreen
+            );
             prev_hook(info);
         }));
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            EnableMouseCapture
+        )?;
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
         Ok(Self { terminal })
@@ -502,6 +519,7 @@ impl Drop for TerminalGuard {
         let _ = execute!(
             self.terminal.backend_mut(),
             DisableBracketedPaste,
+            DisableMouseCapture,
             LeaveAlternateScreen
         );
         let _ = self.terminal.show_cursor();

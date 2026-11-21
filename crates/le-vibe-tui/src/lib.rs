@@ -1,4 +1,5 @@
 pub mod commands;
+pub mod diagram;
 pub mod editor;
 pub mod export;
 pub mod input;
@@ -13,6 +14,7 @@ pub use commands::{
     BUILTIN_SLASH_COMMANDS, SlashCommandItem, SlashCommandSpec, filter_slash_commands,
     filter_slash_commands_with_dynamic,
 };
+pub use diagram::{extract_latest_xml_block, project_xml_diagram};
 pub use editor::wrap_editor_lines;
 pub use export::{export_session_html, export_session_markdown};
 pub use input::poll_tui_action;

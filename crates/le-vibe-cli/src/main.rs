@@ -12,7 +12,8 @@ use le_vibe_telemetry::TelemetryRecorder;
 use le_vibe_tui::{
     ALL_SHELLS, ALL_THEMES, ActiveModal, AgentMode, TerminalGuard, ThemeId, TranscriptBlock,
     TuiAction, TuiState, build_system_prompt, draw_frame, export_session_html,
-    export_session_markdown, format_tokens, poll_tui_action, render_status_bar,
+    export_session_markdown, extract_latest_xml_block, format_tokens, poll_tui_action,
+    project_xml_diagram, render_status_bar,
 };
 use serde_json::Value;
 use std::fs;
@@ -31,11 +32,11 @@ use crate::rpc::{run_rpc_mode, run_streaming_prompt};
 use crate::settings::{
     arg_value, current_git_branch, current_repo_name, cwd_string, default_mcp_paths,
     default_model_for, format_cwd, load_history, load_layered_settings, load_scope,
-    open_session_with_opts, provider_arg, resolve_python_dir, resolve_python_exe, save_history,
-    save_scope, save_setting, save_setting_for_scope, scan_workspace_files, self_repo_path,
-    sessions_dir, summarize_git_status, trust_cwd_in_policy,
+    open_session_with_opts, project_settings_file, resolve_python_dir, resolve_python_exe,
+    save_history, save_scope, save_setting, save_setting_for_scope, scan_workspace_files,
+    self_repo_path, sessions_dir, settings_file, summarize_git_status, trust_cwd_in_policy,
 };
-use crate::worker::{WorkerCmd, WorkerMsg, refresh_state, spawn_tui_worker, update_quota_badges, usage_report};
+use crate::worker::{WorkerCmd, WorkerMsg, spawn_tui_worker, update_quota_badges, usage_report};
 
 fn prompt_line(label: &str) -> String {
     print!("{label}");
@@ -111,6 +112,148 @@ fn main() {
             println!("le-vibe {}", env!("CARGO_PKG_VERSION"));
             return;
         }
+        CliAction::Subcommand(ref sub, ref sub_args) if sub == "config" => {
+            match sub_args.first().map(String::as_str) {
+                Some("path") => {
+                    println!("user:    {}", settings_file().display());
+                    println!("project: {}", project_settings_file().display());
+                }
+                Some("set") if sub_args.len() >= 3 => {
+                    let key = &sub_args[1];
+                    let val = &sub_args[2];
+                    let scope = if sub_args.iter().any(|a| a == "--project") { 1 } else { 0 };
+                    let label = save_setting_for_scope(scope, key, val);
+                    println!("Saved {key} = {val} ({label})");
+                }
+                _ => {
+                    let (vals, origins) = load_layered_settings();
+                    println!("user:    {}", settings_file().display());
+                    println!("project: {}", project_settings_file().display());
+                    if vals.is_empty() {
+                        println!("(no overrides set; using defaults)");
+                    } else {
+                        for (k, v) in vals {
+                            let orig = origins.get(&k).map(String::as_str).unwrap_or("default");
+                            println!("  {k} = {v} [{orig}]");
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        CliAction::Subcommand(ref sub, ref sub_args)
+            if matches!(sub.as_str(), "install" | "remove" | "list" | "update") =>
+        {
+            let home = std::env::var_os("USERPROFILE")
+                .or_else(|| std::env::var_os("HOME"))
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            let ext_dir = home.join(".le-vibe").join("extensions");
+            match sub.as_str() {
+                "list" => {
+                    let mut found = Vec::new();
+                    for dir in [&ext_dir, &std::path::PathBuf::from(".le-vibe").join("extensions")] {
+                        if let Ok(entries) = fs::read_dir(dir) {
+                            for e in entries.flatten() {
+                                let p = e.path();
+                                if p.extension().and_then(|s| s.to_str()) == Some("py") {
+                                    found.push(p.display().to_string());
+                                }
+                            }
+                        }
+                    }
+                    if found.is_empty() {
+                        println!("No extensions installed in {}", ext_dir.display());
+                    } else {
+                        for f in found {
+                            println!("  • {f}");
+                        }
+                    }
+                }
+                "install" => {
+                    let Some(src) = sub_args.first() else {
+                        eprintln!("Usage: le-vibe install <path/to/ext.py | git-url>");
+                        std::process::exit(1);
+                    };
+                    let _ = fs::create_dir_all(&ext_dir);
+                    let src_path = std::path::Path::new(src);
+                    if src_path.is_file() {
+                        let name = src_path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("extension.py");
+                        let dst = ext_dir.join(name);
+                        if let Err(err) = fs::copy(src_path, &dst) {
+                            eprintln!("Install failed: {err}");
+                            std::process::exit(1);
+                        }
+                        println!("Installed extension to {}", dst.display());
+                    } else if src.starts_with("http://")
+                        || src.starts_with("https://")
+                        || src.starts_with("git@")
+                    {
+                        let status = std::process::Command::new("git")
+                            .args(["clone", "--depth", "1", src])
+                            .current_dir(&ext_dir)
+                            .status();
+                        if !status.is_ok_and(|s| s.success()) {
+                            eprintln!("git clone failed for {src}");
+                            std::process::exit(1);
+                        }
+                        println!("Cloned extension repository into {}", ext_dir.display());
+                    } else {
+                        eprintln!("Source not found: {src}");
+                        std::process::exit(1);
+                    }
+                }
+                "remove" => {
+                    let Some(name) = sub_args.first() else {
+                        eprintln!("Usage: le-vibe remove <extension-name>");
+                        std::process::exit(1);
+                    };
+                    let candidates = [
+                        ext_dir.join(name),
+                        ext_dir.join(format!("{name}.py")),
+                    ];
+                    let mut removed = false;
+                    for p in candidates {
+                        if (p.is_file() && fs::remove_file(&p).is_ok())
+                            || (p.is_dir() && fs::remove_dir_all(&p).is_ok())
+                        {
+                            println!("Removed {}", p.display());
+                            removed = true;
+                        }
+                    }
+                    if !removed {
+                        eprintln!("Extension not found: {name}");
+                        std::process::exit(1);
+                    }
+                }
+                "update" => {
+                    let repo = self_repo_path();
+                    println!("Updating le-vibe from {repo}...");
+                    let pull = std::process::Command::new("git")
+                        .args(["pull", "--ff-only"])
+                        .current_dir(&repo)
+                        .status();
+                    if !pull.is_ok_and(|s| s.success()) {
+                        eprintln!("git pull failed (check uncommitted changes in {repo})");
+                        std::process::exit(1);
+                    }
+                    let inst = std::process::Command::new("cargo")
+                        .args(["install", "--path", "crates/le-vibe-cli", "--no-default-features"])
+                        .current_dir(&repo)
+                        .status();
+                    if !inst.is_ok_and(|s| s.success()) {
+                        eprintln!("cargo install failed");
+                        std::process::exit(1);
+                    }
+                    println!("le-vibe updated successfully.");
+                }
+                _ => {}
+            }
+            return;
+        }
         CliAction::Subcommand(ref sub, ref sub_args) if sub == "mcp" => {
             if sub_args.first().map(String::as_str) == Some("list") || sub_args.is_empty() {
                 let mgr = le_vibe_mcp::McpManager::from_config_files(&default_mcp_paths());
@@ -156,6 +299,24 @@ fn main() {
         _ => {}
     }
 
+    // Propagate --no-extensions and -e/--extension to the Python bridge via process env
+    if let CliAction::Run(ref opts) = action {
+        if opts.no_extensions {
+            // SAFETY: single-threaded startup before any worker threads are spawned.
+            unsafe {
+                std::env::set_var("LE_VIBE_NO_EXTENSIONS", "1");
+            }
+        }
+        if !opts.extra_extensions.is_empty() {
+            let sep = if cfg!(windows) { ";" } else { ":" };
+            let joined = opts.extra_extensions.join(sep);
+            // SAFETY: single-threaded startup before any worker threads are spawned.
+            unsafe {
+                std::env::set_var("LE_VIBE_EXTRA_EXTENSIONS", joined);
+            }
+        }
+    }
+
     let python_dir = resolve_python_dir();
     let python_exe = resolve_python_exe(&python_dir);
     let mut bridge = PythonBridge::spawn(&python_exe, &python_dir)
@@ -165,31 +326,9 @@ fn main() {
         CliAction::Subcommand(sub, sub_args) => {
             match sub.as_str() {
                 "login" => handle_login(&mut bridge, &sub_args),
-                "logout" => {
-                    let provider = arg_value(&sub_args, "--provider").unwrap_or_else(|| "vibe".to_string());
-                    match bridge.logout(&provider) {
-                        Ok(true) => println!("Removed saved credentials for {provider}"),
-                        Ok(false) => println!("No saved credentials found for {provider}"),
-                        Err(err) => {
-                            eprintln!("Logout failed: {err}");
-                            std::process::exit(1);
-                        }
-                    }
-                }
                 "auth" => {
                     let status = bridge.auth_status().expect("auth status");
                     println!("{}", serde_json::to_string_pretty(&status).unwrap());
-                }
-                "usage" => {
-                    let mut state = TuiState::new(
-                        provider_arg(&sub_args),
-                        String::new(),
-                        format_cwd(),
-                        current_git_branch(),
-                    );
-                    refresh_state(&mut bridge, &mut state, false);
-                    let live = bridge.fetch_usage(None).unwrap_or(Value::Null);
-                    println!("{}", usage_report(&state, &live));
                 }
                 _ => {}
             }
@@ -244,7 +383,7 @@ fn main() {
                         .and_then(AgentMode::from_name)
                         .unwrap_or(AgentMode::Normal);
                     let allowed_tools = opts.allowed_tools.or_else(|| agent_mode.allowed_tools());
-                    let sys = build_system_prompt(
+                    let mut sys = build_system_prompt(
                         agent_mode,
                         "powershell",
                         &cwd_string(),
@@ -252,6 +391,11 @@ fn main() {
                         &[],
                         "",
                     );
+                    if let Some(extra) = &opts.system_prompt_extra
+                        && !extra.trim().is_empty()
+                    {
+                        sys.push_str(&format!("\n\n<cli_instructions>\n{}\n</cli_instructions>", extra.trim()));
+                    }
                     let cfg = AgentConfig {
                         provider,
                         model,
@@ -267,12 +411,22 @@ fn main() {
                 }
             }
 
-            run_interactive_tui(bridge, session, telemetry, provider, model, opts.yolo);
+            run_interactive_tui(
+                bridge,
+                session,
+                telemetry,
+                provider,
+                model,
+                opts.yolo,
+                opts.offline,
+                opts.system_prompt_extra,
+            );
         }
         CliAction::Help | CliAction::Version | CliAction::ExportOffline { .. } => {}
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_interactive_tui(
     bridge: PythonBridge,
     session: SessionStore,
@@ -280,6 +434,8 @@ fn run_interactive_tui(
     initial_provider: String,
     initial_model: String,
     initial_yolo: bool,
+    offline: bool,
+    system_prompt_extra: Option<String>,
 ) {
     let mut state = TuiState::new(
         initial_provider,
@@ -352,6 +508,7 @@ fn run_interactive_tui(
         telemetry,
         Arc::clone(&cancel),
         Arc::clone(&logger),
+        system_prompt_extra,
     );
     let _ = cmd_tx.send(WorkerCmd::RefreshCatalog {
         live: false,
@@ -359,7 +516,9 @@ fn run_interactive_tui(
         provider: state.provider.clone(),
         model: state.model.clone(),
     });
-    let _ = cmd_tx.send(WorkerCmd::FetchUsage);
+    if !offline {
+        let _ = cmd_tx.send(WorkerCmd::FetchUsage);
+    }
 
     let mut guard = TerminalGuard::enter().expect("failed to initialize TUI terminal");
     let mut last_catalog_check = Instant::now();
@@ -371,6 +530,7 @@ fn run_interactive_tui(
     let mut last_quit_press: Option<Instant> = None;
     let mut last_esc_empty: Option<Instant> = None;
     let mut needs_redraw = true;
+    let mut active_prompt = false;
 
     loop {
         if state.mode != last_recorded_mode {
@@ -378,7 +538,25 @@ fn run_interactive_tui(
             needs_redraw = true;
             let _ = cmd_tx.send(WorkerCmd::RecordModeChange(state.mode.name().to_string()));
         }
-        while let Ok(msg) = msg_rx.try_recv() {
+        loop {
+            let msg = match msg_rx.try_recv() {
+                Ok(m) => m,
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    if state.is_busy || active_prompt {
+                        state.is_busy = false;
+                        active_prompt = false;
+                        state.queued_prompts.clear();
+                        state.status_text = None;
+                        state.blocks.push(TranscriptBlock::System(
+                            "Worker disconnected unexpectedly. Restart le-vibe to continue."
+                                .to_string(),
+                        ));
+                        needs_redraw = true;
+                    }
+                    break;
+                }
+            };
             needs_redraw = true;
             match msg {
                 WorkerMsg::CatalogSynced {
@@ -538,6 +716,7 @@ fn run_interactive_tui(
                     in_context,
                     git_badges,
                 } => {
+                    active_prompt = false;
                     state.git_badges = git_badges;
                     let preview: String = output.lines().take(20).collect::<Vec<_>>().join("\n");
                     state.blocks.push(TranscriptBlock::Script {
@@ -592,8 +771,10 @@ fn run_interactive_tui(
                             "Plan ready — press Shift+Tab to switch mode.".to_string(),
                         ));
                     }
+                    active_prompt = false;
                 }
                 WorkerMsg::TurnError(err) => {
+                    active_prompt = false;
                     if let Some(started) = state.active_started.take() {
                         state.active_ms = state
                             .active_ms
@@ -604,7 +785,16 @@ fn run_interactive_tui(
                         .push(TranscriptBlock::System(format!("Error: {err}")));
                 }
                 WorkerMsg::Notice(text) => {
+                    if text.starts_with("Interrupted") {
+                        active_prompt = false;
+                    }
                     state.blocks.push(TranscriptBlock::System(text));
+                }
+                WorkerMsg::InfoModal { title, lines } => {
+                    state.info_modal_title = title;
+                    state.info_modal_lines = lines;
+                    state.help_scroll = 0;
+                    state.modal = ActiveModal::InfoModal;
                 }
                 WorkerMsg::RewindLoaded(rows) => {
                     state.rewind_rows = rows;
@@ -654,21 +844,46 @@ fn run_interactive_tui(
                     state.todos = items;
                 }
                 WorkerMsg::Idle => {
+                    if active_prompt {
+                        // Ignore Idle emitted by non-prompt background/info commands while a prompt is active.
+                        continue;
+                    }
                     if let Some(next_prompt) = state.queued_prompts.pop_front() {
+                        cancel.store(false, Ordering::SeqCst);
                         state.is_busy = true;
+                        active_prompt = true;
+                        state.scroll_offset = 0;
                         state.active_started = Some(Instant::now());
-                        state.status_text = Some("Thinking...".to_string());
-                        state.blocks.push(TranscriptBlock::User(next_prompt.clone()));
-                        let _ = cmd_tx.send(WorkerCmd::RunPrompt {
-                            provider: state.provider.clone(),
-                            model: state.model.clone(),
-                            thinking_level: state.thinking_level.clone(),
-                            mode: state.mode,
-                            shell: state.shell.clone(),
-                            max_turns: state.max_turns,
-                            retry_max: state.retry_max,
-                            prompt: next_prompt,
-                        });
+                        if let Some(rest) = next_prompt.strip_prefix("!!") {
+                            let cmd = rest.trim().to_string();
+                            state.status_text = Some(format!("Running `{cmd}`..."));
+                            let _ = cmd_tx.send(WorkerCmd::RunShell {
+                                command: cmd,
+                                include_in_context: false,
+                                shell: state.shell.clone(),
+                            });
+                        } else if let Some(rest) = next_prompt.strip_prefix('!') {
+                            let cmd = rest.trim().to_string();
+                            state.status_text = Some(format!("Running `{cmd}`..."));
+                            let _ = cmd_tx.send(WorkerCmd::RunShell {
+                                command: cmd,
+                                include_in_context: true,
+                                shell: state.shell.clone(),
+                            });
+                        } else {
+                            state.status_text = Some("Thinking...".to_string());
+                            state.blocks.push(TranscriptBlock::User(next_prompt.clone()));
+                            let _ = cmd_tx.send(WorkerCmd::RunPrompt {
+                                provider: state.provider.clone(),
+                                model: state.model.clone(),
+                                thinking_level: state.thinking_level.clone(),
+                                mode: state.mode,
+                                shell: state.shell.clone(),
+                                max_turns: state.max_turns,
+                                retry_max: state.retry_max,
+                                prompt: next_prompt,
+                            });
+                        }
                     } else {
                         state.is_busy = false;
                         state.status_text = None;
@@ -691,6 +906,8 @@ fn run_interactive_tui(
             needs_redraw = true;
             state.blocks.push(TranscriptBlock::User(format!("[loop] {due_prompt}")));
             state.is_busy = true;
+            active_prompt = true;
+            cancel.store(false, Ordering::SeqCst);
             state.active_started = Some(Instant::now());
             state.status_text = Some("Running scheduled loop...".to_string());
             let _ = cmd_tx.send(WorkerCmd::RunPrompt {
@@ -705,7 +922,7 @@ fn run_interactive_tui(
             });
         }
 
-        if last_catalog_check.elapsed() >= Duration::from_secs(60) && !state.is_busy {
+        if !offline && last_catalog_check.elapsed() >= Duration::from_secs(60) && !state.is_busy {
             last_catalog_check = Instant::now();
             let _ = cmd_tx.send(WorkerCmd::CheckStaleAndRefresh {
                 provider: state.provider.clone(),
@@ -729,7 +946,12 @@ fn run_interactive_tui(
             }
             let draw_start = Instant::now();
             let before_scroll = state.rendered_scroll.get();
-            if guard.terminal.draw(|f| draw_frame(f, &state)).is_err() {
+            // Synchronized update (DEC mode 2026) prevents mid-frame cursor flicker during animations.
+            let _ = write!(guard.terminal.backend_mut(), "\x1b[?2026h");
+            let draw_failed = guard.terminal.draw(|f| draw_frame(f, &state)).is_err();
+            let _ = write!(guard.terminal.backend_mut(), "\x1b[?2026l");
+            let _ = guard.terminal.backend_mut().flush();
+            if draw_failed {
                 break;
             }
             let draw_ms = draw_start.elapsed().as_millis() as u64;
@@ -777,19 +999,43 @@ fn run_interactive_tui(
                 break;
             }
             TuiAction::Interrupt => {
-                if !state.is_busy && state.input.is_empty() && state.double_esc_rewind {
-                    if last_esc_empty.is_some_and(|t| t.elapsed() <= Duration::from_millis(700)) {
-                        last_esc_empty = None;
-                        let _ = cmd_tx.send(WorkerCmd::ListRewindCheckpoints);
-                    } else {
-                        last_esc_empty = Some(Instant::now());
+                if !state.is_busy {
+                    if state.scroll_offset > 0 {
+                        state.scroll_offset = 0;
+                        continue;
+                    }
+                    if !state.pending_attachments.is_empty() {
+                        state.pending_attachments.clear();
+                        state.status_text = Some("Cleared pending attachment(s).".to_string());
+                        continue;
+                    }
+                    if state.input.is_empty() && state.double_esc_rewind {
+                        if last_esc_empty.is_some_and(|t| t.elapsed() <= Duration::from_millis(700)) {
+                            last_esc_empty = None;
+                            state.status_text = None;
+                            let _ = cmd_tx.send(WorkerCmd::ListRewindCheckpoints);
+                        } else {
+                            last_esc_empty = Some(Instant::now());
+                            state.status_text = Some("Press Esc again to /rewind".to_string());
+                        }
                     }
                     continue;
                 }
                 logger.log("ui", "interrupt", None, "Esc pressed while busy");
                 cancel.store(true, Ordering::SeqCst);
+                state.usage_loading = false;
+                let cleared = state.queued_prompts.len();
                 state.queued_prompts.clear();
-                state.status_text = Some("Interrupting...".to_string());
+                if cleared > 0 {
+                    state.status_text = Some(format!(
+                        "Interrupting (cleared {cleared} queued prompt(s))..."
+                    ));
+                    state.blocks.push(TranscriptBlock::System(format!(
+                        "Cleared {cleared} queued prompt(s) on Esc."
+                    )));
+                } else {
+                    state.status_text = Some("Interrupting...".to_string());
+                }
             }
             TuiAction::ToggleDebug => {
                 if DEBUG_ENABLED {
@@ -1005,9 +1251,16 @@ fn run_interactive_tui(
             TuiAction::Submit(input) => {
                 if state.is_busy && !input.starts_with('/') {
                     state.queued_prompts.push_back(input);
-                    state.status_text = Some(format!(
-                        "Queued ({}) — Esc to interrupt",
-                        state.queued_prompts.len()
+                    continue;
+                }
+                if state.is_busy
+                    && matches!(
+                        input.split_whitespace().next().unwrap_or(""),
+                        "/compact" | "/handover" | "/clear" | "/new" | "/rewind" | "/resume"
+                    )
+                {
+                    state.blocks.push(TranscriptBlock::System(
+                        "Turn in progress — wait for it to finish or press Esc first.".to_string(),
                     ));
                     continue;
                 }
@@ -1260,6 +1513,8 @@ fn run_interactive_tui(
                     );
                     state.blocks.push(TranscriptBlock::User("/suggestion".to_string()));
                     state.is_busy = true;
+                    active_prompt = true;
+                    cancel.store(false, Ordering::SeqCst);
                     state.active_started = Some(Instant::now());
                     state.status_text = Some("Analyzing previous sessions for optimizations...".to_string());
                     let _ = cmd_tx.send(WorkerCmd::RunPrompt {
@@ -1272,6 +1527,40 @@ fn run_interactive_tui(
                         retry_max: state.retry_max,
                         prompt,
                     });
+                    continue;
+                }
+                if input == "/diagram" {
+                    let latest_xml = state.blocks.iter().rev().find_map(|b| match b {
+                        TranscriptBlock::Assistant(txt) => extract_latest_xml_block(txt),
+                        _ => None,
+                    });
+                    if let Some(xml) = latest_xml {
+                        state.info_modal_title = "XML Diagram Projection (/diagram)".to_string();
+                        state.info_modal_lines = project_xml_diagram(&xml);
+                        state.help_scroll = 0;
+                        state.modal = ActiveModal::InfoModal;
+                    } else {
+                        state.blocks.push(TranscriptBlock::System(
+                            "No XML/draw.io diagram found in transcript. Pass a file path: /diagram <file.xml|file.drawio>".to_string(),
+                        ));
+                    }
+                    continue;
+                }
+                if let Some(arg) = input.strip_prefix("/diagram ") {
+                    let path = arg.trim().trim_matches('"');
+                    match fs::read_to_string(path) {
+                        Ok(xml) => {
+                            state.info_modal_title = format!("Diagram: {path}");
+                            state.info_modal_lines = project_xml_diagram(&xml);
+                            state.help_scroll = 0;
+                            state.modal = ActiveModal::InfoModal;
+                        }
+                        Err(err) => {
+                            state.blocks.push(TranscriptBlock::System(format!(
+                                "Failed to read diagram file {path:?}: {err}"
+                            )));
+                        }
+                    }
                     continue;
                 }
                 if input == "/memory" {
@@ -1546,6 +1835,8 @@ fn run_interactive_tui(
                     let cmd = cmd.trim().to_string();
                     if !cmd.is_empty() {
                         state.is_busy = true;
+                        active_prompt = true;
+                        cancel.store(false, Ordering::SeqCst);
                         state.status_text = Some(format!("Running ! {cmd} (no context)..."));
                         let _ = cmd_tx.send(WorkerCmd::RunShell {
                             command: cmd,
@@ -1559,6 +1850,8 @@ fn run_interactive_tui(
                     let cmd = cmd.trim().to_string();
                     if !cmd.is_empty() {
                         state.is_busy = true;
+                        active_prompt = true;
+                        cancel.store(false, Ordering::SeqCst);
                         state.status_text = Some(format!("Running ! {cmd}..."));
                         let _ = cmd_tx.send(WorkerCmd::RunShell {
                             command: cmd,
@@ -1569,7 +1862,7 @@ fn run_interactive_tui(
                     continue;
                 }
 
-                // Dispatch dynamic plugin/extension slash commands if matched
+                // Dispatch dynamic plugin/extension slash commands; reject unknown /commands locally
                 if input.starts_with('/') {
                     let mut parts = input.splitn(2, char::is_whitespace);
                     let cmd_name = parts.next().unwrap_or("");
@@ -1583,8 +1876,12 @@ fn run_interactive_tui(
                             name: cmd_name.to_string(),
                             args: cmd_args,
                         });
-                        continue;
+                    } else {
+                        state.blocks.push(TranscriptBlock::System(format!(
+                            "Unknown command {cmd_name} — type /help for available commands."
+                        )));
                     }
+                    continue;
                 }
 
                 let mut prompt_text = input;
@@ -1617,6 +1914,9 @@ fn run_interactive_tui(
 
                 state.blocks.push(TranscriptBlock::User(input.clone()));
                 state.is_busy = true;
+                active_prompt = true;
+                cancel.store(false, Ordering::SeqCst);
+                state.scroll_offset = 0;
                 state.active_started = Some(Instant::now());
                 state.status_text = Some(format!("Working ({}/{})...", state.provider, state.model));
                 let _ = cmd_tx.send(WorkerCmd::RunPrompt {

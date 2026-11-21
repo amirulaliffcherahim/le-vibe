@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict
 import json
+import os
 from pathlib import Path
 import sys
 from typing import Any
@@ -134,11 +135,43 @@ def _default_extension_dirs() -> list[Path]:
     return [Path.home() / ".le-vibe" / "extensions", Path.cwd() / ".le-vibe" / "extensions"]
 
 
+def _load_configured_extensions(host: ExtensionHost) -> list[str]:
+    if os.environ.get("LE_VIBE_NO_EXTENSIONS") == "1":
+        return []
+    dirs = _default_extension_dirs()
+    loaded = load_extensions_from_dirs(host, dirs)
+    extra_raw = os.environ.get("LE_VIBE_EXTRA_EXTENSIONS", "").strip()
+    if extra_raw:
+        import importlib.util
+
+        for item in extra_raw.split(os.pathsep):
+            p = Path(item.strip())
+            if not p.exists():
+                continue
+            if p.is_dir():
+                loaded.extend(load_extensions_from_dirs(host, [p]))
+            elif p.is_file() and p.suffix == ".py":
+                mod_name = f"le_vibe_ext_extra_{p.stem}_{abs(hash(str(p.resolve())))}"
+                try:
+                    spec = importlib.util.spec_from_file_location(mod_name, p)
+                    if spec and spec.loader:
+                        module = importlib.util.module_from_spec(spec)
+                        sys.modules[mod_name] = module
+                        spec.loader.exec_module(module)
+                        reg = getattr(module, "register", None)
+                        if callable(reg):
+                            reg(host)
+                            loaded.append(str(p))
+                except Exception as exc:
+                    host.load_errors.append(f"{p}: {exc}")
+    return loaded
+
+
 class BridgeRuntime:
     def __init__(self) -> None:
         self.policy = PermissionStore.load_from_files(_default_policy_paths())
         self.extensions = ExtensionHost()
-        self.loaded_extensions = load_extensions_from_dirs(self.extensions, _default_extension_dirs())
+        self.loaded_extensions = _load_configured_extensions(self.extensions)
 
     def reload_policy(self) -> None:
         yolo = self.policy.yolo
@@ -146,7 +179,7 @@ class BridgeRuntime:
 
     def reload_extensions(self) -> list[str]:
         self.extensions.clear()
-        self.loaded_extensions = load_extensions_from_dirs(self.extensions, _default_extension_dirs())
+        self.loaded_extensions = _load_configured_extensions(self.extensions)
         return self.loaded_extensions
 
     async def handle_request(

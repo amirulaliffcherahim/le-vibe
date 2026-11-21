@@ -179,6 +179,7 @@ pub(crate) fn draw_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     if state.modal == ActiveModal::HelpModal
         || state.modal == ActiveModal::ChangelogModal
         || state.modal == ActiveModal::DebugModal
+        || state.modal == ActiveModal::InfoModal
     {
         draw_text_modal(frame, area, state);
         return;
@@ -190,7 +191,8 @@ pub(crate) fn draw_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         | ActiveModal::QuestionModal
         | ActiveModal::HelpModal
         | ActiveModal::ChangelogModal
-        | ActiveModal::DebugModal => return,
+        | ActiveModal::DebugModal
+        | ActiveModal::InfoModal => return,
         ActiveModal::ModelPicker => {
             let base = if state.scope_view {
                 " Scoped Models · Tab: all · Space: pin · Ctrl+S: save · Type to filter · Esc "
@@ -429,15 +431,19 @@ pub(crate) fn draw_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         .collect();
 
     let fitted_title = truncate_ellipsis(&title, inner_w);
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(accent))
-            .title(Span::styled(
-                fitted_title,
-                Style::default().fg(accent).add_modifier(Modifier::BOLD),
-            )),
-    );
+    let pal = state.theme.palette();
+    let list = List::new(items)
+        .style(Style::default().bg(pal.modal_bg))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(pal.accent))
+                .style(Style::default().bg(pal.modal_bg))
+                .title(Span::styled(
+                    fitted_title,
+                    Style::default().fg(pal.complementary).add_modifier(Modifier::BOLD),
+                )),
+        );
     frame.render_widget(list, popup_area);
 }
 
@@ -667,9 +673,38 @@ fn draw_text_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     frame.render_widget(Clear, popup_area);
 
     let pal = state.theme.palette();
-    let (title, lines): (&str, Vec<Line<'_>>) = if state.modal == ActiveModal::DebugModal {
+    let inner_modal_w = width.saturating_sub(3) as usize;
+    let (title, lines): (String, Vec<Line<'_>>) = if state.modal == ActiveModal::InfoModal {
         (
-            " Debugger & Event Log (f filter · c clear · ↑/↓ scroll · F12/Esc close) ",
+            format!(" {} (↑/↓ scroll · Esc/Enter close) ", state.info_modal_title),
+            state
+                .info_modal_lines
+                .iter()
+                .map(|s| {
+                    let is_diagram = s.contains('┌') || s.contains('└') || s.contains('│') || s.contains("─▶");
+                    let display = if is_diagram {
+                        truncate_ellipsis(s, inner_modal_w)
+                    } else {
+                        s.clone()
+                    };
+                    let style = if s.ends_with(':') || s.starts_with("## ") || s.starts_with("Active ") || s.starts_with("Draw.io Diagram") {
+                        Style::default().fg(pal.complementary).add_modifier(Modifier::BOLD)
+                    } else if s.contains("─▶") || s.contains("├─") || s.contains("└─") {
+                        Style::default().fg(pal.secondary)
+                    } else if s.contains('┌') || s.contains('└') || s.contains('│') {
+                        Style::default().fg(pal.accent)
+                    } else if s.trim_start().starts_with("• ") || s.trim_start().starts_with("- ") {
+                        Style::default().fg(pal.fg)
+                    } else {
+                        Style::default().fg(pal.muted)
+                    };
+                    Line::from(Span::styled(format!(" {display}"), style.bg(pal.modal_bg)))
+                })
+                .collect(),
+        )
+    } else if state.modal == ActiveModal::DebugModal {
+        (
+            " Debugger & Event Log (f filter · c clear · ↑/↓ scroll · F12/Esc close) ".to_string(),
             state
                 .debug_lines
                 .iter()
@@ -709,7 +744,7 @@ fn draw_text_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             "  /reload-plugins /trust /reload /skills /mcp /help /changelog /quit",
         ];
         (
-            " Help & Hotkeys (↑/↓ scroll · Esc/Enter close) ",
+            " Help & Hotkeys (↑/↓ scroll · Esc/Enter close) ".to_string(),
             items
                 .iter()
                 .map(|s| Line::from(Span::styled(*s, Style::default().fg(Color::Gray))))
@@ -717,7 +752,7 @@ fn draw_text_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         )
     } else {
         (
-            " le-vibe Changelog (↑/↓ scroll · Esc/Enter close) ",
+            " le-vibe Changelog (↑/↓ scroll · Esc/Enter close) ".to_string(),
             state
                 .changelog_lines
                 .iter()
@@ -729,13 +764,15 @@ fn draw_text_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let paragraph = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((state.help_scroll, 0))
+        .style(Style::default().bg(pal.modal_bg))
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(accent))
+                .style(Style::default().bg(pal.modal_bg))
                 .title(Span::styled(
-                    truncate_ellipsis(title, width.saturating_sub(2) as usize),
-                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                    truncate_ellipsis(&title, width.saturating_sub(2) as usize),
+                    Style::default().fg(pal.complementary).add_modifier(Modifier::BOLD),
                 )),
         );
     frame.render_widget(paragraph, popup_area);

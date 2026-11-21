@@ -97,7 +97,7 @@ pub(crate) fn draw_editor(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         .collect();
     frame.render_widget(Paragraph::new(display_lines), inner);
 
-    if state.modal == ActiveModal::None {
+    if state.modal == ActiveModal::None && (!state.is_busy || !state.input.is_empty()) {
         let cursor_x = (inner.x + 1 + cursor_col as u16).min(inner.x + inner.width.saturating_sub(1));
         let cursor_y = inner.y + (cursor_row.saturating_sub(start_row)) as u16;
         if cursor_y < inner.y + inner.height {

@@ -26,33 +26,30 @@ pub fn draw_frame(frame: &mut Frame<'_>, state: &TuiState) {
     let (editor_wrapped, _, _) = wrap_editor_lines(&state.input, state.cursor, editor_max_w);
     let editor_height = (editor_wrapped.len() as u16).clamp(1, 5) + 2;
 
-    let header_h = if state.quiet_startup { 1 } else { 4 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(header_h),      // Sleepy Owl Header (or compact 1-line in quiet mode)
-            Constraint::Min(5),                // Transcript viewport
+            Constraint::Min(5),                // Full-height scrollable transcript (startup banner scrolls naturally like Pi)
             Constraint::Length(1),             // Dedicated working/status strip above editor
             Constraint::Length(editor_height), // Auto-wrapping Editor box (1-5 lines)
             Constraint::Length(3),             // pi-footer (identity/git, usage/model, mode+quota/runtime)
         ])
         .split(area);
 
-    draw_header(frame, chunks[0], state);
-    draw_transcript(frame, chunks[1], state);
-    draw_status_strip(frame, chunks[2], state);
-    draw_editor(frame, chunks[3], state);
-    draw_footer(frame, chunks[4], state);
+    draw_transcript(frame, chunks[0], state);
+    draw_status_strip(frame, chunks[1], state);
+    draw_editor(frame, chunks[2], state);
+    draw_footer(frame, chunks[3], state);
 
     let matches = filter_slash_commands_with_dynamic(&state.input, &state.plugin_commands);
     if !matches.is_empty() && state.modal == ActiveModal::None {
-        draw_slash_popup(frame, chunks[3], &matches, state.selected_slash_idx, state.theme);
+        draw_slash_popup(frame, chunks[2], &matches, state.selected_slash_idx, state.theme);
     } else if state.modal == ActiveModal::None {
         let file_matches = state.at_file_matches();
         if !file_matches.is_empty() {
             draw_at_file_popup(
                 frame,
-                chunks[3],
+                chunks[2],
                 &file_matches,
                 state.selected_slash_idx,
                 state.theme,
@@ -64,11 +61,11 @@ pub fn draw_frame(frame: &mut Frame<'_>, state: &TuiState) {
     }
 }
 
-fn draw_header(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+fn push_startup_banner(lines: &mut Vec<Line<'static>>, state: &TuiState) {
     let accent = state.theme.accent();
     let secondary = state.theme.secondary();
     if state.quiet_startup {
-        let line = Line::from(vec![
+        lines.push(Line::from(vec![
             Span::styled(" le-vibe ", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
             Span::styled(format!("v{} ", state.version), Style::default().fg(Color::DarkGray)),
             Span::styled("· ", Style::default().fg(Color::DarkGray)),
@@ -78,134 +75,149 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             Span::styled(" model · ", Style::default().fg(Color::DarkGray)),
             Span::styled("/", Style::default().fg(Color::Gray)),
             Span::styled(" commands", Style::default().fg(Color::DarkGray)),
-        ]);
-        frame.render_widget(Paragraph::new(line), area);
+        ]));
         return;
     }
-    let lines = vec![
-        Line::from(vec![
-            Span::styled(
-                "  ,___,  ",
-                Style::default().fg(accent).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "le-vibe ",
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("v{} ", state.version),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled("zZz", Style::default().fg(secondary)),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "  (-v-)  ",
-                Style::default().fg(accent).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("esc", Style::default().fg(Color::Gray)),
-            Span::styled(" interrupt · ", Style::default().fg(Color::DarkGray)),
-            Span::styled("ctrl+c", Style::default().fg(Color::Gray)),
-            Span::styled(" clear/exit · ", Style::default().fg(Color::DarkGray)),
-            Span::styled("ctrl+p", Style::default().fg(Color::Gray)),
-            Span::styled(" cycle model · ", Style::default().fg(Color::DarkGray)),
-            Span::styled("shift+tab", Style::default().fg(Color::Gray)),
-            Span::styled(" mode · ", Style::default().fg(Color::DarkGray)),
-            Span::styled("!", Style::default().fg(Color::Gray)),
-            Span::styled(" bash · ", Style::default().fg(Color::DarkGray)),
-            Span::styled("/", Style::default().fg(Color::Gray)),
-            Span::styled(" commands", Style::default().fg(Color::DarkGray)),
-        ]),
-        Line::from(vec![
-            Span::styled(" /)_(_\\  ", Style::default().fg(accent)),
-            Span::styled(
-                "Rust Pi harness · Unified Python provider engine (Vibe, DeepSeek, Antigravity)",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]),
-    ];
-    let paragraph = Paragraph::new(lines);
-    frame.render_widget(paragraph, area);
+    lines.push(Line::from(vec![
+        Span::styled("  ,___,  ", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+        Span::styled("le-vibe ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("v{} ", state.version), Style::default().fg(Color::DarkGray)),
+        Span::styled("zZz", Style::default().fg(secondary)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  (-v-)  ", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+        Span::styled("esc", Style::default().fg(Color::Gray)),
+        Span::styled(" interrupt · ", Style::default().fg(Color::DarkGray)),
+        Span::styled("ctrl+c", Style::default().fg(Color::Gray)),
+        Span::styled(" clear/exit · ", Style::default().fg(Color::DarkGray)),
+        Span::styled("ctrl+p", Style::default().fg(Color::Gray)),
+        Span::styled(" model · ", Style::default().fg(Color::DarkGray)),
+        Span::styled("shift+tab", Style::default().fg(Color::Gray)),
+        Span::styled(" mode · ", Style::default().fg(Color::DarkGray)),
+        Span::styled("/", Style::default().fg(Color::Gray)),
+        Span::styled(" commands", Style::default().fg(Color::DarkGray)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(" /)_(_\\  ", Style::default().fg(accent)),
+        Span::styled(
+            "Rust Pi harness · Unified Python provider engine (Vibe, DeepSeek, Antigravity)",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
 }
 
-struct CardStyle {
-    bar: Color,
+struct SurfaceStyle {
     title: Color,
     bg: Color,
     body: Style,
+    diff_ok: Color,
+    diff_err: Color,
 }
 
-fn push_shaded_card(
+fn sanitize_display_line(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '\t' => out.push_str("    "),
+            '\0' | '\r' => {}
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Pi-style full-width borderless tinted surface (zero `▎` noise, zero jagged right edges).
+fn push_pi_surface(
     lines: &mut Vec<Line<'static>>,
     area_width: u16,
     title: &str,
     body: &str,
-    style: CardStyle,
+    hidden_count: usize,
+    style: SurfaceStyle,
 ) {
-    let total_w = (area_width as usize).saturating_sub(2).max(20);
-    let inner_w = total_w.saturating_sub(4);
+    let total_w = (area_width as usize).max(20);
+    let inner_w = total_w.saturating_sub(2).max(16);
     let bg_style = Style::default().bg(style.bg);
-    let bar_style = Style::default().fg(style.bar).bg(style.bg);
 
-    // Top breathing room
-    lines.push(Line::from(vec![
-        Span::raw(" "),
-        Span::styled(" ".repeat(total_w), bg_style),
-    ]));
+    // Top 1-line breathing room
+    lines.push(Line::from(Span::styled(" ".repeat(total_w), bg_style)).style(bg_style));
 
-    // Header line inside shaded card
-    let header_pad = inner_w.saturating_sub(title.chars().count());
-    lines.push(Line::from(vec![
-        Span::raw(" "),
-        Span::styled("▎ ", bar_style),
-        Span::styled(
-            title.to_string(),
-            Style::default()
-                .fg(style.title)
-                .bg(style.bg)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" ".repeat(header_pad + 2), bg_style),
-    ]));
+    // Header line (bold white/tinted, full-width padded)
+    let clean_title = sanitize_display_line(title);
+    let title_fit: String = clean_title.chars().take(inner_w).collect();
+    let header_pad = total_w.saturating_sub(1 + title_fit.chars().count());
+    lines.push(
+        Line::from(vec![
+            Span::styled(" ", bg_style),
+            Span::styled(
+                title_fit,
+                Style::default()
+                    .fg(style.title)
+                    .bg(style.bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" ".repeat(header_pad), bg_style),
+        ])
+        .style(bg_style),
+    );
 
-    let raw_lines: Vec<&str> = if body.is_empty() {
-        Vec::new()
-    } else {
-        body.lines().collect()
-    };
-    for raw in raw_lines {
-        let mut remaining = raw;
-        loop {
-            let chunk: String = remaining.chars().take(inner_w).collect();
-            let consumed = chunk.len();
-            let pad = inner_w.saturating_sub(chunk.chars().count());
-            lines.push(Line::from(vec![
-                Span::raw(" "),
-                Span::styled("▎ ", bar_style),
-                Span::styled(chunk, style.body.bg(style.bg)),
-                Span::styled(" ".repeat(pad + 2), bg_style),
-            ]));
-            remaining = &remaining[consumed..];
-            if remaining.is_empty() {
-                break;
+    if hidden_count > 0 {
+        let hint = format!("... ({hidden_count} earlier lines, ctrl+o to expand)");
+        let hint_fit: String = hint.chars().take(inner_w).collect();
+        let pad = total_w.saturating_sub(1 + hint_fit.chars().count());
+        lines.push(
+            Line::from(vec![
+                Span::styled(" ", bg_style),
+                Span::styled(hint_fit, Style::default().fg(Color::DarkGray).bg(style.bg)),
+                Span::styled(" ".repeat(pad), bg_style),
+            ])
+            .style(bg_style),
+        );
+    }
+
+    if !body.is_empty() {
+        lines.push(Line::from(Span::styled(" ".repeat(total_w), bg_style)).style(bg_style));
+        for raw_line in body.lines() {
+            let clean = sanitize_display_line(raw_line);
+            let line_style = if clean.starts_with('+') && !clean.starts_with("+++") {
+                Style::default().fg(style.diff_ok).bg(style.bg)
+            } else if clean.starts_with('-') && !clean.starts_with("---") {
+                Style::default().fg(style.diff_err).bg(style.bg)
+            } else {
+                style.body.bg(style.bg)
+            };
+            if clean.is_empty() {
+                lines.push(Line::from(Span::styled(" ".repeat(total_w), bg_style)).style(bg_style));
+                continue;
+            }
+            let mut remaining = clean.as_str();
+            while !remaining.is_empty() {
+                let chunk: String = remaining.chars().take(inner_w).collect();
+                let consumed = chunk.len();
+                let pad = total_w.saturating_sub(1 + chunk.chars().count());
+                lines.push(
+                    Line::from(vec![
+                        Span::styled(" ", bg_style),
+                        Span::styled(chunk, line_style),
+                        Span::styled(" ".repeat(pad), bg_style),
+                    ])
+                    .style(bg_style),
+                );
+                remaining = &remaining[consumed..];
             }
         }
     }
 
-    // Bottom breathing room
-    lines.push(Line::from(vec![
-        Span::raw(" "),
-        Span::styled(" ".repeat(total_w), bg_style),
-    ]));
+    // Bottom 1-line breathing room
+    lines.push(Line::from(Span::styled(" ".repeat(total_w), bg_style)).style(bg_style));
 }
 
 fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let pal = state.theme.palette();
     let accent = pal.accent;
-    let secondary = pal.secondary;
     let mut lines: Vec<Line<'static>> = Vec::new();
+    push_startup_banner(&mut lines, state);
 
     for block in &state.blocks {
         match block {
@@ -216,12 +228,14 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                     lines.push(Line::from(vec![
                         Span::styled(
                             prefix,
-                            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(pal.complementary)
+                                .add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(
                             l.to_string(),
                             Style::default()
-                                .fg(Color::White)
+                                .fg(pal.fg)
                                 .add_modifier(Modifier::BOLD),
                         ),
                     ]));
@@ -231,41 +245,37 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                 if !text.is_empty() {
                     lines.push(Line::from(""));
                     if state.show_thinking {
-                        push_shaded_card(
+                        push_pi_surface(
                             &mut lines,
                             area.width,
                             "thinking",
                             text,
-                            CardStyle {
-                                bar: secondary,
-                                title: secondary,
+                            0,
+                            SurfaceStyle {
+                                title: Color::DarkGray,
                                 bg: pal.card_thinking_bg,
                                 body: Style::default()
                                     .fg(Color::Gray)
                                     .add_modifier(Modifier::ITALIC),
+                                diff_ok: pal.success,
+                                diff_err: pal.error,
                             },
                         );
                     } else {
                         let line_count = text.lines().count().max(1);
-                        push_shaded_card(
-                            &mut lines,
-                            area.width,
-                            &format!("thinking ({line_count} lines · Ctrl+T to expand)"),
-                            "",
-                            CardStyle {
-                                bar: secondary,
-                                title: secondary,
-                                bg: pal.card_thinking_bg,
-                                body: Style::default().fg(Color::DarkGray),
-                            },
-                        );
+                        lines.push(Line::from(Span::styled(
+                            format!("  thinking ({line_count} lines, ctrl+t to expand)"),
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::ITALIC),
+                        )));
                     }
                 }
             }
             TranscriptBlock::Assistant(text) => {
                 if !text.is_empty() {
                     lines.push(Line::from(""));
-                    lines.extend(render_markdown_lines(text, &pal));
+                    lines.extend(render_markdown_lines(text, &pal, area.width, state.expand_tools));
                 }
             }
             TranscriptBlock::Tool {
@@ -276,23 +286,26 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                 lines.push(Line::from(""));
                 let is_err = status == "failed";
                 let title = format!("{name} · {status}");
-                let max_lines = if state.expand_tools { 40 } else { 3 };
-                let preview_lines: Vec<&str> = output.trim().lines().take(max_lines).collect();
-                let preview = if preview_lines.is_empty() {
-                    String::new()
+                let all_out: Vec<&str> = output.trim().lines().collect();
+                let max_lines = if state.expand_tools { 40 } else { 5 };
+                let hidden = all_out.len().saturating_sub(max_lines);
+                let preview = if hidden > 0 {
+                    all_out[all_out.len() - max_lines..].join("\n")
                 } else {
-                    preview_lines.join("\n")
+                    all_out.join("\n")
                 };
-                push_shaded_card(
+                push_pi_surface(
                     &mut lines,
                     area.width,
                     &title,
                     &preview,
-                    CardStyle {
-                        bar: if is_err { pal.error } else { pal.success },
-                        title: if is_err { pal.error } else { pal.warning },
+                    hidden,
+                    SurfaceStyle {
+                        title: if is_err { pal.error } else { Color::White },
                         bg: if is_err { pal.card_err_bg } else { pal.card_ok_bg },
                         body: Style::default().fg(Color::Gray),
+                        diff_ok: pal.success,
+                        diff_err: pal.error,
                     },
                 );
             }
@@ -307,17 +320,26 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                 } else {
                     format!("$ {command} (no context)")
                 };
-                let body = output.trim();
-                push_shaded_card(
+                let all_out: Vec<&str> = output.trim().lines().collect();
+                let max_lines = if state.expand_tools { 40 } else { 8 };
+                let hidden = all_out.len().saturating_sub(max_lines);
+                let preview = if hidden > 0 {
+                    all_out[all_out.len() - max_lines..].join("\n")
+                } else {
+                    all_out.join("\n")
+                };
+                push_pi_surface(
                     &mut lines,
                     area.width,
                     &tag,
-                    body,
-                    CardStyle {
-                        bar: if *in_context { pal.success } else { Color::DarkGray },
-                        title: if *in_context { pal.success } else { Color::Gray },
-                        bg: if *in_context { pal.card_ok_bg } else { pal.card_quiet_bg },
+                    &preview,
+                    hidden,
+                    SurfaceStyle {
+                        title: Color::White,
+                        bg: pal.card_quiet_bg,
                         body: Style::default().fg(Color::Gray),
+                        diff_ok: pal.success,
+                        diff_err: pal.error,
                     },
                 );
             }
@@ -354,11 +376,17 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         }
     }
 
-    let visible_height = area.height.saturating_sub(1);
-    let total_lines = lines.len() as u16;
+    let wrap_w = (area.width as usize).max(1);
+    let total_visual: usize = lines
+        .iter()
+        .map(|l| l.width().max(1).div_ceil(wrap_w))
+        .sum();
+    let total_lines = total_visual.min(u16::MAX as usize) as u16;
+    let visible_height = area.height.max(1);
     let auto_scroll = total_lines.saturating_sub(visible_height);
-    let target_scroll = auto_scroll.saturating_sub(state.scroll_offset);
-    let cur = state.rendered_scroll.get();
+    let clamped_offset = state.scroll_offset.min(auto_scroll);
+    let target_scroll = auto_scroll.saturating_sub(clamped_offset);
+    let cur = state.rendered_scroll.get().min(auto_scroll);
     let next_scroll = if state.reduced_motion || cur == target_scroll {
         target_scroll
     } else if cur < target_scroll {
@@ -377,14 +405,43 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 }
 
 fn draw_status_strip(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let accent = state.theme.accent();
+    let pal = state.theme.palette();
+    let accent = pal.accent;
     let mut spans: Vec<Span<'static>> = Vec::new();
+    let scroll_pill = if state.scroll_offset > 0 {
+        format!(" ↓ scrolled up ({} · End)", state.scroll_offset)
+    } else {
+        String::new()
+    };
+    let right_reserved = scroll_pill.chars().count();
+    let max_left = (area.width as usize).saturating_sub(right_reserved + 1);
+    let mut used = 0usize;
+
+    let push_clamped = |spans: &mut Vec<Span<'static>>, used: &mut usize, text: String, style: Style| {
+        if *used >= max_left {
+            return;
+        }
+        let avail = max_left.saturating_sub(*used);
+        let len = text.chars().count();
+        if len <= avail {
+            *used += len;
+            spans.push(Span::styled(text, style));
+        } else if avail > 3 {
+            let mut s: String = text.chars().take(avail - 1).collect();
+            s.push('…');
+            *used += avail;
+            spans.push(Span::styled(s, style));
+        }
+    };
+
     if let Some(status) = &state.status_text {
-        spans.push(Span::styled(
+        push_clamped(
+            &mut spans,
+            &mut used,
             format!(" {} ", state.spinner_glyph()),
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::styled(status.clone(), Style::default().fg(Color::Gray)));
+        );
+        push_clamped(&mut spans, &mut used, status.clone(), Style::default().fg(pal.fg));
     } else if !state.todos.is_empty() {
         let total = state.todos.len();
         let done = state.todos.iter().filter(|(_, _, s)| s == "completed").count();
@@ -394,10 +451,21 @@ fn draw_status_strip(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             .find(|(_, _, s)| s == "in_progress")
             .map(|(_, subj, _)| subj.as_str())
             .unwrap_or("pending");
-        spans.push(Span::styled(
+        push_clamped(
+            &mut spans,
+            &mut used,
             format!(" ☑ {done}/{total} · ▸ {active}"),
-            Style::default().fg(Color::Gray),
-        ));
+            Style::default().fg(pal.muted),
+        );
+    }
+    if let Some(first_q) = state.queued_prompts.front() {
+        let one_line: String = first_q.lines().next().unwrap_or("").chars().take(42).collect();
+        push_clamped(
+            &mut spans,
+            &mut used,
+            format!("  ↳ queued ({}): \"{one_line}\"", state.queued_prompts.len()),
+            Style::default().fg(pal.complementary),
+        );
     }
     if !state.pending_attachments.is_empty() {
         let names: Vec<&str> = state
@@ -405,22 +473,23 @@ fn draw_status_strip(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             .iter()
             .map(|(n, _, _)| n.as_str())
             .collect();
-        spans.push(Span::styled(
+        push_clamped(
+            &mut spans,
+            &mut used,
             format!(" [📎 {}]", names.join(", ")),
             Style::default().fg(accent),
-        ));
+        );
     }
     if state.active_loops > 0 {
-        spans.push(Span::styled(
+        push_clamped(
+            &mut spans,
+            &mut used,
             format!(" [↻ {} loop]", state.active_loops),
-            Style::default().fg(Color::DarkGray),
-        ));
+            Style::default().fg(pal.muted),
+        );
     }
-    if state.scroll_offset > 0 {
-        let scroll_pill = format!(" ↓ scrolled up ({} · End)", state.scroll_offset);
-        let left_len: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-        let right_len = scroll_pill.chars().count();
-        let pad = (area.width as usize).saturating_sub(left_len + right_len);
+    if !scroll_pill.is_empty() {
+        let pad = (area.width as usize).saturating_sub(used + right_reserved);
         spans.push(Span::raw(" ".repeat(pad)));
         spans.push(Span::styled(scroll_pill, Style::default().fg(accent)));
     }

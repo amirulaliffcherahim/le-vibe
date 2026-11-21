@@ -4,6 +4,24 @@ Chronological timeline of milestones on `master` (`https://github.com/amirulalif
 
 ---
 
+## 2026-11-21 — v0.3.0-beta.1: Pi-Grade TUI Redesign, Curated Complementary Themes, XML/Draw.io Projection & Queue/Overflow Hardening
+
+- **Pi-Philosophy TUI Redesign (`crates/le-vibe-tui/src/{transcript.rs, markdown.rs, modal.rs}`)**:
+  - Replaced pinned top header with a scrollable startup banner for 100% viewport height; replaced `▎` card bars with clean edge-to-edge borderless tinted surfaces (`push_pi_surface`) with diff green/red tinting and quiet collapsed thinking lines.
+  - Fixed viewport and horizontal overflow: exact wrapped visual line count (`div_ceil(wrap_w)` clamped to `u16::MAX`), strict status-strip width clamping with visible inline queue preview (`↳ queued (N)`), and UTF-16LE NUL/control sanitization in `le-vibe-tools` + TUI cards so Windows `bash.exe`/WSL output never breaks card right edges.
+  - Eliminated cursor flicker during spinner animations via DEC mode 2026 synchronized terminal updates; converted `/policy`, `/skills`, `/plugins`, and `/diagram` to scrollable floating modals.
+- **Upgraded Primary / Secondary / Complementary Theme Engine (`crates/le-vibe-tui/src/theme.rs`)**:
+  - Added 2 new themes (`rose-pine` and `kanagawa`, 8 total) and upgraded all palettes with cohesive primary/secondary/complementary accents, crisp foreground/muted typography, elevated `modal_bg` surfaces, and color-coded diagram projection boxes.
+- **Pure-Rust XML / Draw.io (`mxfile`) & SVG Diagram Projection (`crates/le-vibe-tui/src/diagram.rs`)**:
+  - Automatic inline Unicode diagram projection for fenced `xml`/`drawio`/`svg`/`mxfile` blocks with fan-out tree grouping (`├─▶`, `└─▶`), collapsed raw XML (`Ctrl+O` to expand), and interactive `/diagram [path]` modal.
+- **Scroll, Paste, `Esc` Interrupt & Queue Reliability (`crates/le-vibe-cli/src/{main.rs, worker.rs}`, `crates/le-vibe-tui/src/input.rs`)**:
+  - Mouse wheel scrolls transcript/modals cleanly while `Up`/`Down` cycle prompt history (`Shift+Up/Down` & `PgUp/Dn` scroll); multi-line paste no longer auto-submits; `Esc` interrupts all slow bridge calls and visibly clears queued prompts.
+  - Fixed queue freeze/double-dispatch race via `active_prompt` tracking, `cancel` reset + scroll reset before queued dispatch, queued `!`/`!!` shell support, worker disconnect recovery, and busy guards on mutating slash commands.
+- **CLI Subcommand Matrix (`crates/le-vibe-cli/src/{cli.rs, main.rs, worker.rs}`, `python/le_vibe/bridge.py`)**:
+  - Added `config`, `install`, `remove`, `list`, and `update` subcommands plus `-e`/`--extension`, `--no-extensions`, `--system-prompt`, and `--offline` flags; rejected unknown `/` commands locally.
+
+---
+
 ## 2026-11-21 — v0.2.0-beta.1: Production Rust TUI, Hybrid RAG Memory v2, Layered /config, MCP & Self-Optimization
 
 - **Rust Hybrid RAG Memory v2 (`crates/le-vibe-tools/src/memory.rs`)**: Pure-Rust Lucene-IDF BM25 + 512-dim scaled `i8` cosine vector cache (`rag-cache.bin`) + RRF, partitioned by git root (`~/.le-vibe/projects/<hash>/memory/`) with zero git noise, dual-emit `camelCase`/`snake_case` tokenizer, `keywords` write-time expansion, `key` upsert, `memory_delete`, daily recency decay, adaptive inlining, session-pinned `<memory_toc>`, pre-compaction memory flush, and `/memory`.

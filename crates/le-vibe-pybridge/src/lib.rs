@@ -314,15 +314,22 @@ impl PythonBridge {
         python_exe: &str,
         python_dir: &Path,
     ) -> Result<(Child, ChildStdin, mpsc::Receiver<std::io::Result<String>>), BridgeError> {
-        let mut child = Command::new(python_exe)
-            .arg("-m")
+        let mut cmd = Command::new(python_exe);
+        cmd.arg("-m")
             .arg("le_vibe.bridge")
             .env("PYTHONPATH", python_dir)
             .env("PYTHONUTF8", "1")
             .env("PYTHONIOENCODING", "utf-8")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .spawn()?;
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+        }
+        let mut child = cmd.spawn()?;
         let stdin = child.stdin.take().ok_or(BridgeError::Closed)?;
         let stdout = child.stdout.take().ok_or(BridgeError::Closed)?;
         let (tx, rx) = mpsc::channel();

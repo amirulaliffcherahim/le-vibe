@@ -2254,7 +2254,14 @@ fn run_interactive_tui(
 
 fn copy_to_clipboard(text: &str) -> bool {
     let candidates: &[(&str, &[&str])] = if cfg!(target_os = "windows") {
-        &[("powershell", &["-NoProfile", "-Command", "Set-Clipboard -Value $input"])]
+        &[(
+            "powershell",
+            &[
+                "-NoProfile",
+                "-Command",
+                "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; $t = [Console]::In.ReadToEnd(); Set-Clipboard -Value $t",
+            ],
+        )]
     } else if cfg!(target_os = "macos") {
         &[("pbcopy", &[])]
     } else {

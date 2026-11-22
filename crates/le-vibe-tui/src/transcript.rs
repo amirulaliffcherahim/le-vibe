@@ -124,8 +124,56 @@ struct SurfaceStyle {
     diff_err: Color,
 }
 
-/// Word-wrap any line wider than `max_width` while preserving span styles so
-/// `visual_lines.len()` matches rendered screen rows 1:1 (zero scroll undercount).
+/// Compute hanging indent width for wrapped continuation lines (leading spaces + list/quote marker),
+/// capped at `max_width / 3` so narrow terminals never starve.
+fn hanging_indent_for_line(line: &Line<'_>, max_width: usize) -> usize {
+    let mut plain = String::new();
+    for s in &line.spans {
+        plain.push_str(s.content.as_ref());
+        if plain.len() >= 48 {
+            break;
+        }
+    }
+    let bytes = plain.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() && bytes[i] == b' ' {
+        i += 1;
+    }
+    let rest = &plain[i..];
+    let marker_cols = if rest.starts_with("• ")
+        || rest.starts_with("- ")
+        || rest.starts_with("* ")
+        || rest.starts_with("+ ")
+        || rest.starts_with("│ ")
+        || rest.starts_with("> ")
+    {
+        2
+    } else {
+        // Ordered list prefix like "1. " or "12) "
+        let digits = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if digits > 0
+            && digits <= 4
+            && rest.len() > digits + 1
+            && matches!(rest.as_bytes()[digits], b'.' | b')')
+            && rest.as_bytes()[digits + 1] == b' '
+        {
+            digits + 2
+        } else {
+            0
+        }
+    };
+    let indent = i + marker_cols;
+    indent.min(max_width / 3)
+}
+
+struct WrapToken {
+    is_ws: bool,
+    parts: Vec<(String, Style)>,
+    width: usize,
+}
+
+/// Word-wrap any line wider than `max_width` while preserving span styles, keeping cross-span
+/// words atomic (e.g. `(` + inline code), and applying hanging indentation on continuation lines.
 fn wrap_lines_exact(lines: Vec<Line<'static>>, max_width: usize) -> Vec<Line<'static>> {
     let w = max_width.max(8);
     let mut out = Vec::with_capacity(lines.len());
@@ -135,12 +183,14 @@ fn wrap_lines_exact(lines: Vec<Line<'static>>, max_width: usize) -> Vec<Line<'st
             continue;
         }
         let line_style = line.style;
-        let mut cur_spans: Vec<Span<'static>> = Vec::new();
-        let mut cur_w = 0usize;
+        let hanging = hanging_indent_for_line(&line, w);
+
+        // Flatten into atomic tokens across span boundaries: each token is either pure whitespace
+        // or a contiguous non-whitespace word (possibly spanning multiple styles, e.g. `(` + `code`).
+        let mut tokens: Vec<WrapToken> = Vec::new();
         for span in line.spans {
             let st = span.style;
             let text = span.content.into_owned();
-            // Tokenize keeping whitespace attached so spacing is preserved verbatim.
             let mut idx = 0;
             let bytes = text.as_bytes();
             while idx < text.len() {
@@ -152,30 +202,113 @@ fn wrap_lines_exact(lines: Vec<Line<'static>>, max_width: usize) -> Vec<Line<'st
                         idx += 1;
                     }
                 }
-                let mut token = &text[start..idx];
-                while !token.is_empty() {
-                    let t_chars = token.chars().count();
-                    if cur_w + t_chars <= w {
-                        cur_spans.push(Span::styled(token.to_string(), st));
-                        cur_w += t_chars;
-                        break;
+                let seg = text[start..idx].to_string();
+                let seg_w = Span::raw(&seg).width();
+                if let Some(last) = tokens.last_mut()
+                    && last.is_ws == is_ws
+                {
+                    last.parts.push((seg, st));
+                    last.width += seg_w;
+                } else {
+                    tokens.push(WrapToken {
+                        is_ws,
+                        parts: vec![(seg, st)],
+                        width: seg_w,
+                    });
+                }
+            }
+        }
+
+        let mut cur_spans: Vec<Span<'static>> = Vec::new();
+        let mut cur_w = 0usize;
+        let mut is_continuation = false;
+
+        let start_continuation = |cur_spans: &mut Vec<Span<'static>>,
+                                  cur_w: &mut usize,
+                                  is_continuation: &mut bool,
+                                  out: &mut Vec<Line<'static>>| {
+            out.push(Line::from(std::mem::take(cur_spans)).style(line_style));
+            *cur_w = 0;
+            *is_continuation = true;
+            if hanging > 0 {
+                cur_spans.push(Span::styled(" ".repeat(hanging), line_style));
+                *cur_w = hanging;
+            }
+        };
+
+        for WrapToken {
+            is_ws,
+            parts,
+            width: tok_w,
+        } in tokens
+        {
+            if is_ws {
+                // Drop leading whitespace on wrapped continuation lines
+                if is_continuation && cur_w <= hanging {
+                    continue;
+                }
+                if cur_w + tok_w <= w {
+                    for (seg, st) in parts {
+                        cur_spans.push(Span::styled(seg, st));
                     }
-                    if cur_w > 0 && !is_ws {
-                        // Break onto a new visual line before this word
-                        out.push(Line::from(std::mem::take(&mut cur_spans)).style(line_style));
-                        cur_w = 0;
-                        continue;
+                    cur_w += tok_w;
+                } else if cur_w > 0 {
+                    start_continuation(&mut cur_spans, &mut cur_w, &mut is_continuation, &mut out);
+                }
+                continue;
+            }
+
+            if cur_w + tok_w <= w {
+                for (seg, st) in parts {
+                    cur_spans.push(Span::styled(seg, st));
+                }
+                cur_w += tok_w;
+                continue;
+            }
+
+            // Word doesn't fit on current line: wrap before it if current line already has content
+            let min_prefix = if is_continuation { hanging } else { 0 };
+            if cur_w > min_prefix {
+                start_continuation(&mut cur_spans, &mut cur_w, &mut is_continuation, &mut out);
+                if cur_w + tok_w <= w {
+                    for (seg, st) in parts {
+                        cur_spans.push(Span::styled(seg, st));
                     }
-                    // Single token longer than line width: hard-split cleanly by chars
+                    cur_w += tok_w;
+                    continue;
+                }
+            }
+
+            // Single word wider than available line width: hard-split cleanly by display width
+            for (seg, st) in parts {
+                let mut rest = seg.as_str();
+                while !rest.is_empty() {
                     let avail = w.saturating_sub(cur_w).max(1);
-                    let chunk: String = token.chars().take(avail).collect();
-                    let consumed = chunk.len();
-                    cur_spans.push(Span::styled(chunk, st));
-                    cur_w += avail;
-                    token = &token[consumed..];
-                    if cur_w >= w && !token.is_empty() {
-                        out.push(Line::from(std::mem::take(&mut cur_spans)).style(line_style));
-                        cur_w = 0;
+                    let mut take_bytes = 0usize;
+                    let mut taken_w = 0usize;
+                    for (bi, ch) in rest.char_indices() {
+                        let cw = Span::raw(ch.to_string()).width().max(1);
+                        if taken_w + cw > avail && taken_w > 0 {
+                            break;
+                        }
+                        taken_w += cw;
+                        take_bytes = bi + ch.len_utf8();
+                    }
+                    if take_bytes == 0 {
+                        let ch = rest.chars().next().unwrap();
+                        take_bytes = ch.len_utf8();
+                        taken_w = Span::raw(ch.to_string()).width().max(1);
+                    }
+                    cur_spans.push(Span::styled(rest[..take_bytes].to_string(), st));
+                    cur_w += taken_w;
+                    rest = &rest[take_bytes..];
+                    if cur_w >= w && !rest.is_empty() {
+                        start_continuation(
+                            &mut cur_spans,
+                            &mut cur_w,
+                            &mut is_continuation,
+                            &mut out,
+                        );
                     }
                 }
             }
@@ -449,7 +582,9 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         }
     }
 
-    let visual_lines = wrap_lines_exact(lines, area.width as usize);
+    // Leave 1 column of breathing room + 1 column for the right-edge scrollbar.
+    let wrap_width = (area.width as usize).saturating_sub(2).max(8);
+    let visual_lines = wrap_lines_exact(lines, wrap_width);
     let total_lines = visual_lines.len().min(u16::MAX as usize) as u16;
     let visible_height = area.height.max(1);
     let auto_scroll = total_lines.saturating_sub(visible_height);
@@ -761,5 +896,52 @@ pub(crate) fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 
     let lines = vec![Line::from(line1_spans), Line::from(line2_spans), line3];
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+#[cfg(test)]
+mod wrap_tests {
+    use super::*;
+
+    fn line_text(l: &Line<'_>) -> String {
+        l.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn preserves_hanging_indent_on_wrapped_bullets() {
+        let input = vec![Line::from(vec![
+            Span::raw("   • "),
+            Span::raw("dcpoc (Workplace Hub), Portfolio_Website (:3000), ocr-pipeline"),
+        ])];
+        let wrapped = wrap_lines_exact(input, 36);
+        assert!(wrapped.len() >= 2);
+        assert!(line_text(&wrapped[0]).starts_with("   • dcpoc"));
+        assert!(
+            line_text(&wrapped[1]).starts_with("     "),
+            "continuation should align under bullet text, got {:?}",
+            line_text(&wrapped[1])
+        );
+    }
+
+    #[test]
+    fn keeps_cross_span_open_paren_attached_to_styled_code() {
+        let input = vec![Line::from(vec![
+            Span::raw("   • mail-inbound ("),
+            Span::styled("server.mjs", Style::default().fg(Color::Cyan)),
+            Span::raw(" :8825)"),
+        ])];
+        // Width 20 fits "   • mail-inbound (" (19 chars) but not "(server.mjs", so "(" must wrap with "server.mjs".
+        let wrapped = wrap_lines_exact(input, 20);
+        assert!(wrapped.len() >= 2);
+        assert!(
+            !line_text(&wrapped[0]).trim_end().ends_with('('),
+            "should not strand '(' at end of line: {:?}",
+            line_text(&wrapped[0])
+        );
+        assert!(
+            line_text(&wrapped[1]).contains("(server.mjs"),
+            "continuation should keep '(server.mjs' together: {:?}",
+            line_text(&wrapped[1])
+        );
+    }
 }
 

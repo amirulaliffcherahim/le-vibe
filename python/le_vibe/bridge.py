@@ -387,4 +387,7 @@ async def serve_stdio() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(serve_stdio())
+    try:
+        asyncio.run(serve_stdio())
+    except (KeyboardInterrupt, BrokenPipeError, EOFError):
+        sys.exit(0)

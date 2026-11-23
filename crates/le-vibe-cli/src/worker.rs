@@ -3,8 +3,11 @@ use le_vibe_durable::{EntryKind, SessionStore};
 use le_vibe_mcp::McpManager;
 use le_vibe_pybridge::{ChatMessage, CompletionRequest, PolicyPort, ProviderPort, PythonBridge};
 use le_vibe_telemetry::TelemetryRecorder;
-use le_vibe_tools::TodoStore;
-use le_vibe_tui::{AgentMode, TuiState, build_system_prompt, format_tokens};
+use le_vibe_tools::{TodoStore, execute_todo_tool};
+use le_vibe_tui::{
+    AgentMode, QuestionItem, QuestionOption, QuestionSession, TuiState, build_system_prompt,
+    format_tokens,
+};
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -357,6 +360,11 @@ pub(crate) enum WorkerCmd {
     },
     SetYolo(bool),
     SetCodemode(String),
+    TodoUpdate {
+        id: u64,
+        status: String,
+    },
+    TodoDelete(u64),
     Compact {
         provider: String,
         model: String,
@@ -431,11 +439,7 @@ pub(crate) enum WorkerMsg {
         detail: String,
         reason: String,
     },
-    QuestionNeeded {
-        header: String,
-        question: String,
-        options: Vec<(String, String)>,
-    },
+    QuestionNeeded(QuestionSession),
     ShellResult {
         command: String,
         output: String,
@@ -740,6 +744,30 @@ pub(crate) fn spawn_tui_worker(
                 }
                 WorkerCmd::SetCodemode(mode_val) => {
                     codemode_setting = mode_val;
+                }
+                WorkerCmd::TodoUpdate { id, status } => {
+                    let _ = execute_todo_tool(
+                        &mut todos,
+                        &serde_json::json!({ "action": "update", "id": id, "status": status }),
+                    );
+                    let snap = todos
+                        .items()
+                        .iter()
+                        .map(|t| (t.id, t.subject.clone(), t.status.clone()))
+                        .collect();
+                    let _ = msg_tx.send(WorkerMsg::TodosUpdated(snap));
+                }
+                WorkerCmd::TodoDelete(id) => {
+                    let _ = execute_todo_tool(
+                        &mut todos,
+                        &serde_json::json!({ "action": "delete", "id": id }),
+                    );
+                    let snap = todos
+                        .items()
+                        .iter()
+                        .map(|t| (t.id, t.subject.clone(), t.status.clone()))
+                        .collect();
+                    let _ = msg_tx.send(WorkerMsg::TodosUpdated(snap));
                 }
                 WorkerCmd::RefreshCatalog {
                     live,
@@ -1695,40 +1723,79 @@ pub(crate) fn spawn_tui_worker(
                             approval_rx.recv().unwrap_or(ApprovalChoice::Deny)
                         },
                         |args| {
-                            let q_arr = args.get("questions").and_then(Value::as_array);
-                            let first = q_arr.and_then(|a| a.first());
-                            let header = first
-                                .and_then(|q| q.get("header"))
-                                .and_then(Value::as_str)
-                                .unwrap_or("Question")
-                                .to_string();
-                            let question = first
-                                .and_then(|q| q.get("question"))
-                                .and_then(Value::as_str)
-                                .unwrap_or("Please choose an option:")
-                                .to_string();
-                            let options = first
-                                .and_then(|q| q.get("options"))
+                            let items: Vec<QuestionItem> = args
+                                .get("questions")
                                 .and_then(Value::as_array)
-                                .map(|opts| {
-                                    opts.iter()
-                                        .filter_map(|o| {
-                                            let l = o.get("label")?.as_str()?.to_string();
-                                            let d = o
-                                                .get("description")
+                                .map(|arr| {
+                                    arr.iter()
+                                        .map(|q| {
+                                            let header = q
+                                                .get("header")
                                                 .and_then(Value::as_str)
-                                                .unwrap_or("")
+                                                .unwrap_or("Question")
                                                 .to_string();
-                                            Some((l, d))
+                                            let question = q
+                                                .get("question")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("Please choose an option:")
+                                                .to_string();
+                                            let multi_select = q
+                                                .get("multiSelect")
+                                                .and_then(Value::as_bool)
+                                                .unwrap_or(false);
+                                            let options: Vec<QuestionOption> = q
+                                                .get("options")
+                                                .and_then(Value::as_array)
+                                                .map(|opts| {
+                                                    opts.iter()
+                                                        .filter_map(|o| {
+                                                            let label =
+                                                                o.get("label")?.as_str()?.to_string();
+                                                            let description = o
+                                                                .get("description")
+                                                                .and_then(Value::as_str)
+                                                                .unwrap_or("")
+                                                                .to_string();
+                                                            let preview = o
+                                                                .get("preview")
+                                                                .and_then(Value::as_str)
+                                                                .map(ToString::to_string);
+                                                            Some(QuestionOption {
+                                                                label,
+                                                                description,
+                                                                preview,
+                                                            })
+                                                        })
+                                                        .collect()
+                                                })
+                                                .unwrap_or_default();
+                                            let len = options.len();
+                                            QuestionItem {
+                                                header,
+                                                question,
+                                                multi_select,
+                                                options,
+                                                selected: vec![false; len],
+                                                custom_text: String::new(),
+                                                answer: None,
+                                            }
                                         })
                                         .collect()
                                 })
                                 .unwrap_or_default();
-                            let _ = msg_tx.send(WorkerMsg::QuestionNeeded {
-                                header,
-                                question,
-                                options,
-                            });
+                            let session = if items.is_empty() {
+                                QuestionSession::single(
+                                    "Question".to_string(),
+                                    "Please respond:".to_string(),
+                                    Vec::new(),
+                                )
+                            } else {
+                                QuestionSession {
+                                    items,
+                                    active_idx: 0,
+                                }
+                            };
+                            let _ = msg_tx.send(WorkerMsg::QuestionNeeded(session));
                             question_rx
                                 .recv()
                                 .unwrap_or_else(|_| "User cancelled.".to_string())

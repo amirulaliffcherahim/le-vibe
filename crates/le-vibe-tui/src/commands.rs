@@ -75,6 +75,12 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandSpec] = &[
         picker_on_bare: true,
     },
     SlashCommandSpec {
+        name: "/todos",
+        hint: "",
+        description: "Focus or toggle the interactive right-side todo pane (Ctrl+B)",
+        picker_on_bare: true,
+    },
+    SlashCommandSpec {
         name: "/usage",
         hint: "",
         description: "Live plan quota, budget & balance for vibe, deepseek, agy",

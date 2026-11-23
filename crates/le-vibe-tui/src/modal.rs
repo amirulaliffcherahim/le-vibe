@@ -1,5 +1,5 @@
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Padding, Paragraph, Wrap};
@@ -535,18 +535,30 @@ fn draw_approval_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 
 fn draw_question_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let pal = state.theme.palette();
-    let Some((header, question, options)) = &state.question_prompt else {
+    let Some(session) = &state.question_prompt else {
         return;
     };
-    let width = ((area.width as u32 * 78) / 100) as u16;
-    let width = width.clamp(50.min(area.width.saturating_sub(2)), area.width.saturating_sub(2).min(108));
-    let inner_w = width.saturating_sub(2).max(1) as usize;
-    let q_lines = (question.chars().count() + 2).div_ceil(inner_w).max(1);
-    let opt_lines: usize = options
+    let Some(item) = session.active() else {
+        return;
+    };
+    let has_preview = item.options.iter().any(|o| o.preview.is_some());
+    let pct = if has_preview { 88 } else { 78 };
+    let width = ((area.width as u32 * pct) / 100) as u16;
+    let width = width.clamp(
+        52.min(area.width.saturating_sub(2)),
+        area.width.saturating_sub(2).min(124),
+    );
+    let inner_w = width.saturating_sub(4).max(1) as usize;
+    let q_lines = (item.question.chars().count() + 2).div_ceil(inner_w).max(1);
+    let opt_lines: usize = item
+        .options
         .iter()
-        .map(|(l, d)| (4 + l.chars().count() + d.chars().count()).div_ceil(inner_w).max(1))
+        .map(|o| 1 + usize::from(!o.description.is_empty()))
         .sum();
-    let height = ((q_lines + opt_lines + 6) as u16).min(area.height.saturating_sub(4));
+    let tab_rows = usize::from(session.items.len() > 1) * 2;
+    let height = ((q_lines + opt_lines + tab_rows + 8) as u16)
+        .max(if has_preview { 16 } else { 10 })
+        .min(area.height.saturating_sub(4));
     let popup = Rect {
         x: (area.width.saturating_sub(width)) / 2,
         y: (area.height.saturating_sub(height)) / 2,
@@ -555,52 +567,155 @@ fn draw_question_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     };
     frame.render_widget(Clear, popup);
 
-    let mut lines = vec![
-        Line::from(Span::styled(
-            format!(" {question}"),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-    ];
-    for (idx, (label, desc)) in options.iter().enumerate() {
+    let title = if session.items.len() > 1 {
+        format!(
+            " {} ({}/{}) · Tab/←/→ switch · ↑/↓ · {}Enter · Esc ",
+            item.header,
+            session.active_idx + 1,
+            session.items.len(),
+            if item.multi_select { "Space toggle · " } else { "" }
+        )
+    } else {
+        format!(
+            " {} · ↑/↓ · {}Enter · Esc ",
+            item.header,
+            if item.multi_select { "Space toggle · " } else { "" }
+        )
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .padding(Padding::horizontal(1))
+        .border_style(Style::default().fg(pal.accent))
+        .style(Style::default().bg(pal.modal_bg))
+        .title(Span::styled(
+            truncate_ellipsis(&title, width.saturating_sub(2) as usize),
+            Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
+        ));
+    let inner_area = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let mut left_lines: Vec<Line<'_>> = Vec::new();
+    if session.items.len() > 1 {
+        let mut tabs: Vec<Span<'_>> = Vec::new();
+        for (i, q) in session.items.iter().enumerate() {
+            let active = i == session.active_idx;
+            let done = q.answer.is_some();
+            let mark = if done { "✓ " } else { "" };
+            let st = if active {
+                Style::default()
+                    .fg(pal.accent)
+                    .bg(pal.card_quiet_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else if done {
+                Style::default().fg(pal.success)
+            } else {
+                Style::default().fg(pal.muted)
+            };
+            tabs.push(Span::styled(format!(" [{mark}{}] ", q.header), st));
+            tabs.push(Span::raw(" "));
+        }
+        left_lines.push(Line::from(tabs));
+        left_lines.push(Line::from(""));
+    }
+
+    left_lines.push(Line::from(Span::styled(
+        item.question.clone(),
+        Style::default().fg(pal.fg).add_modifier(Modifier::BOLD),
+    )));
+    left_lines.push(Line::from(""));
+
+    for (idx, opt) in item.options.iter().enumerate() {
         let sel = idx == state.modal_idx;
-        let ptr = if sel { " ▸ " } else { "   " };
+        let ptr = if sel { "▸ " } else { "  " };
+        let check = if item.multi_select {
+            if item.selected.get(idx).copied().unwrap_or(false) {
+                "[x] "
+            } else {
+                "[ ] "
+            }
+        } else {
+            ""
+        };
         let l_style = if sel {
             Style::default().fg(pal.accent).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(pal.fg)
         };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{ptr}{label} "), l_style),
-            Span::styled(desc.clone(), Style::default().fg(Color::DarkGray)),
-        ]));
+        left_lines.push(Line::from(Span::styled(
+            format!("{ptr}{check}{}. {}", idx + 1, opt.label),
+            l_style,
+        )));
+        if !opt.description.is_empty() {
+            left_lines.push(Line::from(Span::styled(
+                format!("     {}", opt.description),
+                Style::default().fg(pal.muted),
+            )));
+        }
     }
-    let custom_idx = options.len();
+
+    let custom_idx = item.options.len();
     let custom_sel = state.modal_idx == custom_idx;
-    let custom_ptr = if custom_sel { " ▸ " } else { "   " };
-    lines.push(Line::from(vec![
+    let custom_ptr = if custom_sel { "▸ " } else { "  " };
+    let custom_label = if item.custom_text.is_empty() {
+        "Type something.".to_string()
+    } else {
+        item.custom_text.clone()
+    };
+    left_lines.push(Line::from(vec![
         Span::styled(
-            format!("{custom_ptr}Type answer: "),
-            Style::default().fg(if custom_sel { pal.accent } else { Color::DarkGray }),
+            format!("{custom_ptr}{}. ", custom_idx + 1),
+            Style::default().fg(if custom_sel { pal.accent } else { pal.muted }),
         ),
-        Span::styled(state.question_custom.clone(), Style::default().fg(Color::White)),
+        Span::styled(
+            custom_label,
+            Style::default().fg(if item.custom_text.is_empty() && !custom_sel {
+                pal.muted
+            } else {
+                pal.fg
+            }),
+        ),
     ]));
 
-    let paragraph = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .style(Style::default().bg(pal.modal_bg))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .padding(Padding::horizontal(1))
-                .border_style(Style::default().fg(pal.accent))
-                .style(Style::default().bg(pal.modal_bg))
-                .title(Span::styled(
-                    format!(" {header} (↑/↓ Enter · Esc cancel) "),
-                    Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
-                )),
+    if has_preview && inner_area.width >= 72 {
+        let panes = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
+            .split(inner_area);
+        frame.render_widget(
+            Paragraph::new(left_lines)
+                .wrap(Wrap { trim: false })
+                .style(Style::default().bg(pal.modal_bg)),
+            panes[0],
         );
-    frame.render_widget(paragraph, popup);
+        let preview_text = item
+            .options
+            .get(state.modal_idx)
+            .and_then(|o| o.preview.as_deref())
+            .unwrap_or("(select an option to preview)");
+        let preview_lines: Vec<Line<'_>> = preview_text
+            .lines()
+            .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(pal.fg))))
+            .collect();
+        let preview_box = Paragraph::new(preview_lines)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().bg(pal.card_quiet_bg))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .padding(Padding::horizontal(1))
+                    .border_style(Style::default().fg(pal.muted))
+                    .style(Style::default().bg(pal.card_quiet_bg))
+                    .title(Span::styled(" Preview ", Style::default().fg(pal.secondary))),
+            );
+        frame.render_widget(preview_box, panes[1]);
+    } else {
+        frame.render_widget(
+            Paragraph::new(left_lines)
+                .wrap(Wrap { trim: false })
+                .style(Style::default().bg(pal.modal_bg)),
+            inner_area,
+        );
+    }
 }
 
 fn draw_usage_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {

@@ -834,6 +834,8 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                 hooks.run_pre_tool(&tc.name, &args_json_str).err()
             };
             let mut codemode_used_read = false;
+            let mut codemode_used_exec = false;
+            let mut codemode_used_retrieve = false;
             let (mut output, is_error) = if let Some(reason) = blocked_reason {
                 (reason, true)
             } else if tc.name == "codemode" {
@@ -854,8 +856,12 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                         text: "Running codemode script...".to_string(),
                     });
                     match run_codemode_script(script, timeout_ms, |sub_tool, sub_args| {
-                        if sub_tool == "read" {
-                            codemode_used_read = true;
+                        match sub_tool {
+                            "read" => codemode_used_read = true,
+                            "retrieve_output" => codemode_used_retrieve = true,
+                            "bash" | "powershell" => codemode_used_exec = true,
+                            s if s.starts_with("mcp__") => codemode_used_exec = true,
+                            _ => {}
                         }
                         let sub_args_str = sub_args.to_string();
                         hooks
@@ -1160,7 +1166,9 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                 output.push_str("[PostToolUse hook]\n");
                 output.push_str(&post_note);
             }
-            let route_tool = if codemode_used_read {
+            let route_tool = if codemode_used_retrieve && !codemode_used_exec && !codemode_used_read {
+                "retrieve_output"
+            } else if codemode_used_read && !codemode_used_exec {
                 "read"
             } else {
                 tc.name.as_str()

@@ -54,6 +54,15 @@ fn normalize_model_spec(raw: &str) -> String {
     trimmed.split(':').next().unwrap_or(trimmed).to_string()
 }
 
+/// Extract `[sub_tool=<name>]` when a codemode script surfaces a sub-tool error.
+fn extract_sub_tool(content: &str) -> Option<&str> {
+    let start = content.find("[sub_tool=")?;
+    let rest = &content[start + 10..];
+    let end = rest.find(']')?;
+    let name = rest[..end].trim();
+    (!name.is_empty()).then_some(name)
+}
+
 /// Classify a tool error string into a stable friction bucket. Returns `None` for normal
 /// compiler/test iteration noise so `/learn` focuses on repeatable harness/model mistakes.
 fn classify_tool_friction(tool: &str, content: &str) -> Option<&'static str> {
@@ -64,7 +73,7 @@ fn classify_tool_friction(tool: &str, content: &str) -> Option<&'static str> {
     if lower.contains("old_text") || lower.contains("oldtext") || lower.contains("not found in") {
         return Some("edit_oldtext_mismatch");
     }
-    if lower.starts_with("policy denied:") {
+    if lower.contains("policy denied:") {
         return Some("policy_denied");
     }
     if lower.contains("unknown tool") {
@@ -194,11 +203,16 @@ pub(crate) fn mine_sessions(
                 if is_err {
                     report.total_tool_errors += 1;
                     mstats.tool_errors += 1;
-                    if let Some(bucket) = classify_tool_friction(tool, content) {
+                    let effective_tool = if tool == "codemode" {
+                        extract_sub_tool(content).unwrap_or(tool)
+                    } else {
+                        tool
+                    };
+                    if let Some(bucket) = classify_tool_friction(effective_tool, content) {
                         mstats.harness_misuse += 1;
                         *report
                             .tool_friction
-                            .entry((tool.to_string(), bucket.to_string()))
+                            .entry((effective_tool.to_string(), bucket.to_string()))
                             .or_insert(0) += 1;
                     }
                 }
@@ -525,6 +539,19 @@ mod tests {
         assert!(digest.contains("<learn_report>"));
         assert!(digest.contains("<rag_memory>"));
         assert!(digest.contains("key=\"model:<provider>/<model>\""));
+
+        // Verify codemode sub-tool attribution extracts `[sub_tool=edit]` properly.
+        assert_eq!(
+            extract_sub_tool("RuntimeError: [sub_tool=edit] Read 'a.rs' first before editing"),
+            Some("edit")
+        );
+        assert_eq!(
+            classify_tool_friction(
+                "edit",
+                "RuntimeError: [sub_tool=edit] Read 'a.rs' first before editing"
+            ),
+            Some("edit_without_read")
+        );
 
         println!(
             "\n=== PR C Interconnected /suggestion & Model-Profile Benchmark ===\n  model_profile lookup : {} us\n  KV-cache prefix match: 100% byte-identical ({} B static prefix preserved)\n  model_profile size   : {} B (capped <=400 B body)\n  /suggestion digest   : {:.2} ms ({} chars, includes <learn_report> + <rag_memory>)",

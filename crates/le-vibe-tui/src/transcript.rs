@@ -1,3 +1,6 @@
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -30,6 +33,7 @@ pub fn draw_frame(frame: &mut Frame<'_>, state: &TuiState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(5),                // Full-height scrollable transcript (startup banner scrolls naturally like Pi)
+            Constraint::Length(1),             // Breathing room above working/status strip (Pi Loader style)
             Constraint::Length(1),             // Dedicated working/status strip above editor
             Constraint::Length(editor_height), // Auto-wrapping Editor box (1-5 lines)
             Constraint::Length(3),             // pi-footer (identity/git, usage/model, mode+quota/runtime)
@@ -37,19 +41,19 @@ pub fn draw_frame(frame: &mut Frame<'_>, state: &TuiState) {
         .split(area);
 
     draw_transcript(frame, chunks[0], state);
-    draw_status_strip(frame, chunks[1], state);
-    draw_editor(frame, chunks[2], state);
-    draw_footer(frame, chunks[3], state);
+    draw_status_strip(frame, chunks[2], state);
+    draw_editor(frame, chunks[3], state);
+    draw_footer(frame, chunks[4], state);
 
     let matches = filter_slash_commands_with_dynamic(&state.input, &state.plugin_commands);
     if !matches.is_empty() && state.modal == ActiveModal::None {
-        draw_slash_popup(frame, chunks[2], &matches, state.selected_slash_idx, state.theme);
+        draw_slash_popup(frame, chunks[3], &matches, state.selected_slash_idx, state.theme);
     } else if state.modal == ActiveModal::None {
         let file_matches = state.at_file_matches();
         if !file_matches.is_empty() {
             draw_at_file_popup(
                 frame,
-                chunks[2],
+                chunks[3],
                 &file_matches,
                 state.selected_slash_idx,
                 state.theme,
@@ -342,7 +346,9 @@ fn push_pi_surface(
     hidden_count: usize,
     style: SurfaceStyle,
 ) {
-    let total_w = (area_width as usize).max(20);
+    // Pad to the wrap width (callers reserve 2 columns for the scrollbar) so a surface line never
+    // re-wraps into a phantom trailing line.
+    let total_w = (area_width as usize).saturating_sub(2).max(20);
     let inner_w = total_w.saturating_sub(2).max(16);
     let bg_style = Style::default().bg(style.bg);
 
@@ -419,172 +425,283 @@ fn push_pi_surface(
     lines.push(Line::from(Span::styled(" ".repeat(total_w), bg_style)).style(bg_style));
 }
 
-fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+/// Pi-style user turn: full-width tinted surface, one column of inner padding, no prefix glyph.
+fn push_user_surface(
+    lines: &mut Vec<Line<'static>>,
+    area_width: u16,
+    text: &str,
+    bg: Color,
+    fg: Color,
+) {
+    let total_w = (area_width as usize).saturating_sub(2).max(20);
+    let inner_w = total_w.saturating_sub(2).max(8);
+    let bg_style = Style::default().bg(bg);
+    let body_style = Style::default().fg(fg).bg(bg);
+
+    lines.push(Line::from(Span::styled(" ".repeat(total_w), bg_style)).style(bg_style));
+    for raw in text.lines() {
+        let clean = sanitize_display_line(raw);
+        if clean.is_empty() {
+            lines.push(Line::from(Span::styled(" ".repeat(total_w), bg_style)).style(bg_style));
+            continue;
+        }
+        let mut remaining = clean.as_str();
+        while !remaining.is_empty() {
+            let (chunk, rest) = split_at_chars(remaining, inner_w);
+            let pad = total_w.saturating_sub(1 + chunk.chars().count());
+            lines.push(
+                Line::from(vec![
+                    Span::styled(" ", bg_style),
+                    Span::styled(chunk.to_string(), body_style),
+                    Span::styled(" ".repeat(pad), bg_style),
+                ])
+                .style(bg_style),
+            );
+            remaining = rest;
+        }
+    }
+    lines.push(Line::from(Span::styled(" ".repeat(total_w), bg_style)).style(bg_style));
+}
+
+/// Split `text` after at most `max_chars` characters, always on a char boundary.
+fn split_at_chars(text: &str, max_chars: usize) -> (&str, &str) {
+    match text.char_indices().nth(max_chars) {
+        Some((idx, _)) => text.split_at(idx),
+        None => (text, ""),
+    }
+}
+
+fn hash_block(block: &TranscriptBlock) -> u64 {    let mut h = DefaultHasher::new();
+    match block {
+        TranscriptBlock::User(t) => {
+            0u8.hash(&mut h);
+            t.hash(&mut h);
+        }
+        TranscriptBlock::Thinking(t) => {
+            1u8.hash(&mut h);
+            t.hash(&mut h);
+        }
+        TranscriptBlock::Assistant(t) => {
+            2u8.hash(&mut h);
+            t.hash(&mut h);
+        }
+        TranscriptBlock::Tool { name, status, output } => {
+            3u8.hash(&mut h);
+            name.hash(&mut h);
+            status.hash(&mut h);
+            output.hash(&mut h);
+        }
+        TranscriptBlock::Script { command, output, in_context } => {
+            4u8.hash(&mut h);
+            command.hash(&mut h);
+            output.hash(&mut h);
+            in_context.hash(&mut h);
+        }
+        TranscriptBlock::System(t) => {
+            5u8.hash(&mut h);
+            t.hash(&mut h);
+        }
+        TranscriptBlock::Report(t) => {
+            6u8.hash(&mut h);
+            t.hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+fn render_block_wrapped(
+    block: &TranscriptBlock,
+    area_width: u16,
+    wrap_width: usize,
+    state: &TuiState,
+) -> Vec<Line<'static>> {
     let pal = state.theme.palette();
     let accent = pal.accent;
     let mut lines: Vec<Line<'static>> = Vec::new();
-    push_startup_banner(&mut lines, state);
-
-    for block in &state.blocks {
-        match block {
-            TranscriptBlock::User(text) => {
+    match block {
+        TranscriptBlock::User(text) => {
+            lines.push(Line::from(""));
+            push_user_surface(
+                &mut lines,
+                area_width,
+                text,
+                state.theme.user_surface(),
+                pal.fg,
+            );
+        }
+        TranscriptBlock::Thinking(text) => {
+            if !text.is_empty() {
                 lines.push(Line::from(""));
-                for (idx, l) in text.lines().enumerate() {
-                    let prefix = if idx == 0 { " › " } else { "   " };
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            prefix,
-                            Style::default()
-                                .fg(pal.complementary)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(
-                            l.to_string(),
-                            Style::default()
-                                .fg(pal.fg)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                    ]));
-                }
-            }
-            TranscriptBlock::Thinking(text) => {
-                if !text.is_empty() {
-                    lines.push(Line::from(""));
-                    if state.show_thinking {
-                        push_pi_surface(
-                            &mut lines,
-                            area.width,
-                            "thinking",
-                            text,
-                            0,
-                            SurfaceStyle {
-                                title: Color::DarkGray,
-                                bg: pal.card_thinking_bg,
-                                body: Style::default()
-                                    .fg(Color::Gray)
+                let line_count = text.lines().count().max(1);
+                if state.show_thinking {
+                    for l in text.lines() {
+                        lines.push(Line::from(vec![
+                            Span::styled(" ", Style::default()),
+                            Span::styled(
+                                l.to_string(),
+                                Style::default()
+                                    .fg(pal.muted)
                                     .add_modifier(Modifier::ITALIC),
-                                diff_ok: pal.success,
-                                diff_err: pal.error,
-                            },
-                        );
-                    } else {
-                        let line_count = text.lines().count().max(1);
-                        lines.push(Line::from(Span::styled(
-                            format!("  thinking ({line_count} lines, ctrl+t to expand)"),
-                            Style::default()
-                                .fg(Color::DarkGray)
-                                .add_modifier(Modifier::ITALIC),
-                        )));
+                            ),
+                        ]));
                     }
+                } else {
+                    let unit = if line_count == 1 { "line" } else { "lines" };
+                    lines.push(Line::from(Span::styled(
+                        format!(" Thinking... ({line_count} {unit}, ctrl+t to expand)"),
+                        Style::default()
+                            .fg(pal.muted)
+                            .add_modifier(Modifier::ITALIC),
+                    )));
                 }
             }
-            TranscriptBlock::Assistant(text) => {
-                if !text.is_empty() {
+        }
+        TranscriptBlock::Assistant(text) => {
+            if !text.is_empty() {
+                lines.push(Line::from(""));
+                lines.extend(render_markdown_lines(text, &pal, area_width, state.expand_tools));
+            }
+        }
+        TranscriptBlock::Tool {
+            name,
+            status,
+            output,
+        } => {
+            lines.push(Line::from(""));
+            let is_err = status == "failed";
+            let title = format!("{name} · {status}");
+            let all_out: Vec<&str> = output.trim().lines().collect();
+            let max_lines = if state.expand_tools { 40 } else { 5 };
+            let hidden = all_out.len().saturating_sub(max_lines);
+            let preview = if hidden > 0 {
+                all_out[all_out.len() - max_lines..].join("\n")
+            } else {
+                all_out.join("\n")
+            };
+            push_pi_surface(
+                &mut lines,
+                area_width,
+                &title,
+                &preview,
+                hidden,
+                SurfaceStyle {
+                    title: if is_err { pal.error } else { pal.fg },
+                    bg: if is_err {
+                        pal.card_err_bg
+                    } else if status == "running" || status == "pending" {
+                        pal.card_quiet_bg
+                    } else {
+                        pal.card_ok_bg
+                    },
+                    body: Style::default().fg(pal.muted),
+                    diff_ok: pal.success,
+                    diff_err: pal.error,
+                },
+            );
+        }
+        TranscriptBlock::Script {
+            command,
+            output,
+            in_context,
+        } => {
+            lines.push(Line::from(""));
+            let tag = if *in_context {
+                format!("$ {command}")
+            } else {
+                format!("$ {command} (no context)")
+            };
+            let all_out: Vec<&str> = output.trim().lines().collect();
+            let max_lines = if state.expand_tools { 40 } else { 8 };
+            let hidden = all_out.len().saturating_sub(max_lines);
+            let preview = if hidden > 0 {
+                all_out[all_out.len() - max_lines..].join("\n")
+            } else {
+                all_out.join("\n")
+            };
+            push_pi_surface(
+                &mut lines,
+                area_width,
+                &tag,
+                &preview,
+                hidden,
+                SurfaceStyle {
+                    title: Color::White,
+                    bg: pal.card_quiet_bg,
+                    body: Style::default().fg(Color::Gray),
+                    diff_ok: pal.success,
+                    diff_err: pal.error,
+                },
+            );
+        }
+        TranscriptBlock::System(text) => {
+            lines.push(Line::from(""));
+            for l in text.lines() {
+                lines.push(Line::from(vec![
+                    Span::styled("   • ", Style::default().fg(accent)),
+                    Span::styled(l.to_string(), Style::default().fg(Color::Gray)),
+                ]));
+            }
+        }
+        TranscriptBlock::Report(text) => {
+            lines.push(Line::from(""));
+            for l in text.lines() {
+                if l.is_empty() {
                     lines.push(Line::from(""));
-                    lines.extend(render_markdown_lines(text, &pal, area.width, state.expand_tools));
-                }
-            }
-            TranscriptBlock::Tool {
-                name,
-                status,
-                output,
-            } => {
-                lines.push(Line::from(""));
-                let is_err = status == "failed";
-                let title = format!("{name} · {status}");
-                let all_out: Vec<&str> = output.trim().lines().collect();
-                let max_lines = if state.expand_tools { 40 } else { 5 };
-                let hidden = all_out.len().saturating_sub(max_lines);
-                let preview = if hidden > 0 {
-                    all_out[all_out.len() - max_lines..].join("\n")
+                } else if l.starts_with(' ') {
+                    // Detail lines (bars, budget) stay indented and dim.
+                    lines.push(Line::from(Span::styled(
+                        l.to_string(),
+                        Style::default().fg(Color::Gray),
+                    )));
                 } else {
-                    all_out.join("\n")
-                };
-                push_pi_surface(
-                    &mut lines,
-                    area.width,
-                    &title,
-                    &preview,
-                    hidden,
-                    SurfaceStyle {
-                        title: if is_err { pal.error } else { Color::White },
-                        bg: if is_err { pal.card_err_bg } else { pal.card_ok_bg },
-                        body: Style::default().fg(Color::Gray),
-                        diff_ok: pal.success,
-                        diff_err: pal.error,
-                    },
-                );
-            }
-            TranscriptBlock::Script {
-                command,
-                output,
-                in_context,
-            } => {
-                lines.push(Line::from(""));
-                let tag = if *in_context {
-                    format!("$ {command}")
-                } else {
-                    format!("$ {command} (no context)")
-                };
-                let all_out: Vec<&str> = output.trim().lines().collect();
-                let max_lines = if state.expand_tools { 40 } else { 8 };
-                let hidden = all_out.len().saturating_sub(max_lines);
-                let preview = if hidden > 0 {
-                    all_out[all_out.len() - max_lines..].join("\n")
-                } else {
-                    all_out.join("\n")
-                };
-                push_pi_surface(
-                    &mut lines,
-                    area.width,
-                    &tag,
-                    &preview,
-                    hidden,
-                    SurfaceStyle {
-                        title: Color::White,
-                        bg: pal.card_quiet_bg,
-                        body: Style::default().fg(Color::Gray),
-                        diff_ok: pal.success,
-                        diff_err: pal.error,
-                    },
-                );
-            }
-            TranscriptBlock::System(text) => {
-                lines.push(Line::from(""));
-                for l in text.lines() {
-                    lines.push(Line::from(vec![
-                        Span::styled("   • ", Style::default().fg(accent)),
-                        Span::styled(l.to_string(), Style::default().fg(Color::Gray)),
-                    ]));
-                }
-            }
-            TranscriptBlock::Report(text) => {
-                lines.push(Line::from(""));
-                for l in text.lines() {
-                    if l.is_empty() {
-                        lines.push(Line::from(""));
-                    } else if l.starts_with(' ') {
-                        // Detail lines (bars, budget) stay indented and dim.
-                        lines.push(Line::from(Span::styled(
-                            l.to_string(),
-                            Style::default().fg(Color::Gray),
-                        )));
-                    } else {
-                        lines.push(Line::from(Span::styled(
-                            l.to_string(),
-                            Style::default()
-                                .fg(Color::White)
-                                .add_modifier(Modifier::BOLD),
-                        )));
-                    }
+                    lines.push(Line::from(Span::styled(
+                        l.to_string(),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    )));
                 }
             }
         }
     }
+    wrap_lines_exact(lines, wrap_width)
+}
 
-    // Leave 1 column of breathing room + 1 column for the right-edge scrollbar.
+fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let wrap_width = (area.width as usize).saturating_sub(2).max(8);
-    let visual_lines = wrap_lines_exact(lines, wrap_width);
+    let mut banner_lines: Vec<Line<'static>> = Vec::new();
+    push_startup_banner(&mut banner_lines, state);
+    let mut visual_lines = wrap_lines_exact(banner_lines, wrap_width);
+
+    let mut cache = state.transcript_cache.borrow_mut();
+    if cache.width != area.width
+        || cache.theme != Some(state.theme)
+        || cache.show_thinking != state.show_thinking
+        || cache.expand_tools != state.expand_tools
+    {
+        cache.width = area.width;
+        cache.theme = Some(state.theme);
+        cache.show_thinking = state.show_thinking;
+        cache.expand_tools = state.expand_tools;
+        cache.entries.clear();
+    }
+    if cache.entries.len() > state.blocks.len() {
+        cache.entries.truncate(state.blocks.len());
+    }
+    for (idx, block) in state.blocks.iter().enumerate() {
+        let h = hash_block(block);
+        let hit = cache.entries.get(idx).is_some_and(|(ch, _)| *ch == h);
+        if !hit {
+            let rendered = render_block_wrapped(block, area.width, wrap_width, state);
+            if idx < cache.entries.len() {
+                cache.entries[idx] = (h, rendered);
+            } else {
+                cache.entries.push((h, rendered));
+            }
+        }
+        visual_lines.extend(cache.entries[idx].1.iter().cloned());
+    }
+    drop(cache);
     let total_lines = visual_lines.len().min(u16::MAX as usize) as u16;
     let visible_height = area.height.max(1);
     let auto_scroll = total_lines.saturating_sub(visible_height);
@@ -655,14 +772,23 @@ fn draw_status_strip(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         }
     };
 
-    if let Some(status) = &state.status_text {
+    let effective_status = state
+        .status_text
+        .as_deref()
+        .or_else(|| state.is_busy.then_some("Working..."));
+    if let Some(status) = effective_status {
+        let glyph = if state.is_busy || state.usage_loading {
+            format!(" {} ", state.spinner_glyph())
+        } else {
+            " • ".to_string()
+        };
         push_clamped(
             &mut spans,
             &mut used,
-            format!(" {} ", state.spinner_glyph()),
+            glyph,
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         );
-        push_clamped(&mut spans, &mut used, status.clone(), Style::default().fg(pal.fg));
+        push_clamped(&mut spans, &mut used, status.to_string(), Style::default().fg(pal.fg));
     } else if !state.todos.is_empty() {
         let total = state.todos.len();
         let done = state.todos.iter().filter(|(_, _, s)| s == "completed").count();
@@ -802,6 +928,19 @@ pub(crate) fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     } else {
         0.0
     };
+    // Pi colors context pressure at the same thresholds and shows the window size.
+    let ctx_text = if state.context_window > 0 {
+        format!("◔ {ctx_pct:.1}%/{} (auto)", format_tokens(state.context_window))
+    } else {
+        "◔ ?".to_string()
+    };
+    let ctx_color = if ctx_pct > 90.0 {
+        pal.error
+    } else if ctx_pct > 70.0 {
+        pal.warning
+    } else {
+        c_context
+    };
 
     let stats: [(&str, String, Color); 6] = [
         ("", format!("↑ {}", format_tokens(state.input_tokens)), c_input),
@@ -809,7 +948,7 @@ pub(crate) fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         ("", cache_str, c_cache),
         ("", tps_str, c_tps),
         ("", format!("$ {:.3}", state.cost_usd), c_cost),
-        ("", format!("◔ {ctx_pct:.1}%"), c_context),
+        ("", ctx_text, ctx_color),
     ];
 
     let right_model = format!("({}) {} ", state.provider, state.model);
@@ -942,6 +1081,42 @@ mod wrap_tests {
             "continuation should keep '(server.mjs' together: {:?}",
             line_text(&wrapped[1])
         );
+    }
+
+    #[test]
+    fn transcript_cache_hits_on_unchanged_blocks_and_invalidates_on_change() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = TuiState::new("vibe".into(), "devstral".into(), ".".into(), None);
+        state.blocks.push(TranscriptBlock::User("hello".into()));
+        state.blocks.push(TranscriptBlock::Assistant("world".into()));
+
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw_frame(f, &state)).unwrap();
+        assert_eq!(state.transcript_cache.borrow().entries.len(), 2);
+        let first_h0 = state.transcript_cache.borrow().entries[0].0;
+        let first_h1 = state.transcript_cache.borrow().entries[1].0;
+
+        // Second draw at same width/theme/toggles keeps cached hashes intact
+        term.draw(|f| draw_frame(f, &state)).unwrap();
+        assert_eq!(state.transcript_cache.borrow().entries[0].0, first_h0);
+        assert_eq!(state.transcript_cache.borrow().entries[1].0, first_h1);
+
+        // Mutating last block updates only that block's hash
+        if let Some(TranscriptBlock::Assistant(s)) = state.blocks.last_mut() {
+            s.push_str(" more");
+        }
+        term.draw(|f| draw_frame(f, &state)).unwrap();
+        assert_eq!(state.transcript_cache.borrow().entries[0].0, first_h0);
+        assert_ne!(state.transcript_cache.borrow().entries[1].0, first_h1);
+
+        // Width change clears and repopulates at new width
+        let mut term_wide = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term_wide.draw(|f| draw_frame(f, &state)).unwrap();
+        assert_eq!(state.transcript_cache.borrow().width, 100);
+        assert_eq!(state.transcript_cache.borrow().entries.len(), 2);
     }
 }
 

@@ -5,7 +5,8 @@ use crossterm::execute;
 use crossterm::style::Print;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
 use ratatui::Terminal;
-use std::cell::Cell;
+use ratatui::text::Line;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Stdout};
 use std::time::Instant;
@@ -66,6 +67,15 @@ pub enum TranscriptBlock {
     System(String),
     /// Preformatted output (reports, tables): rendered verbatim, without a bullet or indent.
     Report(String),
+}
+
+#[derive(Debug, Default)]
+pub struct TranscriptCache {
+    pub width: u16,
+    pub theme: Option<ThemeId>,
+    pub show_thinking: bool,
+    pub expand_tools: bool,
+    pub entries: Vec<(u64, Vec<Line<'static>>)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -148,6 +158,7 @@ pub struct TuiState {
     pub selected_slash_idx: usize,
     pub scroll_offset: u16,
     pub rendered_scroll: Cell<u16>,
+    pub transcript_cache: RefCell<TranscriptCache>,
     pub blocks: Vec<TranscriptBlock>,
     pub available_models: Vec<(String, String, String)>,
     /// Models pinned for Ctrl+P cycling, as (provider, model id).
@@ -213,7 +224,7 @@ impl TuiState {
             model,
             thinking_level: "medium".to_string(),
             mode: AgentMode::Normal,
-            theme: ThemeId::OwlCyan,
+            theme: ThemeId::Pi,
             shell: if cfg!(windows) {
                 "powershell".to_string()
             } else {
@@ -251,6 +262,7 @@ impl TuiState {
             selected_slash_idx: 0,
             scroll_offset: 0,
             rendered_scroll: Cell::new(0),
+            transcript_cache: RefCell::new(TranscriptCache::default()),
             blocks: Vec::new(),
             available_models: Vec::new(),
             queued_prompts: VecDeque::new(),

@@ -6,6 +6,7 @@ pub mod input;
 pub mod markdown;
 pub mod modal;
 pub mod mode;
+pub mod probe;
 pub mod resync_backend;
 pub mod state;
 pub mod theme;
@@ -18,8 +19,9 @@ pub use commands::{
 pub use diagram::{extract_latest_xml_block, project_xml_diagram};
 pub use editor::wrap_editor_lines;
 pub use export::{export_session_html, export_session_markdown};
-pub use input::poll_tui_action;
+pub use input::{apply_wheel_scroll, handle_key_event, poll_tui_action};
 pub use mode::{ALL_MODES, ALL_SHELLS, AgentMode, build_system_prompt};
+pub use probe::{ProbeFrame, key_from_spec, press, render_frame, render_frame_text};
 pub use state::{
     ActiveModal, FrameBuffer, ProviderUsageStats, QuestionPrompt, SPINNER_FRAMES,
     TerminalGuard, TranscriptBlock, TuiAction, TuiState, format_tokens, render_status_bar,

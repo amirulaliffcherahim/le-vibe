@@ -3,6 +3,7 @@ mod debug_log;
 mod features;
 mod rpc;
 mod settings;
+mod tui_probe;
 mod worker;
 
 use le_vibe_agent::{AgentConfig, AgentEvent, ApprovalChoice};
@@ -301,6 +302,9 @@ fn main() {
             }
             return;
         }
+        CliAction::Subcommand(ref sub, ref sub_args) if sub == "tui-probe" => {
+            std::process::exit(tui_probe::run(sub_args));
+        }
         CliAction::ExportOffline { input, output } => {
             let session = SessionStore::open(&input).expect("failed to open session file");
             let mut state = TuiState::new(
@@ -594,6 +598,9 @@ fn run_interactive_tui(
         Arc::clone(&logger),
         system_prompt_extra,
     );
+    if state.yolo {
+        let _ = cmd_tx.send(WorkerCmd::SetYolo(true));
+    }
     if state.codemode != "off" {
         let _ = cmd_tx.send(WorkerCmd::SetCodemode(state.codemode.clone()));
     }
@@ -617,6 +624,8 @@ fn run_interactive_tui(
     let mut last_quit_press: Option<Instant> = None;
     let mut last_esc_empty: Option<Instant> = None;
     let mut needs_redraw = true;
+    let mut input_dirty = true;
+    let mut last_draw_at = Instant::now();
     let mut active_prompt = false;
 
     loop {
@@ -760,22 +769,50 @@ fn run_interactive_tui(
                         ..
                     } => {
                         let label = if is_error { "failed" } else { "done" };
+                        let log_msg = if is_error {
+                            let first_line: String = output
+                                .lines()
+                                .map(str::trim)
+                                .find(|l| !l.is_empty())
+                                .unwrap_or("")
+                                .chars()
+                                .take(160)
+                                .collect();
+                            if first_line.is_empty() {
+                                format!("{name} -> {label} ({} bytes)", output.len())
+                            } else {
+                                format!("{name} -> {label}: {first_line}")
+                            }
+                        } else {
+                            format!("{name} -> {label} ({} bytes)", output.len())
+                        };
                         logger.log(
                             if is_error { "error" } else { "tool" },
                             "end",
                             None,
-                            format!("{name} -> {label} ({} bytes)", output.len()),
+                            log_msg,
                         );
                         let preview: String = output.lines().take(8).collect::<Vec<_>>().join("\n");
                         if let Some(TranscriptBlock::Tool {
-                            name: n,
                             status: st,
                             output: out,
-                        }) = state.blocks.last_mut()
-                            && *n == name
-                        {
+                            ..
+                        }) = state.blocks.iter_mut().rev().find(|b| {
+                            matches!(
+                                b,
+                                TranscriptBlock::Tool { name: n, status: s, .. }
+                                if *n == name && s == "running..."
+                            )
+                        }) {
                             *st = label.to_string();
                             *out = preview;
+                        }
+                        if state.is_busy
+                            && !state.blocks.iter().any(|b| {
+                                matches!(b, TranscriptBlock::Tool { status: s, .. } if s == "running...")
+                            })
+                        {
+                            state.status_text = Some("Thinking...".to_string());
                         }
                     }
                     _ => {}
@@ -1031,7 +1068,12 @@ fn run_interactive_tui(
             });
         }
 
-        if needs_redraw {
+        let can_draw_now = !state.is_busy
+            || input_dirty
+            || last_draw_at.elapsed() >= Duration::from_millis(24);
+        if needs_redraw && can_draw_now {
+            input_dirty = false;
+            last_draw_at = Instant::now();
             if DEBUG_ENABLED && state.modal == ActiveModal::DebugModal {
                 let summary = format!(
                     "State: busy={} mode={} model={}/{} blocks={} queue={} last_draw={}ms",
@@ -1064,11 +1106,17 @@ fn run_interactive_tui(
             needs_redraw = state.rendered_scroll.get() != before_scroll;
         }
 
-        // Wait up to 16ms for the first input event, then drain bursts without redrawing per key.
+        // Wait up to 4ms while streaming so token bursts & keys react immediately; 16ms when idle.
+        let poll_wait = if state.is_busy {
+            Duration::from_millis(4)
+        } else {
+            Duration::from_millis(16)
+        };
         let mut actions = Vec::new();
-        let first = poll_tui_action(&mut state, Duration::from_millis(16)).unwrap_or(TuiAction::None);
+        let first = poll_tui_action(&mut state, poll_wait).unwrap_or(TuiAction::None);
         if !matches!(first, TuiAction::None) {
             needs_redraw = true;
+            input_dirty = true;
             actions.push(first);
             for _ in 0..15 {
                 let next = poll_tui_action(&mut state, Duration::ZERO).unwrap_or(TuiAction::None);
@@ -1337,6 +1385,7 @@ fn run_interactive_tui(
                     1 => ApprovalChoice::AllowSession,
                     2 => {
                         state.yolo = true;
+                        save_setting("yolo", "true");
                         ApprovalChoice::AllowYolo
                     }
                     _ => ApprovalChoice::Deny,
@@ -1534,6 +1583,7 @@ fn run_interactive_tui(
                 }
                 if input == "/yolo" {
                     state.yolo = !state.yolo;
+                    save_setting("yolo", &state.yolo.to_string());
                     let _ = cmd_tx.send(WorkerCmd::SetYolo(state.yolo));
                     state.blocks.push(TranscriptBlock::System(if state.yolo {
                         "YOLO mode enabled (all non-blocked tools auto-approved).".to_string()

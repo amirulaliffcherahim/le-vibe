@@ -37,7 +37,8 @@ fn modal_len(state: &TuiState) -> usize {
     }
 }
 
-fn apply_wheel_scroll(state: &mut TuiState, up: bool) {
+/// Scroll the active surface (transcript or modal list) by one wheel notch.
+pub fn apply_wheel_scroll(state: &mut TuiState, up: bool) {
     match state.modal {
         ActiveModal::None => {
             if up {
@@ -187,7 +188,8 @@ pub fn poll_tui_action(state: &mut TuiState, timeout: Duration) -> io::Result<Tu
     }
 }
 
-fn handle_key_event(state: &mut TuiState, key: crossterm::event::KeyEvent) -> io::Result<TuiAction> {
+/// Apply one pressed key to the UI state, returning the action the event loop must run.
+pub fn handle_key_event(state: &mut TuiState, key: crossterm::event::KeyEvent) -> io::Result<TuiAction> {
 
     if key.code == KeyCode::F(12)
         && state.modal != ActiveModal::ApprovalModal

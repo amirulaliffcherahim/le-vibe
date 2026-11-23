@@ -790,7 +790,7 @@ fn draw_usage_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .padding(Padding::horizontal(1))
+                .padding(Padding::new(2, 2, 1, 1))
                 .border_style(Style::default().fg(accent))
                 .style(Style::default().bg(pal.modal_bg))
                 .title(Span::styled(
@@ -836,11 +836,11 @@ fn draw_text_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                     } else if s.contains('┌') || s.contains('└') || s.contains('│') {
                         Style::default().fg(pal.accent)
                     } else if s.trim_start().starts_with("• ") || s.trim_start().starts_with("- ") {
-                        Style::default().fg(pal.fg)
+                        Style::default().fg(pal.fg).add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(pal.muted)
                     };
-                    Line::from(Span::styled(format!(" {display}"), style.bg(pal.modal_bg)))
+                    Line::from(Span::styled(display, style.bg(pal.modal_bg)))
                 })
                 .collect(),
         )
@@ -871,25 +871,40 @@ fn draw_text_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             "Keybindings:",
             "  Shift+Tab       Cycle mode (normal / plan / ask / rea / cyber)",
             "  Ctrl+P          Cycle scoped models",
-            "  Ctrl+T          Toggle thinking block visibility",
-            "  Ctrl+O          Toggle tool output expansion (3 vs 40 lines)",
-            "  Ctrl+V          Paste text, file path, or clipboard image",
-            "  Ctrl+L          Clear transcript viewport (preserves context)",
-            "  Shift+Enter     Insert newline in editor (or Alt+Enter / Ctrl+J)",
+            "  Ctrl+B          Toggle right-side todo pane",
+            "  Ctrl+T / Ctrl+O Toggle thinking / expand tool output",
+            "  Ctrl+X          Copy last reply to clipboard",
+            "  Ctrl+V / Ctrl+G Paste image or text / open external editor",
+            "  Ctrl+L          Clear transcript viewport (keeps context)",
+            "  Shift+Enter     Insert newline (or Alt+Enter / Ctrl+J)",
             "  Esc             Interrupt active turn (or clear editor)",
             "  !cmd / !!cmd    Run shell command (in-context / local)",
             "",
-            "Slash Commands:",
-            "  /model /mode /thinking /config /theme /term /yolo /policy /usage /auth",
-            "  /login /logout /new /clear /resume /rename /status /context /rewind",
-            "  /clone /compact /handover /export /copy /report /loop /plugins",
-            "  /reload-plugins /trust /reload /skills /mcp /help /changelog /quit",
+            "Models & Settings:",
+            "  /model  /mode  /thinking  /theme  /config  /term  /yolo  /policy",
+            "",
+            "Session & Copy:",
+            "  /new  /clear  /resume  /rename  /rewind  /tree  /compact  /handover",
+            "  /copy [chat|code]  /export  /report  /search",
+            "",
+            "Learning, Tools & Extensions:",
+            "  /learn  /suggestion  /context  /usage  /memory  /todos",
+            "  /skills  /mcp  /plugins  /reload  /trust  /auth  /login  /quit",
         ];
         (
             " Help & Hotkeys (↑/↓ scroll · Esc/Enter close) ".to_string(),
             items
                 .iter()
-                .map(|s| Line::from(Span::styled(*s, Style::default().fg(Color::Gray))))
+                .map(|s| {
+                    let st = if s.ends_with(':') {
+                        Style::default()
+                            .fg(pal.complementary)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(pal.fg)
+                    };
+                    Line::from(Span::styled(*s, st))
+                })
                 .collect(),
         )
     } else {
@@ -910,7 +925,7 @@ fn draw_text_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .padding(Padding::horizontal(1))
+                .padding(Padding::new(2, 2, 1, 1))
                 .border_style(Style::default().fg(accent))
                 .style(Style::default().bg(pal.modal_bg))
                 .title(Span::styled(

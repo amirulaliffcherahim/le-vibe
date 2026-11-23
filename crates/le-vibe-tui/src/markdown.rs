@@ -191,7 +191,8 @@ pub fn render_markdown_lines(
     expand_raw_xml: bool,
 ) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
-    let width = (area_width as usize).max(24);
+    // Reserve 2 columns for the scrollbar margin so padded code cards never re-wrap a trailing space.
+    let width = (area_width as usize).saturating_sub(2).max(20);
     let base = Style::default().fg(pal.fg);
     let code_inline = Style::default().fg(pal.complementary).bg(pal.card_quiet_bg);
     let code_block_style = Style::default().fg(pal.fg);

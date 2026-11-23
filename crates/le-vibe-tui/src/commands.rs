@@ -172,8 +172,8 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "/copy",
-        hint: "",
-        description: "Copy the last assistant response to clipboard",
+        hint: "[chat|code]",
+        description: "Copy last reply (raw Markdown, `chat` for WhatsApp/Teams, or `code` block)",
         picker_on_bare: true,
     },
     SlashCommandSpec {

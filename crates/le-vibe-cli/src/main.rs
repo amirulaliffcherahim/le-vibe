@@ -14,8 +14,8 @@ use le_vibe_telemetry::TelemetryRecorder;
 use le_vibe_tui::{
     ALL_SHELLS, ALL_THEMES, ActiveModal, AgentMode, TerminalGuard, ThemeId, TranscriptBlock,
     TuiAction, TuiState, build_system_prompt, draw_frame, export_session_html,
-    export_session_markdown, extract_latest_xml_block, format_tokens, poll_tui_action,
-    project_xml_diagram, render_status_bar,
+    export_session_markdown, extract_last_code_block, extract_latest_xml_block, format_chat_html,
+    format_chat_plain, format_tokens, poll_tui_action, project_xml_diagram, render_status_bar,
 };
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -2040,17 +2040,42 @@ fn run_interactive_tui(
                     }
                     continue;
                 }
-                if input == "/copy" {
+                if input == "/copy" || input.starts_with("/copy ") {
+                    let arg = input.strip_prefix("/copy").unwrap_or("").trim().to_ascii_lowercase();
                     let last_msg = state.blocks.iter().rev().find_map(|b| match b {
                         TranscriptBlock::Assistant(txt) if !txt.trim().is_empty() => Some(txt.clone()),
                         _ => None,
                     });
                     if let Some(txt) = last_msg {
-                        let copied = copy_to_clipboard(&txt);
+                        let (label, copied, char_len) = match arg.as_str() {
+                            "chat" | "plain" | "whatsapp" | "teams" => {
+                                let plain = format_chat_plain(&txt);
+                                let html = format_chat_html(&txt);
+                                let ok = copy_to_clipboard_dual(&plain, html.as_deref());
+                                ("chat-friendly", ok, plain.len())
+                            }
+                            "code" => {
+                                if let Some(code) = extract_last_code_block(&txt) {
+                                    let ok = copy_to_clipboard(&code);
+                                    ("code block", ok, code.len())
+                                } else {
+                                    state.blocks.push(TranscriptBlock::System(
+                                        "No fenced code block in the last assistant response.".to_string(),
+                                    ));
+                                    continue;
+                                }
+                            }
+                            _ => {
+                                let ok = copy_to_clipboard(&txt);
+                                ("Markdown", ok, txt.len())
+                            }
+                        };
                         if copied {
+                            state.status_text = Some(format!(
+                                "Copied ({label}, {char_len} chars) to clipboard."
+                            ));
                             state.blocks.push(TranscriptBlock::System(format!(
-                                "Copied {} chars to clipboard.",
-                                txt.len()
+                                "Copied ({label}, {char_len} chars) to clipboard."
                             )));
                         } else {
                             state.blocks.push(TranscriptBlock::System(
@@ -2305,6 +2330,42 @@ fn run_interactive_tui(
 
 
 fn copy_to_clipboard(text: &str) -> bool {
+    copy_to_clipboard_dual(text, None)
+}
+
+fn copy_to_clipboard_dual(plain: &str, html: Option<&str>) -> bool {
+    if cfg!(target_os = "windows")
+        && let Some(html_frag) = html
+    {
+        // Dual-MIME Windows clipboard: Teams/Notion paste real HTML tables while WhatsApp gets clean plain text.
+        let header_stub = "Version:0.9\r\nStartHTML:0000000000\r\nEndHTML:0000000000\r\nStartFragment:0000000000\r\nEndFragment:0000000000\r\n";
+        let prefix = "<html><body><!--StartFragment-->";
+        let suffix = "<!--EndFragment--></body></html>";
+        let start_html = header_stub.len();
+        let start_frag = start_html + prefix.len();
+        let end_frag = start_frag + html_frag.len();
+        let end_html = end_frag + suffix.len();
+        let cf_html = format!(
+            "Version:0.9\r\nStartHTML:{start_html:010}\r\nEndHTML:{end_html:010}\r\nStartFragment:{start_frag:010}\r\nEndFragment:{end_frag:010}\r\n{prefix}{html_frag}{suffix}"
+        );
+        let payload = format!("{plain}\0\0{cf_html}");
+        let script = "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; $raw = [Console]::In.ReadToEnd(); $parts = $raw -split \"`0`0\", 2; Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.DataObject; $d.SetText($parts[0], [System.Windows.Forms.TextDataFormat]::UnicodeText); if ($parts.Length -gt 1) { $d.SetData([System.Windows.Forms.DataFormats]::Html, $parts[1]) }; [System.Windows.Forms.Clipboard]::SetDataObject($d, $true)";
+        if let Ok(mut child) = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-STA", "-Command", script])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(payload.as_bytes());
+            }
+            if child.wait().is_ok_and(|s| s.success()) {
+                return true;
+            }
+        }
+    }
+
     let candidates: &[(&str, &[&str])] = if cfg!(target_os = "windows") {
         &[(
             "powershell",
@@ -2328,14 +2389,40 @@ fn copy_to_clipboard(text: &str) -> bool {
             .spawn()
         {
             if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(text.as_bytes());
+                let _ = stdin.write_all(plain.as_bytes());
             }
             if child.wait().is_ok_and(|s| s.success()) {
                 return true;
             }
         }
     }
-    false
+    // OSC 52 universal terminal clipboard fallback (works over SSH/tmux without local tools).
+    let b64 = encode_base64(plain.as_bytes());
+    let mut out = io::stdout();
+    write!(out, "\x1b]52;c;{b64}\x07").is_ok() && out.flush().is_ok()
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as usize;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as usize;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as usize;
+        out.push(TABLE[(b0 >> 2) & 0x3F] as char);
+        out.push(TABLE[((b0 & 0x03) << 4) | (b1 >> 4)] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((b1 & 0x0F) << 2) | (b2 >> 6)] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[b2 & 0x3F] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 #[cfg(test)]

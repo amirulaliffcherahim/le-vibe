@@ -140,7 +140,9 @@ pub fn build_system_prompt(
          </modes>\n\n\
          <rules>\n\
          - Only write shell commands compatible with `{shell}` on `{os}`.\n\
-         - Be concise and direct. Show exact file paths. Only report results directly observed from tool output.\n\
+         - Be concise, direct, and easy to understand: use plain, simple language instead of heavy technical jargon; if a technical term is unavoidable, explain it in a few plain words.\n\
+         - Make every output copy-paste friendly: put ready-to-run commands, configs, and code in clean fenced code blocks (` ```lang `), and keep Markdown tables compact with short cell values.\n\
+         - Show exact file paths. Only report results directly observed from tool output.\n\
          - Use `todo` for multi-step work (3+ steps); keep exactly one task `in_progress` and verify before marking `completed`.\n\
          </rules>\n\n\
          <efficiency>\n\

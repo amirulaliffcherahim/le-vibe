@@ -447,8 +447,6 @@ fn action_label(action: &TuiAction) -> String {
         TuiAction::ConfigCycleKey(key) => format!("config-cycle {key}"),
         TuiAction::ApprovalDecision(idx) => format!("approval {idx}"),
         TuiAction::QuestionAnswer(answer) => format!("answer {answer:?}"),
-        TuiAction::TodoCycle(id, status) => format!("todo-cycle {id} -> {status}"),
-        TuiAction::TodoDelete(id) => format!("todo-delete {id}"),
         TuiAction::ToggleDebug => "toggle-debug".to_string(),
         TuiAction::DebugClear => "debug-clear".to_string(),
         TuiAction::DebugCycleFilter => "debug-cycle-filter".to_string(),

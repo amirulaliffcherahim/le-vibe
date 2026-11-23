@@ -77,7 +77,7 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "/todos",
         hint: "",
-        description: "Focus or toggle the interactive right-side todo pane (Ctrl+B)",
+        description: "Toggle the right-side todo pane (Ctrl+B)",
         picker_on_bare: true,
     },
     SlashCommandSpec {

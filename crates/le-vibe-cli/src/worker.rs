@@ -3,7 +3,7 @@ use le_vibe_durable::{EntryKind, SessionStore};
 use le_vibe_mcp::McpManager;
 use le_vibe_pybridge::{ChatMessage, CompletionRequest, PolicyPort, ProviderPort, PythonBridge};
 use le_vibe_telemetry::TelemetryRecorder;
-use le_vibe_tools::{TodoStore, execute_todo_tool};
+use le_vibe_tools::TodoStore;
 use le_vibe_tui::{
     AgentMode, QuestionItem, QuestionOption, QuestionSession, TuiState, build_system_prompt,
     format_tokens,
@@ -360,11 +360,6 @@ pub(crate) enum WorkerCmd {
     },
     SetYolo(bool),
     SetCodemode(String),
-    TodoUpdate {
-        id: u64,
-        status: String,
-    },
-    TodoDelete(u64),
     Compact {
         provider: String,
         model: String,
@@ -744,30 +739,6 @@ pub(crate) fn spawn_tui_worker(
                 }
                 WorkerCmd::SetCodemode(mode_val) => {
                     codemode_setting = mode_val;
-                }
-                WorkerCmd::TodoUpdate { id, status } => {
-                    let _ = execute_todo_tool(
-                        &mut todos,
-                        &serde_json::json!({ "action": "update", "id": id, "status": status }),
-                    );
-                    let snap = todos
-                        .items()
-                        .iter()
-                        .map(|t| (t.id, t.subject.clone(), t.status.clone()))
-                        .collect();
-                    let _ = msg_tx.send(WorkerMsg::TodosUpdated(snap));
-                }
-                WorkerCmd::TodoDelete(id) => {
-                    let _ = execute_todo_tool(
-                        &mut todos,
-                        &serde_json::json!({ "action": "delete", "id": id }),
-                    );
-                    let snap = todos
-                        .items()
-                        .iter()
-                        .map(|t| (t.id, t.subject.clone(), t.status.clone()))
-                        .collect();
-                    let _ = msg_tx.send(WorkerMsg::TodosUpdated(snap));
                 }
                 WorkerCmd::RefreshCatalog {
                     live,

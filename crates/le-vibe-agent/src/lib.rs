@@ -203,12 +203,30 @@ pub fn sanitize_messages_for_provider(provider: &str, messages: &mut Vec<ChatMes
 
 fn is_transient_error(err: &BridgeError) -> bool {
     let text = err.to_string();
-    text.contains("HTTP 429")
-        || text.contains("HTTP 502")
-        || text.contains("HTTP 503")
-        || text.contains("HTTP 504")
-        || text.contains("ReadTimeout")
-        || text.contains("ConnectError")
+    [
+        "HTTP 429",
+        "HTTP 500",
+        "HTTP 502",
+        "HTTP 503",
+        "HTTP 504",
+        "HTTP 520",
+        "HTTP 522",
+        "HTTP 524",
+        "ReadTimeout",
+        "ConnectTimeout",
+        "WriteTimeout",
+        "PoolTimeout",
+        "ConnectError",
+        "RemoteProtocolError",
+        "ReadError",
+        "WriteError",
+        "Server disconnected",
+        "peer closed connection",
+        "incomplete chunked read",
+        "timed out",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
 }
 
 const TOOL_RESULT_MAX_BYTES: usize = 24 * 1024;

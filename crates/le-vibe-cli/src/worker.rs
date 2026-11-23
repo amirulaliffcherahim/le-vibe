@@ -1596,14 +1596,40 @@ pub(crate) fn spawn_tui_worker(
                         Ok(skills) if skills.is_empty() => {
                             vec!["No SKILL.md files discovered in project or global skill directories.".to_string()]
                         }
-                        Ok(skills) => skills
-                            .into_iter()
-                            .map(|s| format!("• {} — {} ({})", s.name, s.description, s.path))
-                            .collect(),
+                        Ok(mut skills) => {
+                            skills.sort_by(|a, b| a.name.cmp(&b.name));
+                            let mut out = vec![
+                                format!("{} on-demand skill(s) — loaded via `load_skill` when needed:", skills.len()),
+                                String::new(),
+                            ];
+                            for s in skills {
+                                let scope = if s.path.contains(".le-vibe") && !s.path.starts_with(&cwd_string()) {
+                                    "global"
+                                } else {
+                                    "project"
+                                };
+                                out.push(format!("• {}  [{scope}]", s.name));
+                                let first_sentence = s
+                                    .description
+                                    .split_once(". ")
+                                    .map(|(head, _)| format!("{head}."))
+                                    .unwrap_or_else(|| s.description.clone());
+                                let desc: String = if first_sentence.chars().count() > 100 {
+                                    let mut d: String = first_sentence.chars().take(99).collect();
+                                    d.push('…');
+                                    d
+                                } else {
+                                    first_sentence
+                                };
+                                out.push(format!("    {desc}"));
+                                out.push(String::new());
+                            }
+                            out
+                        }
                         Err(err) => vec![format!("Failed to list skills: {err}")],
                     };
                     let _ = msg_tx.send(WorkerMsg::InfoModal {
-                        title: "Discovered Skills (/skills)".to_string(),
+                        title: "Skills (/skills)".to_string(),
                         lines,
                     });
                     let _ = msg_tx.send(WorkerMsg::Idle);

@@ -35,10 +35,24 @@ pub(crate) fn run_streaming_prompt(
     if !json_mode {
         println!();
     }
-    if let Err(err) = res {
-        eprintln!("Error: {err}");
-        if json_mode {
-            std::process::exit(1);
+    match res {
+        Ok(reply) => {
+            if json_mode {
+                println!(
+                    "{}",
+                    json!({
+                        "type": "result",
+                        "stop_reason": reply.stop_reason,
+                        "usage": reply.usage
+                    })
+                );
+            }
+        }
+        Err(err) => {
+            eprintln!("Error: {err}");
+            if json_mode {
+                std::process::exit(1);
+            }
         }
     }
 }

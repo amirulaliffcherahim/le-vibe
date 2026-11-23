@@ -795,6 +795,22 @@ fn run_shell(shell: &str, args: &Value) -> Result<String, ToolError> {
     }
     let stdout_buf = decode_shell_output(&stdout_bytes);
     let stderr_buf = decode_shell_output(&stderr_bytes);
+    let code = status.code().unwrap_or(-1);
+    let first_err = if code != 0 {
+        stderr_buf
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .map(|l| {
+                let mut s: String = l.chars().take(200).collect();
+                if l.chars().count() > 200 {
+                    s.push_str("...");
+                }
+                s
+            })
+    } else {
+        None
+    };
     let combined = if stderr_buf.is_empty() {
         stdout_buf
     } else if stdout_buf.is_empty() {
@@ -802,7 +818,16 @@ fn run_shell(shell: &str, args: &Value) -> Result<String, ToolError> {
     } else {
         format!("{stdout_buf}\n{stderr_buf}")
     };
-    let code = status.code().unwrap_or(-1);
+    if code != 0 {
+        let header = match first_err {
+            Some(line) => format!("exit_code={code} | stderr: {line}"),
+            None => format!("exit_code={code}"),
+        };
+        if combined.is_empty() {
+            return Ok(header);
+        }
+        return Ok(truncate_output(&format!("{header}\n{combined}")));
+    }
     Ok(truncate_output(&format!("exit_code={code}\n{combined}")))
 }
 
@@ -1082,6 +1107,14 @@ mod tests {
             &json!({"command": "Start-Sleep -Seconds 5", "timeout_secs": 1}),
         );
         assert!(matches!(timeout_res, Err(ToolError::Edit(msg)) if msg.contains("timed out")));
+
+        let fail_out = execute_builtin_tool(
+            &mut allow,
+            "powershell",
+            &json!({"command": "[Console]::Error.WriteLine('boom-line-1'); exit 3"}),
+        )
+        .unwrap();
+        assert!(fail_out.starts_with("exit_code=3 | stderr: boom-line-1"));
 
         let _ = fs::remove_dir_all(&dir);
     }

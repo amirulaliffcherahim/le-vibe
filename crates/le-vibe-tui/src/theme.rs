@@ -27,6 +27,7 @@ pub struct ThemePalette {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThemeId {
+    Pi,
     OwlCyan,
     RosePine,
     Kanagawa,
@@ -38,6 +39,7 @@ pub enum ThemeId {
 }
 
 pub const ALL_THEMES: &[ThemeId] = &[
+    ThemeId::Pi,
     ThemeId::OwlCyan,
     ThemeId::RosePine,
     ThemeId::Kanagawa,
@@ -51,6 +53,7 @@ pub const ALL_THEMES: &[ThemeId] = &[
 impl ThemeId {
     pub fn name(self) -> &'static str {
         match self {
+            ThemeId::Pi => "pi",
             ThemeId::OwlCyan => "owl-cyan",
             ThemeId::RosePine => "rose-pine",
             ThemeId::Kanagawa => "kanagawa",
@@ -64,6 +67,7 @@ impl ThemeId {
 
     pub fn description(self) -> &'static str {
         match self {
+            ThemeId::Pi => "Pi dark — violet accent, blue user turns, dim neutral chrome",
             ThemeId::OwlCyan => "Luminous seafoam teal, soft iris & warm amber gold",
             ThemeId::RosePine => "Rosé Pine — warm rose, iris & gold on deep pine",
             ThemeId::Kanagawa => "Kanagawa Wave — crystal blue, oni violet & carp gold",
@@ -82,30 +86,64 @@ impl ThemeId {
             .find(|t| t.name().eq_ignore_ascii_case(s.trim()))
     }
 
+    /// User-turn surface tint (Pi `userMessageBg`).
+    pub fn user_surface(self) -> Color {
+        match self {
+            ThemeId::Pi => Color::Rgb(33, 59, 73),
+            ThemeId::OwlCyan => Color::Rgb(20, 44, 52),
+            ThemeId::Kanagawa => Color::Rgb(42, 48, 66),
+            _ => self.palette().card_quiet_bg,
+        }
+    }
+
     pub fn palette(self) -> ThemePalette {
         match self {
+            // Converted from Pi's dark.json okhsl tokens so the chrome matches `pi` exactly.
+            ThemeId::Pi => ThemePalette {
+                accent: Color::Rgb(167, 152, 215),       // #A798D7 violet
+                secondary: Color::Rgb(105, 173, 208),    // #69ADD0 blue
+                complementary: Color::Rgb(104, 183, 141), // #68B78D green
+                fg: Color::Rgb(222, 224, 225),           // #DEE0E1 text
+                muted: Color::Rgb(157, 165, 169),        // #9DA5A9 muted
+                modal_bg: Color::Rgb(32, 36, 38),
+                success: Color::Rgb(104, 183, 141),
+                warning: Color::Rgb(205, 154, 34),
+                error: Color::Rgb(234, 127, 129),
+                card_thinking_bg: Color::Rgb(40, 44, 46),
+                card_ok_bg: Color::Rgb(37, 65, 49),      // #254131 toolSuccessBg
+                card_err_bg: Color::Rgb(91, 40, 42),     // #5B282A toolErrorBg
+                card_quiet_bg: Color::Rgb(52, 56, 58),   // #34383A toolPendingBg
+                branch: Color::Rgb(105, 173, 208),
+                git_status: Color::Rgb(205, 154, 34),
+                input: Color::Rgb(105, 173, 208),
+                output: Color::Rgb(167, 152, 215),
+                cache: Color::Rgb(104, 183, 141),
+                tps: Color::Rgb(94, 178, 134),
+                cost: Color::Rgb(205, 154, 34),
+                context: Color::Rgb(157, 165, 169),
+            },
             ThemeId::OwlCyan => ThemePalette {
-                accent: Color::Rgb(56, 232, 216),        // #38E8D8 seafoam teal (primary)
-                secondary: Color::Rgb(192, 132, 252),    // #C084FC soft iris (secondary)
-                complementary: Color::Rgb(245, 178, 72), // #F5B248 warm amber gold (complementary)
-                fg: Color::Rgb(230, 237, 243),           // #E6EDF3 crisp ivory
-                muted: Color::Rgb(139, 155, 180),        // #8B9BB4 slate
-                modal_bg: Color::Rgb(19, 25, 36),        // #131924 midnight slate
+                accent: Color::Rgb(72, 224, 210),        // #48E0D2 seafoam teal (primary)
+                secondary: Color::Rgb(167, 139, 250),    // #A78BFA soft iris (secondary)
+                complementary: Color::Rgb(240, 178, 84), // #F0B254 warm amber gold
+                fg: Color::Rgb(226, 234, 240),           // #E2EAF0 crisp slate white
+                muted: Color::Rgb(132, 148, 170),        // #8494AA balanced slate
+                modal_bg: Color::Rgb(17, 23, 33),        // #111721 deep midnight slate
                 success: Color::Rgb(110, 231, 183),
-                warning: Color::Rgb(245, 178, 72),
+                warning: Color::Rgb(240, 178, 84),
                 error: Color::Rgb(248, 113, 113),
-                card_thinking_bg: Color::Rgb(22, 25, 38),
-                card_ok_bg: Color::Rgb(20, 34, 30),
-                card_err_bg: Color::Rgb(44, 22, 28),
-                card_quiet_bg: Color::Rgb(20, 25, 35),
-                branch: Color::Rgb(56, 232, 216),
-                git_status: Color::Rgb(245, 178, 72),
-                input: Color::Rgb(56, 232, 216),
-                output: Color::Rgb(192, 132, 252),
+                card_thinking_bg: Color::Rgb(20, 26, 38),
+                card_ok_bg: Color::Rgb(19, 38, 34),
+                card_err_bg: Color::Rgb(48, 22, 29),
+                card_quiet_bg: Color::Rgb(24, 31, 43),
+                branch: Color::Rgb(72, 224, 210),
+                git_status: Color::Rgb(240, 178, 84),
+                input: Color::Rgb(72, 224, 210),
+                output: Color::Rgb(167, 139, 250),
                 cache: Color::Rgb(110, 231, 183),
-                tps: Color::Rgb(96, 165, 250),
-                cost: Color::Rgb(245, 178, 72),
-                context: Color::Rgb(176, 190, 210),
+                tps: Color::Rgb(105, 173, 228),
+                cost: Color::Rgb(240, 178, 84),
+                context: Color::Rgb(150, 166, 188),
             },
             ThemeId::RosePine => ThemePalette {
                 accent: Color::Rgb(235, 188, 186),       // #EBBCBA rose
@@ -131,27 +169,27 @@ impl ThemeId {
                 context: Color::Rgb(224, 222, 244),
             },
             ThemeId::Kanagawa => ThemePalette {
-                accent: Color::Rgb(126, 156, 216),       // #7E9CD8 crystal blue
-                secondary: Color::Rgb(149, 127, 184),    // #957FB8 oni violet
-                complementary: Color::Rgb(230, 195, 132),// #E6C384 carp yellow
-                fg: Color::Rgb(220, 215, 186),           // #DCD7BA fuji white
-                muted: Color::Rgb(114, 113, 105),        // #727169 fuji gray
-                modal_bg: Color::Rgb(31, 31, 40),        // #1F1F28 sumi ink 3
-                success: Color::Rgb(152, 187, 108),      // #98BB6C spring green
+                accent: Color::Rgb(126, 156, 216),       // #7E9CD8 crystalBlue
+                secondary: Color::Rgb(149, 127, 184),    // #957FB8 oniViolet
+                complementary: Color::Rgb(230, 195, 132),// #E6C384 carpYellow
+                fg: Color::Rgb(220, 215, 186),           // #DCD7BA fujiWhite
+                muted: Color::Rgb(138, 137, 128),        // #8A8980 readable sumi gray
+                modal_bg: Color::Rgb(26, 26, 34),        // #1A1A22 sumiInk2
+                success: Color::Rgb(152, 187, 108),      // #98BB6C springGreen
                 warning: Color::Rgb(230, 195, 132),
-                error: Color::Rgb(228, 104, 118),        // #E46876 wave red
-                card_thinking_bg: Color::Rgb(34, 34, 46),
-                card_ok_bg: Color::Rgb(30, 38, 32),
-                card_err_bg: Color::Rgb(48, 28, 32),
-                card_quiet_bg: Color::Rgb(31, 31, 40),
+                error: Color::Rgb(228, 104, 118),        // #E46876 waveRed
+                card_thinking_bg: Color::Rgb(34, 34, 44),// #22222C sumiInk3
+                card_ok_bg: Color::Rgb(34, 46, 36),
+                card_err_bg: Color::Rgb(54, 30, 34),
+                card_quiet_bg: Color::Rgb(37, 37, 48),   // #252530 sumiInk4
                 branch: Color::Rgb(152, 187, 108),
                 git_status: Color::Rgb(230, 195, 132),
-                input: Color::Rgb(127, 180, 202),
+                input: Color::Rgb(127, 180, 202),        // #7FB4CA springBlue
                 output: Color::Rgb(149, 127, 184),
                 cache: Color::Rgb(152, 187, 108),
                 tps: Color::Rgb(126, 156, 216),
-                cost: Color::Rgb(255, 160, 102),
-                context: Color::Rgb(220, 215, 186),
+                cost: Color::Rgb(255, 160, 102),         // #FFA066 surimiOrange
+                context: Color::Rgb(168, 165, 148),
             },
             ThemeId::TokyoNight => ThemePalette {
                 accent: Color::Rgb(125, 207, 255),       // #7DCFFF electric sky

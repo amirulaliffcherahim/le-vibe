@@ -1654,7 +1654,8 @@ pub(crate) fn spawn_tui_worker(
                         codemode: codemode_setting.clone(),
                         steering_queue: Some(Arc::clone(&steering_queue)),
                     };
-                    let mut first_delta_at: Option<Instant> = None;
+                    let mut stream_ms: u128 = 0;
+                    let mut stream_start: Option<Instant> = None;
                     let mut last_delta_at: Option<Instant> = None;
                     let res = run_turn_loop_cancellable(
                         &mut bridge,
@@ -1666,13 +1667,18 @@ pub(crate) fn spawn_tui_worker(
                         &cfg,
                         &prompt,
                         |ev| {
-                            if matches!(
-                                ev,
-                                AgentEvent::TextDelta { .. } | AgentEvent::ThinkingDelta { .. }
-                            ) {
-                                let now = Instant::now();
-                                first_delta_at.get_or_insert(now);
-                                last_delta_at = Some(now);
+                            match &ev {
+                                AgentEvent::TextDelta { .. } | AgentEvent::ThinkingDelta { .. } => {
+                                    let now = Instant::now();
+                                    stream_start.get_or_insert(now);
+                                    last_delta_at = Some(now);
+                                }
+                                AgentEvent::ToolCallStart { .. } | AgentEvent::ToolCallEnd { .. } => {
+                                    if let (Some(s), Some(e)) = (stream_start.take(), last_delta_at.take()) {
+                                        stream_ms += e.duration_since(s).as_millis();
+                                    }
+                                }
+                                _ => {}
                             }
                             let _ = msg_tx.send(WorkerMsg::Agent(ev));
                         },
@@ -1728,16 +1734,13 @@ pub(crate) fn spawn_tui_worker(
                                 .unwrap_or_else(|_| "User cancelled.".to_string())
                         },
                     );
-                    let tps = match (first_delta_at, last_delta_at) {
-                        (Some(start), Some(end)) => {
-                            let ms = end.duration_since(start).as_millis() as f64;
-                            if ms >= 250.0 {
-                                Some(res.as_ref().map(|r| r.usage.output_tokens as f64).unwrap_or(0.0) / (ms / 1000.0))
-                            } else {
-                                None
-                            }
-                        }
-                        _ => None,
+                    if let (Some(s), Some(e)) = (stream_start.take(), last_delta_at.take()) {
+                        stream_ms += e.duration_since(s).as_millis();
+                    }
+                    let tps = if stream_ms >= 250 {
+                        Some(res.as_ref().map(|r| r.usage.output_tokens as f64).unwrap_or(0.0) / (stream_ms as f64 / 1000.0))
+                    } else {
+                        None
                     };
                     let todo_snapshot: Vec<(u64, String, String)> = todos
                         .items()

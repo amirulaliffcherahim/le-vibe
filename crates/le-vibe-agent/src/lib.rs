@@ -139,11 +139,25 @@ pub fn sanitize_messages_for_provider(provider: &str, messages: &mut Vec<ChatMes
             normalized.push(msg);
             let mut j = i + 1;
             let mut seen_ids: Vec<String> = Vec::new();
-            while j < messages.len() && messages[j].role == "tool" {
-                if let Some(id) = &messages[j].tool_call_id {
-                    seen_ids.push(id.clone());
+            let mut deferred: Vec<ChatMessage> = Vec::new();
+            // Scan past non-tool messages (interrupt/steering user turns recorded
+            // between a tool call and its results) so tool results stay glued to
+            // the assistant message that issued them. Strict providers (Mistral,
+            // vibe) 400 with "Unexpected role 'tool'" if a user message separates
+            // the assistant tool_calls from their results.
+            while j < messages.len() {
+                if messages[j].role == "tool" {
+                    if let Some(id) = &messages[j].tool_call_id {
+                        seen_ids.push(id.clone());
+                    }
+                    normalized.push(messages[j].clone());
+                } else if matches!(messages[j].role.as_str(), "user" | "assistant")
+                    && messages[j].tool_calls.is_empty()
+                {
+                    deferred.push(messages[j].clone());
+                } else {
+                    break;
                 }
-                normalized.push(messages[j].clone());
                 j += 1;
             }
             for (id, name) in expected_ids {
@@ -158,6 +172,9 @@ pub fn sanitize_messages_for_provider(provider: &str, messages: &mut Vec<ChatMes
                     });
                 }
             }
+            // Re-emit deferred user/assistant messages only once every pending
+            // tool result (real or [interrupted] stub) precedes them.
+            normalized.extend(deferred);
             i = j;
             continue;
         }
@@ -1577,6 +1594,63 @@ mod tests {
         assert_eq!(msgs[1].role, "tool");
         assert_eq!(msgs[1].content, "[interrupted]");
         assert_eq!(msgs[1].tool_call_id.as_deref(), Some("tc_1"));
+    }
+
+    #[test]
+    fn interrupted_tool_results_stay_glued_before_intervening_user_turn() {
+        let mk_user = |c: &str| ChatMessage {
+            role: "user".into(),
+            content: c.into(),
+            reasoning_content: None,
+            tool_calls: vec![],
+            tool_call_id: None,
+            name: None,
+        };
+        let mk_tool = |id: &str| ChatMessage {
+            role: "tool".into(),
+            content: "ok".into(),
+            reasoning_content: None,
+            tool_calls: vec![],
+            tool_call_id: Some(id.into()),
+            name: Some("read".into()),
+        };
+        let mut msgs = vec![
+            ChatMessage {
+                role: "assistant".into(),
+                content: String::new(),
+                reasoning_content: None,
+                tool_calls: vec![
+                    ToolCall {
+                        id: "tc_1".into(),
+                        name: "read".into(),
+                        arguments: json!({"path": "README.md"}),
+                        thought_signature: None,
+                    },
+                    ToolCall {
+                        id: "tc_2".into(),
+                        name: "ls".into(),
+                        arguments: json!({}),
+                        thought_signature: None,
+                    },
+                ],
+                tool_call_id: None,
+                name: None,
+            },
+            mk_user("stop, do this instead"),
+            mk_tool("tc_1"),
+        ];
+        sanitize_messages_for_provider("vibe", &mut msgs);
+        // Ordering must be: assistant(tool_calls) -> tool tc_1 -> tool [interrupted] tc_2 -> user
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[0].role, "assistant");
+        assert_eq!(msgs[1].role, "tool");
+        assert_eq!(msgs[1].tool_call_id.as_deref(), Some("tc_1"));
+        assert_eq!(msgs[1].content, "ok");
+        assert_eq!(msgs[2].role, "tool");
+        assert_eq!(msgs[2].tool_call_id.as_deref(), Some("tc_2"));
+        assert_eq!(msgs[2].content, "[interrupted]");
+        assert_eq!(msgs[3].role, "user");
+        assert_eq!(msgs[3].content, "stop, do this instead");
     }
 
     #[test]

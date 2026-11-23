@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Padding, Paragraph, Wrap};
 
 use crate::commands::SlashCommandItem;
 use crate::mode::{ALL_MODES, ALL_SHELLS};
@@ -32,14 +32,15 @@ pub(crate) fn draw_slash_popup(
     selected_idx: usize,
     theme: ThemeId,
 ) {
-    let accent = theme.accent();
+    let pal = theme.palette();
+    let accent = pal.accent;
     let max_h = editor_area.y.clamp(3, 16);
     let height = (matches.len() as u16 + 2).min(max_h);
     let y = editor_area.y.saturating_sub(height);
     let popup_area = Rect {
-        x: editor_area.x + 1,
+        x: editor_area.x,
         y,
-        width: editor_area.width.saturating_sub(2),
+        width: editor_area.width,
         height,
     };
     let inner_w = popup_area.width.saturating_sub(2) as usize;
@@ -94,15 +95,18 @@ pub(crate) fn draw_slash_popup(
         .collect();
 
     let title = truncate_ellipsis(
-        " Commands (↑/↓ navigate · Tab complete · Enter run) ",
+        " Commands (↑/↓ · Tab complete · Enter run) ",
         inner_w,
     );
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
-            .title(Span::styled(title, Style::default().fg(accent))),
-    );
+    let list = List::new(items)
+        .style(Style::default().bg(pal.modal_bg))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(pal.muted))
+                .style(Style::default().bg(pal.modal_bg))
+                .title(Span::styled(title, Style::default().fg(accent))),
+        );
     frame.render_widget(list, popup_area);
 }
 
@@ -113,14 +117,15 @@ pub(crate) fn draw_at_file_popup(
     selected_idx: usize,
     theme: ThemeId,
 ) {
-    let accent = theme.accent();
+    let pal = theme.palette();
+    let accent = pal.accent;
     let max_h = editor_area.y.clamp(3, 14);
     let height = (files.len() as u16 + 2).min(max_h);
     let y = editor_area.y.saturating_sub(height);
     let popup_area = Rect {
-        x: editor_area.x + 1,
+        x: editor_area.x,
         y,
-        width: editor_area.width.saturating_sub(2),
+        width: editor_area.width,
         height,
     };
     let inner_w = popup_area.width.saturating_sub(2) as usize;
@@ -152,13 +157,16 @@ pub(crate) fn draw_at_file_popup(
             ]))
         })
         .collect();
-    let title = truncate_ellipsis(" Files (@path · ↑/↓ navigate · Tab/Enter insert) ", inner_w);
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
-            .title(Span::styled(title, Style::default().fg(accent))),
-    );
+    let title = truncate_ellipsis(" Files (@path · ↑/↓ · Tab/Enter insert) ", inner_w);
+    let list = List::new(items)
+        .style(Style::default().bg(pal.modal_bg))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(pal.muted))
+                .style(Style::default().bg(pal.modal_bg))
+                .title(Span::styled(title, Style::default().fg(accent))),
+        );
     frame.render_widget(list, popup_area);
 }
 
@@ -200,9 +208,9 @@ pub(crate) fn draw_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         | ActiveModal::TrustModal => return,
         ActiveModal::ModelPicker => {
             let base = if state.scope_view {
-                " Scoped Models · Tab: all · Space: pin · Ctrl+S: save · Type to filter · Esc "
+                " Scoped Models · Tab: all · Space: pin · Ctrl+S: save "
             } else {
-                " All Models · Tab: scoped · Space: pin · Ctrl+S: save · Type to filter · Esc "
+                " Models · Tab: scoped · Space: pin · Ctrl+S: save · Type to filter "
             };
             let title = if state.modal_filter.is_empty() {
                 base.to_string()
@@ -508,15 +516,20 @@ fn draw_approval_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         };
         lines.push(Line::from(Span::styled(format!("{ptr}{opt}"), style)));
     }
-    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(pal.warning))
-            .title(Span::styled(
-                " Permission Required (↑/↓ Enter · 1-4 · Esc deny) ",
-                Style::default().fg(pal.warning).add_modifier(Modifier::BOLD),
-            )),
-    );
+    let paragraph = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .style(Style::default().bg(pal.modal_bg))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .padding(Padding::horizontal(1))
+                .border_style(Style::default().fg(pal.warning))
+                .style(Style::default().bg(pal.modal_bg))
+                .title(Span::styled(
+                    " Permission Required (↑/↓ Enter · 1-4 · Esc deny) ",
+                    Style::default().fg(pal.warning).add_modifier(Modifier::BOLD),
+                )),
+        );
     frame.render_widget(paragraph, popup);
 }
 
@@ -573,15 +586,20 @@ fn draw_question_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         Span::styled(state.question_custom.clone(), Style::default().fg(Color::White)),
     ]));
 
-    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(pal.accent))
-            .title(Span::styled(
-                format!(" {header} (↑/↓ Enter · Esc cancel) "),
-                Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
-            )),
-    );
+    let paragraph = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .style(Style::default().bg(pal.modal_bg))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .padding(Padding::horizontal(1))
+                .border_style(Style::default().fg(pal.accent))
+                .style(Style::default().bg(pal.modal_bg))
+                .title(Span::styled(
+                    format!(" {header} (↑/↓ Enter · Esc cancel) "),
+                    Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
+                )),
+        );
     frame.render_widget(paragraph, popup);
 }
 
@@ -649,13 +667,17 @@ fn draw_usage_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         }
     }
 
+    let pal = state.theme.palette();
     let paragraph = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((state.usage_scroll, 0))
+        .style(Style::default().bg(pal.modal_bg))
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .padding(Padding::horizontal(1))
                 .border_style(Style::default().fg(accent))
+                .style(Style::default().bg(pal.modal_bg))
                 .title(Span::styled(
                     title,
                     Style::default().fg(accent).add_modifier(Modifier::BOLD),
@@ -773,6 +795,7 @@ fn draw_text_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .padding(Padding::horizontal(1))
                 .border_style(Style::default().fg(accent))
                 .style(Style::default().bg(pal.modal_bg))
                 .title(Span::styled(
@@ -838,6 +861,7 @@ fn draw_trust_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .padding(Padding::horizontal(1))
                 .border_style(Style::default().fg(pal.warning))
                 .style(Style::default().bg(pal.modal_bg))
                 .title(Span::styled(

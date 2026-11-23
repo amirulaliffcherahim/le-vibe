@@ -975,6 +975,16 @@ impl MemoryRagStore {
         out.join("\n\n---\n\n")
     }
 
+    /// Exact-key lookup in memory entries (used for frozen per-model profile notes).
+    pub fn read_by_key(&self, key: &str) -> Option<String> {
+        let (entries, _) = self.load_entries_and_vectors("memory");
+        entries
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some(key))
+            .map(|e| e.body.trim().to_string())
+            .filter(|b| !b.is_empty())
+    }
+
     pub fn read_target(&self, target: &str) -> String {
         match target {
             "daily" => {

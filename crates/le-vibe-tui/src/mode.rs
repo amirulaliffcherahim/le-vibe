@@ -260,6 +260,19 @@ pub fn build_system_prompt(
     prompt
 }
 
+/// Append a frozen, capped (<=400 bytes) per-model adjustment note to the dynamic suffix of
+/// the system prompt so static KV-cache prefix bytes remain identical across turns.
+pub fn append_model_profile(prompt: &mut String, model_key: &str, note: &str) {
+    let trimmed = note.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    prompt.push_str(&format!(
+        "\n\n<model_profile model=\"{model_key}\">\n{}\n</model_profile>",
+        cap_utf8(trimmed, 400)
+    ));
+}
+
 pub const ALL_SHELLS: &[(&str, &str)] = &[
     ("powershell", "Windows PowerShell (powershell -NoProfile -Command)"),
     ("pwsh", "PowerShell 7+ (pwsh -NoProfile -Command)"),

@@ -545,12 +545,24 @@ pub(crate) fn build_optimization_digest(
             .join(", ")
     };
 
+    let rag = le_vibe_tools::memory::MemoryRagStore::open_default();
+    let learn_report = crate::learn::mine_sessions(sessions_root, &rag, 20);
+    let learn_summary = crate::learn::format_learn_report(&learn_report);
+    let rag_stats = rag.stats_summary();
+
     format!(
-        "Analyze my recent le-vibe sessions and event logs below, then propose 3-6 concrete, high-impact optimizations to le-vibe itself.\n\
+        "Analyze my recent le-vibe sessions, Headroom compression stats, `/learn` friction report, and event logs below, then propose 3-6 concrete, high-impact optimizations to le-vibe itself.\n\
          Group suggestions into:\n\
-         1. **Hot-reloadable updates (apply + run `/reload`, no restart)**: `~/.le-vibe/SYSTEM.md`, `~/.le-vibe/policy.json`, `~/.le-vibe/settings.json`, `~/.le-vibe/extensions/*.py`, `.le-vibe/skills/*/SKILL.md`\n\
-         2. **Rust harness updates (`{self_repo}/crates/*`)**: exact file paths and changes.\n\
-         Number each suggestion (#1, #2, ...) so I can reply `apply #1` to have you edit le-vibe directly.\n\n\
+         1. **Model profile adjustments (saved via `memory_write` with `key=\"model:<provider>/<model>\"`, <=400 bytes)**: concise per-model behavior tweaks auto-loaded on session start / model switch without busting KV-cache.\n\
+         2. **Hot-reloadable RAG & config updates (apply + run `/reload`, no restart)**: `MEMORY.md` (`key=\"learn:...\"`), `~/.le-vibe/SYSTEM.md`, `~/.le-vibe/policy.json`, `~/.le-vibe/settings.json`, `~/.le-vibe/extensions/*.py`, `.le-vibe/skills/*/SKILL.md`.\n\
+         3. **Rust harness updates (`{self_repo}/crates/*`)**: exact file paths and changes.\n\
+         Number each suggestion (#1, #2, ...) so I can reply `apply #1` to have you apply it directly. Skip items already marked `[known]` in `<learn_report>`.\n\n\
+         <learn_report>\n\
+         {learn_summary}\n\
+         </learn_report>\n\n\
+         <rag_memory>\n\
+         {rag_stats}\n\
+         </rag_memory>\n\n\
          <session_telemetry>\n\
          sessions_analyzed: {}\n\
          total_user_turns: {total_user_turns}\n\

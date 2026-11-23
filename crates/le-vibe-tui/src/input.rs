@@ -93,7 +93,8 @@ fn modal_len(state: &TuiState) -> usize {
         ActiveModal::QuestionModal => state
             .question_prompt
             .as_ref()
-            .map(|(_, _, opts)| opts.len() + 1)
+            .and_then(|s| s.active())
+            .map(|q| q.options.len() + 1)
             .unwrap_or(1),
     }
 }
@@ -349,32 +350,117 @@ pub fn handle_key_event(state: &mut TuiState, key: crossterm::event::KeyEvent) -
             KeyCode::Esc => {
                 state.modal = ActiveModal::None;
                 state.question_prompt = None;
-                state.question_custom.clear();
                 return Ok(TuiAction::QuestionAnswer("User cancelled question.".to_string()));
             }
             KeyCode::Up => state.modal_idx = state.modal_idx.saturating_sub(1),
             KeyCode::Down if state.modal_idx + 1 < total => state.modal_idx += 1,
-            KeyCode::Backspace if state.modal_idx == custom_idx => {
-                state.question_custom.pop();
+            KeyCode::Left | KeyCode::BackTab => {
+                if let Some(session) = state.question_prompt.as_mut()
+                    && session.items.len() > 1
+                {
+                    session.active_idx = if session.active_idx == 0 {
+                        session.items.len() - 1
+                    } else {
+                        session.active_idx - 1
+                    };
+                    state.modal_idx = 0;
+                }
             }
-            KeyCode::Char(c) if state.modal_idx == custom_idx => {
-                state.question_custom.push(c);
+            KeyCode::Right | KeyCode::Tab => {
+                if let Some(session) = state.question_prompt.as_mut()
+                    && session.items.len() > 1
+                {
+                    session.active_idx = (session.active_idx + 1) % session.items.len();
+                    state.modal_idx = 0;
+                }
             }
-            KeyCode::Enter => {
-                let answer = if state.modal_idx == custom_idx {
-                    state.question_custom.trim().to_string()
-                } else {
-                    state
+            KeyCode::Char(' ')
+                if state.modal_idx < custom_idx
+                    && state
                         .question_prompt
                         .as_ref()
-                        .and_then(|(_, _, opts)| opts.get(state.modal_idx))
-                        .map(|(label, _)| label.clone())
-                        .unwrap_or_default()
-                };
-                state.modal = ActiveModal::None;
-                state.question_prompt = None;
-                state.question_custom.clear();
-                return Ok(TuiAction::QuestionAnswer(answer));
+                        .and_then(|s| s.active())
+                        .is_some_and(|q| q.multi_select) =>
+            {
+                if let Some(item) = state.question_prompt.as_mut().and_then(|s| s.active_mut())
+                    && let Some(flag) = item.selected.get_mut(state.modal_idx)
+                {
+                    *flag = !*flag;
+                }
+            }
+            KeyCode::Char(c @ '1'..='9') if state.modal_idx != custom_idx => {
+                let idx = (c as usize) - ('1' as usize);
+                if idx < total {
+                    state.modal_idx = idx;
+                }
+            }
+            KeyCode::Backspace if state.modal_idx == custom_idx => {
+                if let Some(item) = state.question_prompt.as_mut().and_then(|s| s.active_mut()) {
+                    item.custom_text.pop();
+                }
+            }
+            KeyCode::Char(c) if state.modal_idx == custom_idx => {
+                if let Some(item) = state.question_prompt.as_mut().and_then(|s| s.active_mut()) {
+                    item.custom_text.push(c);
+                }
+            }
+            KeyCode::Enter => {
+                let mut final_payload: Option<String> = None;
+                if let Some(session) = state.question_prompt.as_mut() {
+                    if let Some(item) = session.active_mut() {
+                        let chosen = if state.modal_idx == custom_idx {
+                            item.custom_text.trim().to_string()
+                        } else if item.multi_select {
+                            let picked: Vec<String> = item
+                                .options
+                                .iter()
+                                .enumerate()
+                                .filter(|(i, _)| item.selected.get(*i).copied().unwrap_or(false))
+                                .map(|(_, o)| o.label.clone())
+                                .collect();
+                            if picked.is_empty() {
+                                item.options
+                                    .get(state.modal_idx)
+                                    .map(|o| o.label.clone())
+                                    .unwrap_or_default()
+                            } else {
+                                picked.join(", ")
+                            }
+                        } else {
+                            item.options
+                                .get(state.modal_idx)
+                                .map(|o| o.label.clone())
+                                .unwrap_or_default()
+                        };
+                        item.answer = Some(chosen);
+                    }
+                    if session.items.len() == 1 {
+                        final_payload = session.items[0].answer.clone();
+                    } else if let Some(next_unanswered) =
+                        session.items.iter().position(|q| q.answer.is_none())
+                    {
+                        session.active_idx = next_unanswered;
+                        state.modal_idx = 0;
+                    } else {
+                        let pairs: Vec<String> = session
+                            .items
+                            .iter()
+                            .map(|q| {
+                                format!(
+                                    "{}:{}",
+                                    json_quote(&q.header),
+                                    json_quote(q.answer.as_deref().unwrap_or(""))
+                                )
+                            })
+                            .collect();
+                        final_payload = Some(format!("{{{}}}", pairs.join(",")));
+                    }
+                }
+                if let Some(answer) = final_payload {
+                    state.modal = ActiveModal::None;
+                    state.question_prompt = None;
+                    return Ok(TuiAction::QuestionAnswer(answer));
+                }
             }
             _ => {}
         }
@@ -599,6 +685,19 @@ pub fn handle_key_event(state: &mut TuiState, key: crossterm::event::KeyEvent) -
             KeyCode::Char('l') => return Ok(TuiAction::Submit("/clear".to_string())),
             KeyCode::Char('v') => return Ok(TuiAction::PasteClipboard),
             KeyCode::Char('p') => return Ok(TuiAction::CycleModel),
+            KeyCode::Char('b') => {
+                if state.todos.is_empty() {
+                    state.show_todo_pane = !state.show_todo_pane;
+                } else if !state.show_todo_pane {
+                    state.show_todo_pane = true;
+                    state.todo_focus = true;
+                    state.todo_idx = state.todo_idx.min(state.todos.len().saturating_sub(1));
+                } else {
+                    state.todo_focus = !state.todo_focus;
+                    state.todo_idx = state.todo_idx.min(state.todos.len().saturating_sub(1));
+                }
+                return Ok(TuiAction::None);
+            }
             KeyCode::Char('t') => {
                 state.show_thinking = !state.show_thinking;
                 return Ok(TuiAction::None);
@@ -642,6 +741,35 @@ pub fn handle_key_event(state: &mut TuiState, key: crossterm::event::KeyEvent) -
                 return Ok(TuiAction::None);
             }
             _ => {}
+        }
+    }
+
+    if state.todo_focus {
+        if state.todos.is_empty() {
+            state.todo_focus = false;
+        } else {
+            let max_idx = state.todos.len().saturating_sub(1);
+            state.todo_idx = state.todo_idx.min(max_idx);
+            match key.code {
+                KeyCode::Esc => state.todo_focus = false,
+                KeyCode::Up => state.todo_idx = state.todo_idx.saturating_sub(1),
+                KeyCode::Down if state.todo_idx < max_idx => state.todo_idx += 1,
+                KeyCode::Char(' ') | KeyCode::Enter => {
+                    let (id, _, cur_status) = &state.todos[state.todo_idx];
+                    let next_status = match cur_status.as_str() {
+                        "pending" => "in_progress",
+                        "in_progress" => "completed",
+                        _ => "pending",
+                    };
+                    return Ok(TuiAction::TodoCycle(*id, next_status.to_string()));
+                }
+                KeyCode::Char('d') | KeyCode::Delete => {
+                    let id = state.todos[state.todo_idx].0;
+                    return Ok(TuiAction::TodoDelete(id));
+                }
+                _ => {}
+            }
+            return Ok(TuiAction::None);
         }
     }
 
@@ -841,6 +969,23 @@ pub fn handle_key_event(state: &mut TuiState, key: crossterm::event::KeyEvent) -
     }
 
     Ok(TuiAction::None)
+}
+
+fn json_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 #[cfg(test)]

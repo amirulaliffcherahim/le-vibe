@@ -1,4 +1,4 @@
-use le_vibe_tui::{ActiveModal, TranscriptBlock, TuiState, draw_frame};
+use le_vibe_tui::{ActiveModal, QuestionSession, TranscriptBlock, TuiState, draw_frame};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
@@ -38,7 +38,7 @@ fn renders_all_modals_at_minimum_and_desktop_sizes() {
         "crates/a.rs\n- old\n+ new".into(),
         "requires approval".into(),
     ));
-    state.question_prompt = Some((
+    state.question_prompt = Some(QuestionSession::single(
         "Approach".into(),
         "Which option?".into(),
         vec![("A".into(), "First".into()), ("B".into(), "Second".into())],

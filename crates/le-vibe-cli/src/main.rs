@@ -833,13 +833,8 @@ fn run_interactive_tui(
                     state.modal = ActiveModal::ApprovalModal;
                     state.modal_idx = 0;
                 }
-                WorkerMsg::QuestionNeeded {
-                    header,
-                    question,
-                    options,
-                } => {
-                    state.question_prompt = Some((header, question, options));
-                    state.question_custom.clear();
+                WorkerMsg::QuestionNeeded(session) => {
+                    state.question_prompt = Some(session);
                     state.modal = ActiveModal::QuestionModal;
                     state.modal_idx = 0;
                 }
@@ -1397,6 +1392,22 @@ fn run_interactive_tui(
             TuiAction::QuestionAnswer(answer) => {
                 let _ = question_tx.send(answer);
             }
+            TuiAction::TodoCycle(id, status) => {
+                if let Some(t) = state.todos.iter_mut().find(|(tid, _, _)| *tid == id) {
+                    t.2 = status.clone();
+                }
+                let _ = cmd_tx.send(WorkerCmd::TodoUpdate { id, status });
+            }
+            TuiAction::TodoDelete(id) => {
+                state.todos.retain(|(tid, _, _)| *tid != id);
+                if state.todos.is_empty() {
+                    state.todo_focus = false;
+                    state.todo_idx = 0;
+                } else {
+                    state.todo_idx = state.todo_idx.min(state.todos.len().saturating_sub(1));
+                }
+                let _ = cmd_tx.send(WorkerCmd::TodoDelete(id));
+            }
             TuiAction::SaveScope => {
                 save_scope(&state.scoped_models);
                 state.scope_dirty = false;
@@ -1581,6 +1592,19 @@ fn run_interactive_tui(
                         provider: state.provider.clone(),
                         model: state.model.clone(),
                     });
+                    continue;
+                }
+                if input == "/todos" || input == "/todo" {
+                    if state.todos.is_empty() {
+                        state.show_todo_pane = !state.show_todo_pane;
+                        state.blocks.push(TranscriptBlock::System(
+                            "No tasks yet. The todo pane appears on the right once tasks exist.".to_string(),
+                        ));
+                    } else {
+                        state.show_todo_pane = true;
+                        state.todo_focus = !state.todo_focus;
+                        state.todo_idx = state.todo_idx.min(state.todos.len().saturating_sub(1));
+                    }
                     continue;
                 }
                 if input == "/yolo" {

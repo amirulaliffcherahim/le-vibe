@@ -112,7 +112,62 @@ pub enum ActiveModal {
 
 pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-pub type QuestionPrompt = (String, String, Vec<(String, String)>);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestionOption {
+    pub label: String,
+    pub description: String,
+    pub preview: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestionItem {
+    pub header: String,
+    pub question: String,
+    pub multi_select: bool,
+    pub options: Vec<QuestionOption>,
+    pub selected: Vec<bool>,
+    pub custom_text: String,
+    pub answer: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestionSession {
+    pub items: Vec<QuestionItem>,
+    pub active_idx: usize,
+}
+
+impl QuestionSession {
+    pub fn single(header: String, question: String, options: Vec<(String, String)>) -> Self {
+        let len = options.len();
+        Self {
+            items: vec![QuestionItem {
+                header,
+                question,
+                multi_select: false,
+                options: options
+                    .into_iter()
+                    .map(|(label, description)| QuestionOption {
+                        label,
+                        description,
+                        preview: None,
+                    })
+                    .collect(),
+                selected: vec![false; len],
+                custom_text: String::new(),
+                answer: None,
+            }],
+            active_idx: 0,
+        }
+    }
+
+    pub fn active(&self) -> Option<&QuestionItem> {
+        self.items.get(self.active_idx)
+    }
+
+    pub fn active_mut(&mut self) -> Option<&mut QuestionItem> {
+        self.items.get_mut(self.active_idx)
+    }
+}
 
 pub struct TuiState {
     pub version: String,
@@ -146,8 +201,7 @@ pub struct TuiState {
     pub approval_prompt: Option<(String, String, String)>,
     pub approval_opened_at: Option<Instant>,
     pub collapsed_pastes: Vec<(String, String)>,
-    pub question_prompt: Option<QuestionPrompt>,
-    pub question_custom: String,
+    pub question_prompt: Option<QuestionSession>,
     pub spinner_tick: usize,
     pub reduced_motion: bool,
     pub usage_lines: Vec<String>,
@@ -182,6 +236,9 @@ pub struct TuiState {
     pub show_thinking: bool,
     pub expand_tools: bool,
     pub todos: Vec<(u64, String, String)>,
+    pub show_todo_pane: bool,
+    pub todo_focus: bool,
+    pub todo_idx: usize,
     pub history: Vec<String>,
     pub history_idx: Option<usize>,
     pub modal_filter: String,
@@ -251,7 +308,6 @@ impl TuiState {
             approval_opened_at: None,
             collapsed_pastes: Vec::new(),
             question_prompt: None,
-            question_custom: String::new(),
             spinner_tick: 0,
             reduced_motion,
             usage_lines: Vec::new(),
@@ -278,6 +334,9 @@ impl TuiState {
             show_thinking: true,
             expand_tools: false,
             todos: Vec::new(),
+            show_todo_pane: true,
+            todo_focus: false,
+            todo_idx: 0,
             history: Vec::new(),
             history_idx: None,
             modal_filter: String::new(),
@@ -694,6 +753,8 @@ pub enum TuiAction {
     ConfigCycleKey(String),
     ApprovalDecision(usize),
     QuestionAnswer(String),
+    TodoCycle(u64, String),
+    TodoDelete(u64),
     ToggleDebug,
     DebugClear,
     DebugCycleFilter,

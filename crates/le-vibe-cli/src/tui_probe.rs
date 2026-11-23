@@ -3,8 +3,8 @@
 use std::io::{self, Read, Write};
 
 use le_vibe_tui::{
-    ActiveModal, AgentMode, ThemeId, TranscriptBlock, TuiAction, TuiState, apply_wheel_scroll,
-    press, render_frame,
+    ActiveModal, AgentMode, QuestionItem, QuestionOption, QuestionSession, ThemeId,
+    TranscriptBlock, TuiAction, TuiState, apply_wheel_scroll, press, render_frame,
 };
 
 /// What the probe should do with one line of the script.
@@ -447,6 +447,8 @@ fn action_label(action: &TuiAction) -> String {
         TuiAction::ConfigCycleKey(key) => format!("config-cycle {key}"),
         TuiAction::ApprovalDecision(idx) => format!("approval {idx}"),
         TuiAction::QuestionAnswer(answer) => format!("answer {answer:?}"),
+        TuiAction::TodoCycle(id, status) => format!("todo-cycle {id} -> {status}"),
+        TuiAction::TodoDelete(id) => format!("todo-delete {id}"),
         TuiAction::ToggleDebug => "toggle-debug".to_string(),
         TuiAction::DebugClear => "debug-clear".to_string(),
         TuiAction::DebugCycleFilter => "debug-cycle-filter".to_string(),
@@ -498,20 +500,29 @@ fn seed_modal_data(state: &mut TuiState, modal: &ActiveModal) {
             );
         }
         ActiveModal::QuestionModal => {
-            state.question_prompt = Some((
-                "Approach".to_string(),
-                "Which refactor should land first?".to_string(),
-                vec![
-                    (
-                        "wrap tokens".to_string(),
-                        "Rewrite the wrapper around tokens".to_string(),
-                    ),
-                    (
-                        "post-pass".to_string(),
-                        "Fix wrapping after the fact".to_string(),
-                    ),
-                ],
-            ));
+            state.question_prompt = Some(QuestionSession {
+                items: vec![QuestionItem {
+                    header: "Approach".to_string(),
+                    question: "Which refactor should land first?".to_string(),
+                    multi_select: false,
+                    options: vec![
+                        QuestionOption {
+                            label: "wrap tokens".to_string(),
+                            description: "Rewrite the wrapper around tokens".to_string(),
+                            preview: Some("fn wrap_tokens() {\n  // clean\n}".to_string()),
+                        },
+                        QuestionOption {
+                            label: "post-pass".to_string(),
+                            description: "Fix wrapping after the fact".to_string(),
+                            preview: None,
+                        },
+                    ],
+                    selected: vec![false, false],
+                    custom_text: String::new(),
+                    answer: None,
+                }],
+                active_idx: 0,
+            });
         }
         ActiveModal::TrustModal => {
             state.trust_prompt_path = state.cwd.clone();

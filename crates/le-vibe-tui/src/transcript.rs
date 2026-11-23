@@ -5,7 +5,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
 
 use crate::commands::filter_slash_commands_with_dynamic;
 use crate::editor::{draw_editor, wrap_editor_lines};
@@ -40,7 +40,16 @@ pub fn draw_frame(frame: &mut Frame<'_>, state: &TuiState) {
         ])
         .split(area);
 
-    draw_transcript(frame, chunks[0], state);
+    if state.show_todo_pane && !state.todos.is_empty() && area.width >= 88 {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(52), Constraint::Length(32)])
+            .split(chunks[0]);
+        draw_transcript(frame, cols[0], state);
+        draw_todo_pane(frame, cols[1], state);
+    } else {
+        draw_transcript(frame, chunks[0], state);
+    }
     draw_status_strip(frame, chunks[2], state);
     draw_editor(frame, chunks[3], state);
     draw_footer(frame, chunks[4], state);
@@ -749,6 +758,68 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             cell.set_fg(pal.accent);
         }
     }
+}
+
+fn draw_todo_pane(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let pal = state.theme.palette();
+    let total = state.todos.len();
+    let done = state.todos.iter().filter(|(_, _, s)| s == "completed").count();
+    let border_color = if state.todo_focus { pal.accent } else { pal.muted };
+    let title = format!(" Tasks ({done}/{total}) ");
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (idx, (_, subj, status)) in state.todos.iter().enumerate() {
+        let is_sel = state.todo_focus && idx == state.todo_idx;
+        let (glyph, g_col) = match status.as_str() {
+            "completed" => ("✓", pal.success),
+            "in_progress" => ("▸", pal.accent),
+            _ => ("○", pal.muted),
+        };
+        let text_style = if is_sel {
+            Style::default()
+                .fg(pal.accent)
+                .bg(pal.card_quiet_bg)
+                .add_modifier(Modifier::BOLD)
+        } else if status == "completed" {
+            Style::default().fg(pal.muted).add_modifier(Modifier::CROSSED_OUT)
+        } else if status == "in_progress" {
+            Style::default().fg(pal.fg).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(pal.fg)
+        };
+        let ptr = if is_sel { "▸ " } else { "  " };
+        lines.push(Line::from(vec![
+            Span::styled(ptr, Style::default().fg(pal.accent)),
+            Span::styled(format!("{glyph} "), Style::default().fg(g_col)),
+            Span::styled(subj.clone(), text_style),
+        ]));
+    }
+    lines.push(Line::from(""));
+    let hint = if state.todo_focus {
+        "↑/↓ · Space: cycle · d: del · Esc"
+    } else {
+        "Ctrl+B or /todos to interact"
+    };
+    lines.push(Line::from(Span::styled(
+        hint,
+        Style::default().fg(pal.muted),
+    )));
+
+    let pane = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .style(Style::default().bg(pal.modal_bg))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .padding(Padding::horizontal(1))
+                .border_style(Style::default().fg(border_color))
+                .style(Style::default().bg(pal.modal_bg))
+                .title(Span::styled(
+                    title,
+                    Style::default().fg(border_color).add_modifier(Modifier::BOLD),
+                )),
+        );
+    frame.render_widget(pane, area);
 }
 
 fn draw_status_strip(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {

@@ -5,8 +5,8 @@ use le_vibe_pybridge::{ChatMessage, CompletionRequest, PolicyPort, ProviderPort,
 use le_vibe_telemetry::TelemetryRecorder;
 use le_vibe_tools::TodoStore;
 use le_vibe_tui::{
-    AgentMode, QuestionItem, QuestionOption, QuestionSession, TuiState, build_system_prompt,
-    format_tokens,
+    AgentMode, QuestionItem, QuestionOption, QuestionSession, TuiState, append_model_profile,
+    build_system_prompt, format_tokens,
 };
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -695,8 +695,10 @@ pub(crate) fn spawn_tui_worker(
         let mut todos = TodoStore::new();
         let output_store = Arc::new(Mutex::new(OutputStore::new()));
         let mut codemode_setting = "off".to_string();
-        // Freeze `<memory_toc>` for the session so mid-session `memory_write` never busts prompt cache.
+        // Freeze `<memory_toc>` and `<model_profile>` per session/model so mid-session
+        // `memory_write` never busts the provider KV-cache prefix.
         let mut session_memory_toc = le_vibe_tools::memory::MemoryRagStore::open_default().build_toc(25);
+        let mut session_model_note: Option<(String, Option<String>)> = None;
         let mcp_started = Instant::now();
         let mcp_paths: Vec<std::path::PathBuf> = default_mcp_paths()
             .into_iter()
@@ -760,6 +762,7 @@ pub(crate) fn spawn_tui_worker(
                         let _ = bridge.reload_extensions();
                         session_memory_toc =
                             le_vibe_tools::memory::MemoryRagStore::open_default().build_toc(25);
+                        session_model_note = None;
                         if let Ok(cmds) = bridge.list_extension_commands() {
                             let _ = msg_tx.send(WorkerMsg::PluginCommandsLoaded(cmds));
                         }
@@ -1006,6 +1009,7 @@ pub(crate) fn spawn_tui_worker(
                             let _ = session.append_compaction(&summary);
                             session_memory_toc =
                                 le_vibe_tools::memory::MemoryRagStore::open_default().build_toc(25);
+                            session_model_note = None;
                             let flush_note = if flushed > 0 {
                                 format!(" · saved {flushed} durable memory entry(s) to MEMORY.md")
                             } else {
@@ -1057,6 +1061,7 @@ pub(crate) fn spawn_tui_worker(
                                 session = fresh;
                                 session_memory_toc =
                                     le_vibe_tools::memory::MemoryRagStore::open_default().build_toc(25);
+                                session_model_note = None;
                                 let flush_note = if flushed > 0 {
                                     format!(" · saved {flushed} durable memory entry(s)")
                                 } else {
@@ -1288,6 +1293,7 @@ pub(crate) fn spawn_tui_worker(
                             session = fresh;
                             session_memory_toc =
                                 le_vibe_tools::memory::MemoryRagStore::open_default().build_toc(25);
+                            session_model_note = None;
                             let _ = msg_tx.send(WorkerMsg::SessionReplaced {
                                 blocks: Vec::new(),
                                 notice: format!("Started new session {}", path.display()),
@@ -1649,6 +1655,19 @@ pub(crate) fn spawn_tui_worker(
                         &discovered_skills,
                         &session_memory_toc,
                     );
+                    let model_key = format!("{provider}/{model}");
+                    let cached_note = match &session_model_note {
+                        Some((k, note)) if k == &model_key => note.clone(),
+                        _ => {
+                            let loaded = le_vibe_tools::memory::MemoryRagStore::open_default()
+                                .read_by_key(&format!("model:{model_key}"));
+                            session_model_note = Some((model_key.clone(), loaded.clone()));
+                            loaded
+                        }
+                    };
+                    if let Some(note) = &cached_note {
+                        append_model_profile(&mut sys, &model_key, note);
+                    }
                     if let Some(extra) = &system_prompt_extra
                         && !extra.trim().is_empty()
                     {

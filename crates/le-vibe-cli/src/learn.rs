@@ -461,4 +461,80 @@ mod tests {
         assert!(rendered.contains("vibe/mistral-large-4-0"));
         let _ = fs::remove_dir_all(&tmp);
     }
+
+    #[test]
+    fn pr_c_model_profile_kv_cache_prefix_and_suggestion_digest_benchmark() {
+        let tmp = std::env::temp_dir().join(format!(
+            "le_vibe_prc_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        let sess_dir = tmp.join("sessions");
+        let logs_dir = tmp.join("logs");
+        let mem_dir = tmp.join("memory");
+        fs::create_dir_all(&sess_dir).unwrap();
+        fs::create_dir_all(&logs_dir).unwrap();
+        fs::create_dir_all(&mem_dir).unwrap();
+
+        let rag = MemoryRagStore::open(&mem_dir, &mem_dir);
+        let long_note = "Prefer codemode for multi-file reads; keep edit oldText exact. ".repeat(15);
+        rag.write_memory(
+            "global",
+            "long_term",
+            Some("Model profile: vibe/mistral-large-4-0"),
+            &long_note,
+            vec!["model".into(), "vibe".into(), "mistral".into()],
+            Some("model:vibe/mistral-large-4-0".to_string()),
+        )
+        .unwrap();
+
+        let t0 = Instant::now();
+        let fetched = rag
+            .read_by_key("model:vibe/mistral-large-4-0")
+            .expect("exact model key should resolve");
+        let lookup_us = t0.elapsed().as_micros();
+
+        let base_prompt = le_vibe_tui::build_system_prompt(
+            le_vibe_tui::AgentMode::Normal,
+            "powershell",
+            "C:/repo",
+            "C:/repo",
+            &[],
+            "",
+        );
+        let mut adjusted_prompt = base_prompt.clone();
+        le_vibe_tui::append_model_profile(
+            &mut adjusted_prompt,
+            "vibe/mistral-large-4-0",
+            &fetched,
+        );
+
+        // KV-cache invariant: static prefix must be 100% byte-identical before <model_profile>.
+        assert!(adjusted_prompt.starts_with(&base_prompt));
+        let added_bytes = adjusted_prompt.len() - base_prompt.len();
+        assert!(
+            added_bytes <= 490,
+            "model_profile block must stay capped near 400 bytes, got {added_bytes}"
+        );
+        assert!(adjusted_prompt.contains("<model_profile model=\"vibe/mistral-large-4-0\">"));
+
+        // Verify /suggestion digest integrates <learn_report> + <rag_memory> + Model profile tier.
+        let t1 = Instant::now();
+        let digest = crate::features::build_optimization_digest(&sess_dir, &logs_dir, "C:/repo");
+        let digest_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        assert!(digest.contains("<learn_report>"));
+        assert!(digest.contains("<rag_memory>"));
+        assert!(digest.contains("key=\"model:<provider>/<model>\""));
+
+        println!(
+            "\n=== PR C Interconnected /suggestion & Model-Profile Benchmark ===\n  model_profile lookup : {} us\n  KV-cache prefix match: 100% byte-identical ({} B static prefix preserved)\n  model_profile size   : {} B (capped <=400 B body)\n  /suggestion digest   : {:.2} ms ({} chars, includes <learn_report> + <rag_memory>)",
+            lookup_us,
+            base_prompt.len(),
+            added_bytes,
+            digest_ms,
+            digest.len()
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
 }

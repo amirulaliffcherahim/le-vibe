@@ -58,6 +58,99 @@ fn parse_bold_italic(text: &str, base: Style) -> Vec<Span<'static>> {
     spans
 }
 
+fn split_at_width(text: &str, max_width: usize) -> (&str, &str) {
+    let mut used = 0usize;
+    let mut split_idx = 0usize;
+    for (idx, ch) in text.char_indices() {
+        let mut buf = [0u8; 4];
+        let w = Span::raw(ch.encode_utf8(&mut buf) as &str).width();
+        if split_idx > 0 && used + w > max_width {
+            return text.split_at(idx);
+        }
+        used += w;
+        split_idx = idx + ch.len_utf8();
+        if used >= max_width {
+            return text.split_at(split_idx);
+        }
+    }
+    (text, "")
+}
+
+fn is_table_separator(line: &str) -> bool {
+    let t = line.trim();
+    if !t.contains('|') || !t.contains('-') {
+        return false;
+    }
+    t.chars()
+        .all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t'))
+}
+
+fn parse_table_row(line: &str) -> Vec<String> {
+    let t = line.trim();
+    let inner = t.strip_prefix('|').unwrap_or(t);
+    let inner = inner.strip_suffix('|').unwrap_or(inner);
+    inner.split('|').map(|c| c.trim().to_string()).collect()
+}
+
+fn render_table(rows: &[Vec<String>], pal: &ThemePalette, max_width: usize) -> Vec<Line<'static>> {
+    let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
+    if cols == 0 {
+        return Vec::new();
+    }
+    let mut widths = vec![1usize; cols];
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(Span::raw(cell).width());
+        }
+    }
+    // Cap column widths proportionally if the table exceeds the viewport width.
+    let gaps = cols.saturating_sub(1) * 2;
+    let budget = max_width.saturating_sub(2 + gaps).max(cols * 3);
+    let total: usize = widths.iter().sum();
+    if total > budget {
+        for w in &mut widths {
+            *w = ((*w * budget) / total).max(3);
+        }
+    }
+
+    let mut out = Vec::new();
+    for (r_idx, row) in rows.iter().enumerate() {
+        let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
+        for (c_idx, w) in widths.iter().enumerate() {
+            let cell = row.get(c_idx).map(String::as_str).unwrap_or("");
+            let (fit, rest) = split_at_width(cell, *w);
+            let display = if !rest.is_empty() && *w >= 2 {
+                let (head, _) = split_at_width(cell, w - 1);
+                format!("{head}…")
+            } else {
+                fit.to_string()
+            };
+            let pad = w.saturating_sub(Span::raw(&display).width());
+            let style = if r_idx == 0 {
+                Style::default().fg(pal.accent).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(pal.fg)
+            };
+            spans.push(Span::styled(display, style));
+            if c_idx + 1 < cols {
+                spans.push(Span::raw(" ".repeat(pad + 2)));
+            }
+        }
+        out.push(Line::from(spans));
+        if r_idx == 0 {
+            let mut rule_spans: Vec<Span<'static>> = vec![Span::raw(" ")];
+            for (c_idx, w) in widths.iter().enumerate() {
+                rule_spans.push(Span::styled("─".repeat(*w), Style::default().fg(pal.muted)));
+                if c_idx + 1 < cols {
+                    rule_spans.push(Span::raw("  "));
+                }
+            }
+            out.push(Line::from(rule_spans));
+        }
+    }
+    out
+}
+
 fn push_full_width_line(
     out: &mut Vec<Line<'static>>,
     area_width: usize,
@@ -77,18 +170,17 @@ fn push_full_width_line(
     }
     let mut remaining = clean.as_str();
     while !remaining.is_empty() {
-        let chunk: String = remaining.chars().take(inner_w).collect();
-        let consumed = chunk.len();
-        let pad = area_width.saturating_sub(1 + chunk.chars().count());
+        let (chunk, rest) = split_at_width(remaining, inner_w);
+        let pad = area_width.saturating_sub(1 + Span::raw(chunk).width());
         out.push(
             Line::from(vec![
                 Span::styled(" ", bg_style),
-                Span::styled(chunk, style.bg(bg)),
+                Span::styled(chunk.to_string(), style.bg(bg)),
                 Span::styled(" ".repeat(pad), bg_style),
             ])
             .style(bg_style),
         );
-        remaining = &remaining[consumed..];
+        remaining = rest;
     }
 }
 
@@ -108,8 +200,11 @@ pub fn render_markdown_lines(
     let mut xml_buf: Vec<String> = Vec::new();
     let mut code_buf: Vec<String> = Vec::new();
     let mut fence_lang = String::new();
+    let raw_lines: Vec<&str> = text.lines().collect();
+    let mut i = 0usize;
 
-    for raw in text.lines() {
+    while i < raw_lines.len() {
+        let raw = raw_lines[i];
         let trimmed = raw.trim_start();
         if let Some(lang) = trimmed.strip_prefix("```") {
             in_fence = !in_fence;
@@ -175,6 +270,7 @@ pub fn render_markdown_lines(
                 push_full_width_line(&mut out, width, "", Style::default(), bg);
                 code_buf.clear();
             }
+            i += 1;
             continue;
         }
 
@@ -184,6 +280,25 @@ pub fn render_markdown_lines(
             } else {
                 code_buf.push(raw.to_string());
             }
+            i += 1;
+            continue;
+        }
+
+        if trimmed.contains('|')
+            && i + 1 < raw_lines.len()
+            && is_table_separator(raw_lines[i + 1])
+        {
+            let mut table_rows = vec![parse_table_row(trimmed)];
+            i += 2;
+            while i < raw_lines.len() {
+                let row_line = raw_lines[i].trim();
+                if row_line.is_empty() || !row_line.contains('|') {
+                    break;
+                }
+                table_rows.push(parse_table_row(row_line));
+                i += 1;
+            }
+            out.extend(render_table(&table_rows, pal, width));
             continue;
         }
 
@@ -192,6 +307,7 @@ pub fn render_markdown_lines(
                 " ────────────────────────────────────────",
                 Style::default().fg(Color::DarkGray),
             )));
+            i += 1;
             continue;
         }
 
@@ -203,6 +319,7 @@ pub fn render_markdown_lines(
                     Style::default().fg(pal.secondary).add_modifier(Modifier::BOLD),
                 ),
             ]));
+            i += 1;
             continue;
         }
         if let Some(h) = trimmed.strip_prefix("## ") {
@@ -213,6 +330,7 @@ pub fn render_markdown_lines(
                     Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
                 ),
             ]));
+            i += 1;
             continue;
         }
         if let Some(h) = trimmed.strip_prefix("# ") {
@@ -225,6 +343,7 @@ pub fn render_markdown_lines(
                         .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
                 ),
             ]));
+            i += 1;
             continue;
         }
 
@@ -232,6 +351,7 @@ pub fn render_markdown_lines(
             let mut spans = vec![Span::styled(" │ ", Style::default().fg(pal.secondary))];
             spans.extend(parse_inline_spans(q, Style::default().fg(Color::Gray), code_inline));
             out.push(Line::from(spans));
+            i += 1;
             continue;
         }
 
@@ -243,15 +363,39 @@ pub fn render_markdown_lines(
             ];
             spans.extend(parse_inline_spans(item, base, code_inline));
             out.push(Line::from(spans));
+            i += 1;
             continue;
         }
 
         let mut spans = vec![Span::raw(" ")];
         spans.extend(parse_inline_spans(raw, base, code_inline));
         out.push(Line::from(spans));
+        i += 1;
     }
     if out.is_empty() {
         out.push(Line::from(""));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::ThemeId;
+
+    #[test]
+    fn renders_gfm_table_as_clean_aligned_columns() {
+        let pal = ThemeId::Pi.palette();
+        let md = "| Tool | Status |\n| --- | --- |\n| kofi | ok |\n| stripe | needs key |";
+        let lines = render_markdown_lines(md, &pal, 60, false);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(text.len(), 4);
+        assert_eq!(text[0], " Tool    Status");
+        assert_eq!(text[1], " ──────  ─────────");
+        assert_eq!(text[2], " kofi    ok");
+        assert_eq!(text[3], " stripe  needs key");
+    }
 }

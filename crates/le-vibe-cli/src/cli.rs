@@ -55,7 +55,6 @@ SUBCOMMANDS:
   list                         List installed extensions
   update                       Pull latest main & reinstall le-vibe binary
   doctor                       Run local environment, auth, MCP & config health check
-  tui-probe [--script -]       Render TUI frames headlessly from a key script (dev/agent use)
 
 OPTIONS:
   -h, --help                   Show this help and exit
@@ -93,11 +92,10 @@ pub(crate) fn parse_cli_args(args: &[String]) -> CliAction {
         return CliAction::Version;
     }
     if let Some(first) = args.first().map(String::as_str)
-        && matches!(
+        && (matches!(
             first,
             "login" | "auth" | "mcp" | "config" | "install" | "remove" | "list" | "update" | "doctor"
-                | "tui-probe"
-        )
+        ) || (cfg!(feature = "dev-debug") && first == "tui-probe"))
     {
         return CliAction::Subcommand(first.to_string(), args[1..].to_vec());
     }

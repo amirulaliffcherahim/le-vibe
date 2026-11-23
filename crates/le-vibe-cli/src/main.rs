@@ -3,6 +3,7 @@ mod debug_log;
 mod features;
 mod rpc;
 mod settings;
+#[cfg(feature = "dev-debug")]
 mod tui_probe;
 mod worker;
 
@@ -302,6 +303,7 @@ fn main() {
             }
             return;
         }
+        #[cfg(feature = "dev-debug")]
         CliAction::Subcommand(ref sub, ref sub_args) if sub == "tui-probe" => {
             std::process::exit(tui_probe::run(sub_args));
         }

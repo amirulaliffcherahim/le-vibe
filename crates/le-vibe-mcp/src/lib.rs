@@ -35,10 +35,45 @@ pub struct McpClient {
     next_id: u64,
 }
 
+fn build_platform_command(command: &str, args: &[String]) -> Command {
+    if cfg!(windows) && !command.contains('\\') && !command.contains('/') && !command.contains('.') {
+        // Resolve `.cmd`/`.bat` shims (e.g. `npx`, `npm`, `uvx`) so Windows `Command::new` finds them.
+        if let Ok(out) = Command::new("where.exe").arg(command).output()
+            && out.status.success()
+        {
+            let candidates: Vec<String> = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect();
+            if let Some(cmd_shim) = candidates.iter().find(|p| {
+                let lower = p.to_ascii_lowercase();
+                lower.ends_with(".cmd") || lower.ends_with(".bat")
+            }) {
+                let mut cmd = Command::new("cmd");
+                cmd.arg("/C").arg(cmd_shim).args(args);
+                return cmd;
+            }
+            if let Some(exe) = candidates.iter().find(|p| {
+                let lower = p.to_ascii_lowercase();
+                lower.ends_with(".exe") || lower.ends_with(".com")
+            }) {
+                let mut cmd = Command::new(exe);
+                cmd.args(args);
+                return cmd;
+            }
+        }
+    }
+    let mut cmd = Command::new(command);
+    cmd.args(args);
+    cmd
+}
+
 impl McpClient {
     pub fn spawn(command: &str, args: &[&str]) -> Result<Self, McpError> {
-        let mut child = Command::new(command)
-            .args(args)
+        let owned_args: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        let mut cmd = build_platform_command(command, &owned_args);
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()?;
@@ -53,9 +88,8 @@ impl McpClient {
     }
 
     pub fn spawn_with_env(cfg: &McpServerConfig) -> Result<Self, McpError> {
-        let mut cmd = Command::new(&cfg.command);
-        cmd.args(&cfg.args)
-            .stdin(Stdio::piped())
+        let mut cmd = build_platform_command(&cfg.command, &cfg.args);
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         for (k, v) in &cfg.env {

@@ -1099,16 +1099,77 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
         }
     }
 
+    // Soft turn limit: ask the model for one tool-less summary pass instead of failing with an error.
+    sanitize_messages_for_provider(&config.provider, &mut messages);
+    messages.push(ChatMessage {
+        role: "user".to_string(),
+        content: format!(
+            "Turn budget ({}) reached. Summarize what you completed, what remains, and the exact next step — do not call any tools.",
+            config.max_turns
+        ),
+        reasoning_content: None,
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+        name: None,
+    });
+    if !is_cancelled(cancel)
+        && let Ok(mut wrap_reply) = bridge.stream_complete(
+            CompletionRequest {
+                provider: config.provider.clone(),
+                model: config.model.clone(),
+                messages,
+                system_prompt: config.system_prompt.clone(),
+                tools: Vec::new(),
+                thinking_level: config.thinking_level.clone(),
+            },
+            &mut |ev| match ev.kind.as_str() {
+                "thinking_delta" => on_event(AgentEvent::ThinkingDelta { delta: ev.delta }),
+                "text_delta" => on_event(AgentEvent::TextDelta { delta: ev.delta }),
+                _ => {}
+            },
+        )
+    {
+        wrap_reply.stop_reason = "max_turns".to_string();
+        let _ = session.append("assistant", &wrap_reply.content);
+        on_event(AgentEvent::TurnEnd {
+            stop_reason: wrap_reply.stop_reason.clone(),
+        });
+        hooks.run_stop();
+        return Ok(wrap_reply);
+    }
+
     let note = if last_partial_text.trim().is_empty() {
-        format!("[Turn stopped: max turns exceeded ({})]", config.max_turns)
+        format!(
+            "Reached turn budget ({}). Send `continue` to pick up from here.",
+            config.max_turns
+        )
     } else {
         format!(
-            "{last_partial_text}\n\n[Turn stopped: max turns exceeded ({})]",
+            "{last_partial_text}\n\nReached turn budget ({}). Send `continue` to pick up from here.",
             config.max_turns
         )
     };
     let _ = session.append("assistant", &note);
-    Err(AgentError::MaxTurnsExceeded(config.max_turns))
+    on_event(AgentEvent::TextDelta { delta: note.clone() });
+    on_event(AgentEvent::TurnEnd {
+        stop_reason: "max_turns".to_string(),
+    });
+    hooks.run_stop();
+    Ok(le_vibe_pybridge::AssistantMessage {
+        provider: config.provider.clone(),
+        model: config.model.clone(),
+        content: note,
+        reasoning_content: None,
+        tool_calls: Vec::new(),
+        stop_reason: "max_turns".to_string(),
+        usage: le_vibe_pybridge::Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            cost_usd: 0.0,
+        },
+    })
 }
 
 #[cfg(test)]

@@ -357,13 +357,13 @@ fn push_pi_surface(
 
     // Header line (bold white/tinted, full-width padded)
     let clean_title = sanitize_display_line(title);
-    let title_fit: String = clean_title.chars().take(inner_w).collect();
-    let header_pad = total_w.saturating_sub(1 + title_fit.chars().count());
+    let (title_fit, _) = split_at_width(&clean_title, inner_w);
+    let header_pad = total_w.saturating_sub(1 + Span::raw(title_fit).width());
     lines.push(
         Line::from(vec![
             Span::styled(" ", bg_style),
             Span::styled(
-                title_fit,
+                title_fit.to_string(),
                 Style::default()
                     .fg(style.title)
                     .bg(style.bg)
@@ -376,12 +376,12 @@ fn push_pi_surface(
 
     if hidden_count > 0 {
         let hint = format!("... ({hidden_count} earlier lines, ctrl+o to expand)");
-        let hint_fit: String = hint.chars().take(inner_w).collect();
-        let pad = total_w.saturating_sub(1 + hint_fit.chars().count());
+        let (hint_fit, _) = split_at_width(&hint, inner_w);
+        let pad = total_w.saturating_sub(1 + Span::raw(hint_fit).width());
         lines.push(
             Line::from(vec![
                 Span::styled(" ", bg_style),
-                Span::styled(hint_fit, Style::default().fg(Color::DarkGray).bg(style.bg)),
+                Span::styled(hint_fit.to_string(), Style::default().fg(Color::DarkGray).bg(style.bg)),
                 Span::styled(" ".repeat(pad), bg_style),
             ])
             .style(bg_style),
@@ -405,18 +405,17 @@ fn push_pi_surface(
             }
             let mut remaining = clean.as_str();
             while !remaining.is_empty() {
-                let chunk: String = remaining.chars().take(inner_w).collect();
-                let consumed = chunk.len();
-                let pad = total_w.saturating_sub(1 + chunk.chars().count());
+                let (chunk, rest) = split_at_width(remaining, inner_w);
+                let pad = total_w.saturating_sub(1 + Span::raw(chunk).width());
                 lines.push(
                     Line::from(vec![
                         Span::styled(" ", bg_style),
-                        Span::styled(chunk, line_style),
+                        Span::styled(chunk.to_string(), line_style),
                         Span::styled(" ".repeat(pad), bg_style),
                     ])
                     .style(bg_style),
                 );
-                remaining = &remaining[consumed..];
+                remaining = rest;
             }
         }
     }
@@ -447,8 +446,8 @@ fn push_user_surface(
         }
         let mut remaining = clean.as_str();
         while !remaining.is_empty() {
-            let (chunk, rest) = split_at_chars(remaining, inner_w);
-            let pad = total_w.saturating_sub(1 + chunk.chars().count());
+            let (chunk, rest) = split_at_width(remaining, inner_w);
+            let pad = total_w.saturating_sub(1 + Span::raw(chunk).width());
             lines.push(
                 Line::from(vec![
                     Span::styled(" ", bg_style),
@@ -463,12 +462,23 @@ fn push_user_surface(
     lines.push(Line::from(Span::styled(" ".repeat(total_w), bg_style)).style(bg_style));
 }
 
-/// Split `text` after at most `max_chars` characters, always on a char boundary.
-fn split_at_chars(text: &str, max_chars: usize) -> (&str, &str) {
-    match text.char_indices().nth(max_chars) {
-        Some((idx, _)) => text.split_at(idx),
-        None => (text, ""),
+/// Split `text` so the prefix fits within `max_width` terminal columns (making progress on wide chars).
+fn split_at_width(text: &str, max_width: usize) -> (&str, &str) {
+    let mut used = 0usize;
+    let mut split_idx = 0usize;
+    for (idx, ch) in text.char_indices() {
+        let mut buf = [0u8; 4];
+        let w = Span::raw(ch.encode_utf8(&mut buf) as &str).width();
+        if split_idx > 0 && used + w > max_width {
+            return text.split_at(idx);
+        }
+        used += w;
+        split_idx = idx + ch.len_utf8();
+        if used >= max_width {
+            return text.split_at(split_idx);
+        }
     }
+    (text, "")
 }
 
 fn hash_block(block: &TranscriptBlock) -> u64 {    let mut h = DefaultHasher::new();

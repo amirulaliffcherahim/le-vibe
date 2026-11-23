@@ -123,7 +123,7 @@ fn try_swallow_leaked_sgr_mouse() -> Option<Option<bool>> {
             break;
         }
         if let Ok(Event::Key(k)) = event::read() {
-            if k.kind != KeyEventKind::Press {
+            if !matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                 continue;
             }
             if let KeyCode::Char(c) = k.code {
@@ -167,7 +167,7 @@ pub fn poll_tui_action(state: &mut TuiState, timeout: Duration) -> io::Result<Tu
                 _ => continue,
             },
             Event::Resize(_, _) => return Ok(TuiAction::Redraw),
-            Event::Key(key) if key.kind == KeyEventKind::Press => {
+            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 if key.code == KeyCode::Esc
                     && let Some(wheel) = try_swallow_leaked_sgr_mouse()
                 {
@@ -702,14 +702,6 @@ pub fn handle_key_event(state: &mut TuiState, key: crossterm::event::KeyEvent) -
             state.selected_slash_idx = 0;
         }
         KeyCode::Enter => {
-            // If more input events are already queued at the exact same instant, this Enter came
-            // from an unbracketed multi-line paste burst — insert a newline instead of submitting.
-            if event::poll(Duration::ZERO).unwrap_or(false) {
-                state.input.insert(state.cursor, '\n');
-                state.cursor += 1;
-                state.selected_slash_idx = 0;
-                return Ok(TuiAction::None);
-            }
             if !file_matches.is_empty()
                 && let Some((at_pos, _)) = state.active_at_query()
             {

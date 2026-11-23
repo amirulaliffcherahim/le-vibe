@@ -52,6 +52,8 @@ pub(crate) fn run_rpc_mode(
     model: &mut String,
 ) {
     let stdin = io::stdin();
+    let output_store = std::sync::Arc::new(std::sync::Mutex::new(le_vibe_agent::OutputStore::new()));
+    let mut cached_model_note: Option<(String, Option<String>)> = None;
     for line in stdin.lock().lines().map_while(Result::ok) {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -86,7 +88,7 @@ pub(crate) fn run_rpc_mode(
             }
             "prompt" => {
                 let text = params.get("text").and_then(Value::as_str).unwrap_or("");
-                let sys = build_system_prompt(
+                let mut sys = build_system_prompt(
                     AgentMode::Normal,
                     "powershell",
                     &cwd_string(),
@@ -94,6 +96,19 @@ pub(crate) fn run_rpc_mode(
                     &[],
                     "",
                 );
+                let model_key = format!("{provider}/{model}");
+                let note = match &cached_model_note {
+                    Some((k, n)) if k == &model_key => n.clone(),
+                    _ => {
+                        let loaded = le_vibe_tools::memory::MemoryRagStore::open_default()
+                            .read_by_key(&format!("model:{model_key}"));
+                        cached_model_note = Some((model_key.clone(), loaded.clone()));
+                        loaded
+                    }
+                };
+                if let Some(n) = &note {
+                    le_vibe_tui::append_model_profile(&mut sys, &model_key, n);
+                }
                 let cfg = AgentConfig {
                     provider: provider.clone(),
                     model: model.clone(),
@@ -105,7 +120,7 @@ pub(crate) fn run_rpc_mode(
                     mode_name: Some("normal".to_string()),
                     codemode: "off".to_string(),
                     steering_queue: None,
-                    output_store: None,
+                    output_store: Some(std::sync::Arc::clone(&output_store)),
                 };
                 match run_turn_loop_streaming(bridge, session, telemetry, &cfg, text, |ev| {
                     println!("{}", json!({"id": id, "event": ev}));

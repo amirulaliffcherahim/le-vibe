@@ -1639,6 +1639,11 @@ pub(crate) fn spawn_tui_worker(
                     prompt,
                 } => {
                     cancel.store(false, Ordering::SeqCst);
+                    if session.active_branch().is_empty() {
+                        let _ = session.append_model_change(format!(
+                            "{provider}/{model}:{thinking_level}"
+                        ));
+                    }
                     let skill_dirs = default_skill_dirs();
                     let skill_refs: Vec<&str> = skill_dirs.iter().map(String::as_str).collect();
                     let discovered_skills: Vec<(String, String, String)> = bridge

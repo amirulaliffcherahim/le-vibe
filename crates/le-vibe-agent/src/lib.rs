@@ -833,6 +833,7 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
             } else {
                 hooks.run_pre_tool(&tc.name, &args_json_str).err()
             };
+            let mut codemode_used_read = false;
             let (mut output, is_error) = if let Some(reason) = blocked_reason {
                 (reason, true)
             } else if tc.name == "codemode" {
@@ -853,8 +854,13 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                         text: "Running codemode script...".to_string(),
                     });
                     match run_codemode_script(script, timeout_ms, |sub_tool, sub_args| {
+                        if sub_tool == "read" {
+                            codemode_used_read = true;
+                        }
                         let sub_args_str = sub_args.to_string();
-                        hooks.run_pre_tool(sub_tool, &sub_args_str)?;
+                        hooks
+                            .run_pre_tool(sub_tool, &sub_args_str)
+                            .map_err(|e| format!("[sub_tool={sub_tool}] {e}"))?;
                         if sub_tool == "retrieve_output" {
                             let id = sub_args.get("id").and_then(Value::as_str).unwrap_or("");
                             let query = sub_args.get("query").and_then(Value::as_str);
@@ -876,17 +882,17 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                         }
                         if sub_tool == "todo" {
                             return execute_todo_tool(todos, &sub_args)
-                                .map_err(|e| e.to_string());
+                                .map_err(|e| format!("[sub_tool={sub_tool}] {e}"));
                         }
                         if sub_tool.starts_with("mcp__")
                             && let Some(m) = mcp.as_deref_mut()
                         {
                             return m
                                 .call_namespaced_tool(sub_tool, sub_args)
-                                .map_err(|e| e.to_string());
+                                .map_err(|e| format!("[sub_tool={sub_tool}] {e}"));
                         }
                         execute_builtin_tool(bridge, sub_tool, &sub_args)
-                            .map_err(|e| e.to_string())
+                            .map_err(|e| format!("[sub_tool={sub_tool}] {e}"))
                     }) {
                         Ok(out) => (out, false),
                         Err(err) => (err, true),
@@ -1154,17 +1160,22 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                 output.push_str("[PostToolUse hook]\n");
                 output.push_str(&post_note);
             }
+            let route_tool = if codemode_used_read {
+                "read"
+            } else {
+                tc.name.as_str()
+            };
             let capped_output = match &config.output_store {
                 Some(arc) => {
                     if let Ok(mut guard) = arc.lock() {
-                        compress_tool_output(&tc.name, &output, &mut guard)
+                        compress_tool_output(route_tool, &output, &mut guard)
                     } else {
                         cap_tool_output(&output)
                     }
                 }
                 None => {
                     let mut local = OutputStore::new();
-                    compress_tool_output(&tc.name, &output, &mut local)
+                    compress_tool_output(route_tool, &output, &mut local)
                 }
             };
             let _ = session.append_tool_result(&tc.id, &tc.name, &capped_output);

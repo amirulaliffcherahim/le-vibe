@@ -433,6 +433,12 @@ fn main() {
                     {
                         sys.push_str(&format!("\n\n<cli_instructions>\n{}\n</cli_instructions>", extra.trim()));
                     }
+                    let model_key = format!("{provider}/{model}");
+                    if let Some(note) = le_vibe_tools::memory::MemoryRagStore::open_default()
+                        .read_by_key(&format!("model:{model_key}"))
+                    {
+                        le_vibe_tui::append_model_profile(&mut sys, &model_key, &note);
+                    }
                     let cfg = AgentConfig {
                         provider,
                         model,
@@ -592,7 +598,6 @@ fn run_interactive_tui(
     );
     let cancel = Arc::new(AtomicBool::new(false));
     let steering_queue: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
-    let is_fresh_session = session.active_branch().is_empty();
     let (cmd_tx, msg_rx, approval_tx, question_tx) = spawn_tui_worker(
         bridge,
         session,
@@ -603,12 +608,6 @@ fn run_interactive_tui(
         Arc::clone(&logger),
         system_prompt_extra,
     );
-    if is_fresh_session {
-        let _ = cmd_tx.send(WorkerCmd::RecordModelChange(format!(
-            "{}/{}:{}",
-            state.provider, state.model, state.thinking_level
-        )));
-    }
     if state.yolo {
         let _ = cmd_tx.send(WorkerCmd::SetYolo(true));
     }

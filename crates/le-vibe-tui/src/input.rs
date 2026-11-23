@@ -686,16 +686,7 @@ pub fn handle_key_event(state: &mut TuiState, key: crossterm::event::KeyEvent) -
             KeyCode::Char('v') => return Ok(TuiAction::PasteClipboard),
             KeyCode::Char('p') => return Ok(TuiAction::CycleModel),
             KeyCode::Char('b') => {
-                if state.todos.is_empty() {
-                    state.show_todo_pane = !state.show_todo_pane;
-                } else if !state.show_todo_pane {
-                    state.show_todo_pane = true;
-                    state.todo_focus = true;
-                    state.todo_idx = state.todo_idx.min(state.todos.len().saturating_sub(1));
-                } else {
-                    state.todo_focus = !state.todo_focus;
-                    state.todo_idx = state.todo_idx.min(state.todos.len().saturating_sub(1));
-                }
+                state.show_todo_pane = !state.show_todo_pane;
                 return Ok(TuiAction::None);
             }
             KeyCode::Char('t') => {
@@ -741,35 +732,6 @@ pub fn handle_key_event(state: &mut TuiState, key: crossterm::event::KeyEvent) -
                 return Ok(TuiAction::None);
             }
             _ => {}
-        }
-    }
-
-    if state.todo_focus {
-        if state.todos.is_empty() {
-            state.todo_focus = false;
-        } else {
-            let max_idx = state.todos.len().saturating_sub(1);
-            state.todo_idx = state.todo_idx.min(max_idx);
-            match key.code {
-                KeyCode::Esc => state.todo_focus = false,
-                KeyCode::Up => state.todo_idx = state.todo_idx.saturating_sub(1),
-                KeyCode::Down if state.todo_idx < max_idx => state.todo_idx += 1,
-                KeyCode::Char(' ') | KeyCode::Enter => {
-                    let (id, _, cur_status) = &state.todos[state.todo_idx];
-                    let next_status = match cur_status.as_str() {
-                        "pending" => "in_progress",
-                        "in_progress" => "completed",
-                        _ => "pending",
-                    };
-                    return Ok(TuiAction::TodoCycle(*id, next_status.to_string()));
-                }
-                KeyCode::Char('d') | KeyCode::Delete => {
-                    let id = state.todos[state.todo_idx].0;
-                    return Ok(TuiAction::TodoDelete(id));
-                }
-                _ => {}
-            }
-            return Ok(TuiAction::None);
         }
     }
 

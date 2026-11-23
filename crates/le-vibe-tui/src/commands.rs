@@ -189,6 +189,12 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandSpec] = &[
         picker_on_bare: true,
     },
     SlashCommandSpec {
+        name: "/learn",
+        hint: "",
+        description: "Mine recent sessions for tool friction, per-model stats & RAG lessons (0 LLM tokens)",
+        picker_on_bare: true,
+    },
+    SlashCommandSpec {
         name: "/suggestion",
         hint: "",
         description: "Analyze previous sessions & suggest le-vibe optimizations to apply",

@@ -1,6 +1,7 @@
 mod cli;
 mod debug_log;
 mod features;
+mod learn;
 mod rpc;
 mod settings;
 #[cfg(feature = "dev-debug")]
@@ -591,6 +592,7 @@ fn run_interactive_tui(
     );
     let cancel = Arc::new(AtomicBool::new(false));
     let steering_queue: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let is_fresh_session = session.active_branch().is_empty();
     let (cmd_tx, msg_rx, approval_tx, question_tx) = spawn_tui_worker(
         bridge,
         session,
@@ -601,6 +603,12 @@ fn run_interactive_tui(
         Arc::clone(&logger),
         system_prompt_extra,
     );
+    if is_fresh_session {
+        let _ = cmd_tx.send(WorkerCmd::RecordModelChange(format!(
+            "{}/{}:{}",
+            state.provider, state.model, state.thinking_level
+        )));
+    }
     if state.yolo {
         let _ = cmd_tx.send(WorkerCmd::SetYolo(true));
     }
@@ -1797,6 +1805,14 @@ fn run_interactive_tui(
                         model: state.model.clone(),
                         repo: state.repo_name.clone(),
                     });
+                    continue;
+                }
+                if input == "/learn" {
+                    let rag = le_vibe_tools::memory::MemoryRagStore::open_default();
+                    let report = learn::mine_sessions(&sessions_dir(), &rag, 20);
+                    state
+                        .blocks
+                        .push(TranscriptBlock::Report(learn::format_learn_report(&report)));
                     continue;
                 }
                 if input == "/suggestion" {

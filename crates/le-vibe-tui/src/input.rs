@@ -1,8 +1,69 @@
 use crossterm::event::{
     self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
 };
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::io;
 use std::time::{Duration, Instant};
+
+thread_local! {
+    static PENDING_EVENTS: RefCell<VecDeque<Event>> = const { RefCell::new(VecDeque::new()) };
+}
+
+fn next_terminal_event(timeout: Duration) -> io::Result<Option<Event>> {
+    if let Some(ev) = PENDING_EVENTS.with(|q| q.borrow_mut().pop_front()) {
+        return Ok(Some(ev));
+    }
+    if !event::poll(timeout)? {
+        return Ok(None);
+    }
+    Ok(Some(event::read()?))
+}
+
+/// Detect unbracketed multi-line pastes by peeking past ConPTY `Release` / `Mouse` noise
+/// for an immediately queued character/newline key press.
+fn has_queued_paste_key() -> bool {
+    if PENDING_EVENTS.with(|q| {
+        q.borrow().iter().any(|ev| {
+            matches!(
+                ev,
+                Event::Key(k)
+                    if matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                        && matches!(k.code, KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab)
+            )
+        })
+    }) {
+        return true;
+    }
+    while event::poll(Duration::ZERO).unwrap_or(false) {
+        let Ok(ev) = event::read() else {
+            break;
+        };
+        match &ev {
+            Event::Key(k) if k.kind == KeyEventKind::Release => continue,
+            Event::Mouse(m)
+                if !matches!(
+                    m.kind,
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                ) =>
+            {
+                continue;
+            }
+            Event::Key(k)
+                if matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                    && matches!(k.code, KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab) =>
+            {
+                PENDING_EVENTS.with(|q| q.borrow_mut().push_back(ev));
+                return true;
+            }
+            _ => {
+                PENDING_EVENTS.with(|q| q.borrow_mut().push_back(ev));
+                return false;
+            }
+        }
+    }
+    false
+}
 
 use crate::commands::filter_slash_commands_with_dynamic;
 use crate::editor::{next_char_boundary, prev_char_boundary};
@@ -144,10 +205,10 @@ pub fn poll_tui_action(state: &mut TuiState, timeout: Duration) -> io::Result<Tu
     let deadline = Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if !event::poll(remaining)? {
+        let Some(ev) = next_terminal_event(remaining)? else {
             return Ok(TuiAction::None);
-        }
-        match event::read()? {
+        };
+        match ev {
             Event::Paste(text) => {
                 if state.modal == ActiveModal::None {
                     return Ok(TuiAction::Pasted(text));
@@ -702,6 +763,12 @@ pub fn handle_key_event(state: &mut TuiState, key: crossterm::event::KeyEvent) -
             state.selected_slash_idx = 0;
         }
         KeyCode::Enter => {
+            if has_queued_paste_key() {
+                state.input.insert(state.cursor, '\n');
+                state.cursor += 1;
+                state.selected_slash_idx = 0;
+                return Ok(TuiAction::None);
+            }
             if !file_matches.is_empty()
                 && let Some((at_pos, _)) = state.active_at_query()
             {

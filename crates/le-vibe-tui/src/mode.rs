@@ -63,6 +63,7 @@ impl AgentMode {
                 "ls".into(),
                 "memory_search".into(),
                 "memory_read".into(),
+                "retrieve_output".into(),
             ]),
             AgentMode::Rea => Some(vec![
                 "read".into(),
@@ -73,6 +74,7 @@ impl AgentMode {
                 "powershell".into(),
                 "memory_search".into(),
                 "memory_read".into(),
+                "retrieve_output".into(),
             ]),
         }
     }

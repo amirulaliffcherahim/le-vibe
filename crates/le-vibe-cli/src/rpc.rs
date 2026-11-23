@@ -105,6 +105,7 @@ pub(crate) fn run_rpc_mode(
                     mode_name: Some("normal".to_string()),
                     codemode: "off".to_string(),
                     steering_queue: None,
+                    output_store: None,
                 };
                 match run_turn_loop_streaming(bridge, session, telemetry, &cfg, text, |ev| {
                     println!("{}", json!({"id": id, "event": ev}));

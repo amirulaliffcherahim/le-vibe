@@ -6,13 +6,14 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const RUNNER_PY: &str = r#"
-import json, sys, traceback
+import json, re, sys, traceback
+from pathlib import Path
 
 _out = []
 _store = {}
 
 def text(val):
-    _out.append(val if isinstance(val, str) else json.dumps(val, ensure_ascii=False, indent=2))
+    _out.append(val if isinstance(val, str) else json.dumps(val, ensure_ascii=False, separators=(",", ":")))
 
 def store(key, val):
     if val is None:
@@ -45,7 +46,7 @@ def _print(*args, **kwargs):
 script = sys.stdin.readline()
 payload = json.loads(script)
 code = payload["script"]
-ns = {"tools": tools, "text": text, "print": _print, "store": store, "load": load, "json": json}
+ns = {"tools": tools, "text": text, "print": _print, "store": store, "load": load, "json": json, "re": re, "Path": Path}
 try:
     exec(compile(code, "<codemode>", "exec"), ns, ns)
     sys.stdout.write(json.dumps({"done": True, "output": "\n".join(_out)}, ensure_ascii=False) + "\n")

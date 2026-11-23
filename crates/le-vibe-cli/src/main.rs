@@ -447,6 +447,7 @@ fn main() {
                             .cloned()
                             .unwrap_or_else(|| "off".to_string()),
                         steering_queue: None,
+                        output_store: Some(Arc::new(Mutex::new(le_vibe_agent::OutputStore::new()))),
                     };
                     run_streaming_prompt(&mut bridge, &mut session, &telemetry, &cfg, &prompt, json_mode);
                     return;

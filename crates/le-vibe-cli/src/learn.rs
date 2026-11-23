@@ -553,6 +553,28 @@ mod tests {
             Some("edit_without_read")
         );
 
+        // End-to-end round-trip: real compress_tool_output -> SessionStore -> mine_sessions.
+        let mut store = le_vibe_agent::OutputStore::new();
+        let noisy_log = (0..300)
+            .map(|i| {
+                if i == 150 {
+                    "2026-11-23T12:00:00Z FATAL crash at main.rs:1".to_string()
+                } else {
+                    format!("2026-11-23T12:00:00Z INFO heartbeat #{i}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let crushed = le_vibe_agent::compress_tool_output("bash", &noisy_log, &mut store);
+        let rt_path = sess_dir.join("roundtrip.jsonl");
+        let mut sess = le_vibe_durable::SessionStore::open(&rt_path).unwrap();
+        sess.append_model_change("vibe/mistral-large-4-0:medium")
+            .unwrap();
+        sess.append_tool_result("tc_1", "bash", &crushed).unwrap();
+        let rt_report = mine_sessions(&sess_dir, &rag, 5);
+        assert_eq!(rt_report.compressed_outputs, 1);
+        assert!(rt_report.est_tokens_saved > 1000);
+
         println!(
             "\n=== PR C Interconnected /suggestion & Model-Profile Benchmark ===\n  model_profile lookup : {} us\n  KV-cache prefix match: 100% byte-identical ({} B static prefix preserved)\n  model_profile size   : {} B (capped <=400 B body)\n  /suggestion digest   : {:.2} ms ({} chars, includes <learn_report> + <rag_memory>)",
             lookup_us,

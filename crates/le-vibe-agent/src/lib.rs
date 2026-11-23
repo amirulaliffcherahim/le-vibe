@@ -1,3 +1,7 @@
+pub mod compress;
+
+pub use compress::{CompressionStats, OutputStore, compress_tool_output};
+
 use le_vibe_durable::{EntryKind, SessionStore};
 use le_vibe_mcp::McpManager;
 use le_vibe_pybridge::{
@@ -71,6 +75,7 @@ pub struct AgentConfig {
     pub mode_name: Option<String>,
     pub codemode: String,
     pub steering_queue: Option<Arc<Mutex<VecDeque<String>>>>,
+    pub output_store: Option<Arc<Mutex<OutputStore>>>,
 }
 
 impl Default for AgentConfig {
@@ -86,6 +91,7 @@ impl Default for AgentConfig {
             mode_name: None,
             codemode: "off".to_string(),
             steering_queue: None,
+            output_store: None,
         }
     }
 }
@@ -495,7 +501,10 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                 return codemode_setting == "on" || codemode_setting == "only";
             }
             if codemode_setting == "only"
-                && !matches!(t.name.as_str(), "todo" | "ask_user_question")
+                && !matches!(
+                    t.name.as_str(),
+                    "todo" | "ask_user_question" | "retrieve_output"
+                )
             {
                 return false;
             }
@@ -762,7 +771,19 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                     output.push_str("[PostToolUse hook]\n");
                     output.push_str(&post_note);
                 }
-                let capped_output = cap_tool_output(&output);
+                let capped_output = match &config.output_store {
+                    Some(arc) => {
+                        if let Ok(mut guard) = arc.lock() {
+                            compress_tool_output(&tc.name, &output, &mut guard)
+                        } else {
+                            cap_tool_output(&output)
+                        }
+                    }
+                    None => {
+                        let mut local = OutputStore::new();
+                        compress_tool_output(&tc.name, &output, &mut local)
+                    }
+                };
                 let _ = session.append_tool_result(&tc.id, &tc.name, &capped_output);
                 on_event(AgentEvent::ToolCallEnd {
                     id: tc.id.clone(),
@@ -834,6 +855,36 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                     match run_codemode_script(script, timeout_ms, |sub_tool, sub_args| {
                         let sub_args_str = sub_args.to_string();
                         hooks.run_pre_tool(sub_tool, &sub_args_str)?;
+                        if sub_tool == "retrieve_output" {
+                            let id = sub_args.get("id").and_then(Value::as_str).unwrap_or("");
+                            let query = sub_args.get("query").and_then(Value::as_str);
+                            let offset = sub_args
+                                .get("offset")
+                                .and_then(Value::as_u64)
+                                .map(|n| n as usize);
+                            let limit = sub_args
+                                .get("limit")
+                                .and_then(Value::as_u64)
+                                .map(|n| n as usize);
+                            return Ok(match &config.output_store {
+                                Some(arc) => arc
+                                    .lock()
+                                    .map(|mut g| g.retrieve(id, query, offset, limit))
+                                    .unwrap_or_else(|_| "Output store lock error.".to_string()),
+                                None => format!("Output ref '{id}' unavailable."),
+                            });
+                        }
+                        if sub_tool == "todo" {
+                            return execute_todo_tool(todos, &sub_args)
+                                .map_err(|e| e.to_string());
+                        }
+                        if sub_tool.starts_with("mcp__")
+                            && let Some(m) = mcp.as_deref_mut()
+                        {
+                            return m
+                                .call_namespaced_tool(sub_tool, sub_args)
+                                .map_err(|e| e.to_string());
+                        }
                         execute_builtin_tool(bridge, sub_tool, &sub_args)
                             .map_err(|e| e.to_string())
                     }) {
@@ -874,6 +925,7 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                         mode_name: Some("ask".to_string()),
                         codemode: "off".to_string(),
                         steering_queue: None,
+                        output_store: config.output_store.clone(),
                     };
                     let mut noop_ev = |_: AgentEvent| {};
                     let mut deny_all = |_: ApprovalRequest| ApprovalChoice::Deny;
@@ -895,6 +947,32 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                         Err(err) => (format!("Subagent error: {err}"), true),
                     }
                 }
+            } else if tc.name == "retrieve_output" {
+                let id = tc.arguments.get("id").and_then(Value::as_str).unwrap_or("");
+                let query = tc.arguments.get("query").and_then(Value::as_str);
+                let offset = tc
+                    .arguments
+                    .get("offset")
+                    .and_then(Value::as_u64)
+                    .map(|n| n as usize);
+                let limit = tc
+                    .arguments
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .map(|n| n as usize);
+                let result = match &config.output_store {
+                    Some(arc) => {
+                        if let Ok(mut guard) = arc.lock() {
+                            guard.retrieve(id, query, offset, limit)
+                        } else {
+                            "Output store lock error.".to_string()
+                        }
+                    }
+                    None => format!(
+                        "Output ref '{id}' is not in the current session cache. Re-run the source tool to inspect it."
+                    ),
+                };
+                (result, false)
             } else if tc.name == "todo" {
                 match execute_todo_tool(todos, &tc.arguments) {
                     Ok(out) => (out, false),
@@ -1076,7 +1154,19 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                 output.push_str("[PostToolUse hook]\n");
                 output.push_str(&post_note);
             }
-            let capped_output = cap_tool_output(&output);
+            let capped_output = match &config.output_store {
+                Some(arc) => {
+                    if let Ok(mut guard) = arc.lock() {
+                        compress_tool_output(&tc.name, &output, &mut guard)
+                    } else {
+                        cap_tool_output(&output)
+                    }
+                }
+                None => {
+                    let mut local = OutputStore::new();
+                    compress_tool_output(&tc.name, &output, &mut local)
+                }
+            };
             let _ = session.append_tool_result(&tc.id, &tc.name, &capped_output);
             on_event(AgentEvent::ToolCallEnd {
                 id: tc.id.clone(),

@@ -1,4 +1,4 @@
-use le_vibe_agent::{AgentConfig, AgentEvent, ApprovalChoice, run_turn_loop_cancellable};
+use le_vibe_agent::{AgentConfig, AgentEvent, ApprovalChoice, OutputStore, run_turn_loop_cancellable};
 use le_vibe_durable::{EntryKind, SessionStore};
 use le_vibe_mcp::McpManager;
 use le_vibe_pybridge::{ChatMessage, CompletionRequest, PolicyPort, ProviderPort, PythonBridge};
@@ -693,6 +693,7 @@ pub(crate) fn spawn_tui_worker(
     std::thread::spawn(move || {
         bridge.set_cancel_token(Arc::clone(&cancel));
         let mut todos = TodoStore::new();
+        let output_store = Arc::new(Mutex::new(OutputStore::new()));
         let mut codemode_setting = "off".to_string();
         // Freeze `<memory_toc>` for the session so mid-session `memory_write` never busts prompt cache.
         let mut session_memory_toc = le_vibe_tools::memory::MemoryRagStore::open_default().build_toc(25);
@@ -1565,8 +1566,20 @@ pub(crate) fn spawn_tui_worker(
                     } else {
                         0.0
                     };
+                    let headroom_line = output_store
+                        .lock()
+                        .ok()
+                        .map(|s| {
+                            format!(
+                                "\n  Headroom compression: {} output(s) crushed, ~{} tok saved ({} retrieve(s))",
+                                s.stats.crushed_count,
+                                format_tokens(s.stats.est_tokens_saved() as u64),
+                                s.stats.retrieve_hits
+                            )
+                        })
+                        .unwrap_or_default();
                     let _ = msg_tx.send(WorkerMsg::Notice(format!(
-                        "Context Breakdown:\n  System + AGENTS.md + skills: ~{sys_tok} tok\n  Active branch messages: ~{msg_tok} tok\n  Last reported input: {last_input_tokens} / {context_window} ({pct:.1}%)\n  Auto-compact threshold: 85%"
+                        "Context Breakdown:\n  System + AGENTS.md + skills: ~{sys_tok} tok\n  Active branch messages: ~{msg_tok} tok\n  Last reported input: {last_input_tokens} / {context_window} ({pct:.1}%)\n  Auto-compact threshold: 85%{headroom_line}"
                     )));
                     let _ = msg_tx.send(WorkerMsg::Idle);
                 }
@@ -1652,6 +1665,7 @@ pub(crate) fn spawn_tui_worker(
                         mode_name: Some(mode.name().to_string()),
                         codemode: codemode_setting.clone(),
                         steering_queue: Some(Arc::clone(&steering_queue)),
+                        output_store: Some(Arc::clone(&output_store)),
                     };
                     let mut stream_ms: u128 = 0;
                     let mut stream_start: Option<Instant> = None;

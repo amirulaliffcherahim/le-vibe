@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Sequence
+import hashlib
 import json
 import re
 from typing import Any
@@ -41,6 +42,13 @@ def _split_multimodal_content(content: str) -> str | list[dict[str, Any]]:
     return parts
 
 
+def _normalize_mistral_tool_id(raw_id: str) -> str:
+    """Mistral requires 9-char alphanumeric tool_call IDs; hash non-conforming IDs deterministically."""
+    if len(raw_id) == 9 and raw_id.isascii() and raw_id.isalnum():
+        return raw_id
+    return hashlib.sha256(raw_id.encode("utf-8")).hexdigest()[:9]
+
+
 def build_vibe_payload(
     model: ModelSpec,
     context: TranscriptContext,
@@ -56,7 +64,7 @@ def build_vibe_payload(
         if msg.role == "assistant" and msg.tool_calls:
             entry["tool_calls"] = [
                 {
-                    "id": tc.id,
+                    "id": _normalize_mistral_tool_id(tc.id),
                     "type": "function",
                     "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)},
                 }
@@ -64,7 +72,7 @@ def build_vibe_payload(
             ]
         elif msg.role == "tool":
             if msg.tool_call_id:
-                entry["tool_call_id"] = msg.tool_call_id
+                entry["tool_call_id"] = _normalize_mistral_tool_id(msg.tool_call_id)
             if msg.name:
                 entry["name"] = msg.name
         messages.append(entry)

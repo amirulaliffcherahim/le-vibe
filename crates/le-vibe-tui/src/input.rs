@@ -72,7 +72,7 @@ fn has_queued_paste_key() -> bool {
 /// Coalesce an unbracketed ConPTY paste burst (e.g. right-click or Shift+Insert) into a single
 /// `TuiAction::Pasted(text)` so newlines never auto-submit and multi-line pastes collapse cleanly.
 fn try_coalesce_unbracketed_paste(first_ch: char) -> Option<String> {
-    let initial_deadline = Instant::now() + Duration::from_millis(6);
+    let initial_deadline = Instant::now() + Duration::from_millis(2);
     let ev = loop {
         if let Some(ev) = PENDING_EVENTS.with(|q| q.borrow_mut().pop_front()) {
             break ev;
@@ -135,9 +135,9 @@ fn try_coalesce_unbracketed_paste(first_ch: char) -> Option<String> {
         return None;
     }
 
-    // Drain the rest of the burst with a 20ms inter-chunk window (up to 64KB safety cap).
+    // Drain the rest of the burst with a 10ms inter-chunk window (up to 64KB safety cap).
     while buf.len() < 65_536 {
-        let Some(next) = next_terminal_event(Duration::from_millis(20)).ok().flatten() else {
+        let Some(next) = next_terminal_event(Duration::from_millis(10)).ok().flatten() else {
             break;
         };
         match &next {

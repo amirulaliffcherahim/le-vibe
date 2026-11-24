@@ -221,7 +221,66 @@ pub(crate) fn classify_pasted_text(raw: &str) -> PastedItem {
     PastedItem::PlainText(raw.to_string())
 }
 
+#[cfg(target_os = "windows")]
+fn read_win32_clipboard_text_fast() -> Option<String> {
+    const CF_BITMAP: u32 = 2;
+    const CF_UNICODETEXT: u32 = 13;
+    const CF_HDROP: u32 = 15;
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn IsClipboardFormatAvailable(format: u32) -> i32;
+        fn OpenClipboard(hwnd: *mut core::ffi::c_void) -> i32;
+        fn CloseClipboard() -> i32;
+        fn GetClipboardData(format: u32) -> *mut core::ffi::c_void;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GlobalLock(hmem: *mut core::ffi::c_void) -> *const u16;
+        fn GlobalUnlock(hmem: *mut core::ffi::c_void) -> i32;
+    }
+
+    // SAFETY: Standard Win32 clipboard APIs; null checks guard every handle/pointer,
+    // and CloseClipboard/GlobalUnlock are always paired on success.
+    unsafe {
+        if IsClipboardFormatAvailable(CF_BITMAP) != 0 || IsClipboardFormatAvailable(CF_HDROP) != 0 {
+            return None;
+        }
+        if IsClipboardFormatAvailable(CF_UNICODETEXT) == 0 {
+            return None;
+        }
+        if OpenClipboard(core::ptr::null_mut()) == 0 {
+            return None;
+        }
+        let handle = GetClipboardData(CF_UNICODETEXT);
+        let result = if !handle.is_null() {
+            let ptr = GlobalLock(handle);
+            if !ptr.is_null() {
+                let mut len = 0usize;
+                while len < 1_000_000 && *ptr.add(len) != 0 {
+                    len += 1;
+                }
+                let slice = core::slice::from_raw_parts(ptr, len);
+                let text = String::from_utf16_lossy(slice);
+                GlobalUnlock(handle);
+                Some(text)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        CloseClipboard();
+        result
+    }
+}
+
 pub(crate) fn grab_clipboard_item() -> Option<PastedItem> {
+    #[cfg(target_os = "windows")]
+    if let Some(plain) = read_win32_clipboard_text_fast() {
+        return Some(classify_pasted_text(&plain));
+    }
+
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())

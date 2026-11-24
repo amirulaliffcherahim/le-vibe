@@ -1848,7 +1848,14 @@ pub(crate) fn spawn_tui_worker(
                         .items()
                         .iter()
                         .filter(|t| t.status != "deleted")
-                        .map(|t| (t.id, t.subject.clone(), t.status.clone()))
+                        .map(|t| {
+                            let label = if t.status == "in_progress" {
+                                t.active_form.clone().unwrap_or_else(|| t.subject.clone())
+                            } else {
+                                t.subject.clone()
+                            };
+                            (t.id, label, t.status.clone())
+                        })
                         .collect();
                     let _ = msg_tx.send(WorkerMsg::TodosUpdated(todo_snapshot));
                     match res {

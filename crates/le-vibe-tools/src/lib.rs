@@ -134,16 +134,21 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "todo".to_string(),
-            description: "Manage a multi-step task list (create, update, list, get, delete, clear)".to_string(),
+            description: "Manage a multi-step task list (rpiv-todo parity). Actions: create (subject or tasks[] batch), update (status/activeForm/addBlockedBy/removeBlockedBy), list (status/includeDeleted), get, delete (tombstone), clear. Status: pending -> in_progress -> completed, plus deleted.".to_string(),
             parameters: json!({
                 "type": "object",
                 "required": ["action"],
                 "properties": {
-                    "action": { "type": "string" },
+                    "action": { "type": "string", "enum": ["create", "update", "list", "get", "delete", "clear"] },
                     "id": { "type": "integer" },
                     "subject": { "type": "string" },
                     "description": { "type": "string" },
-                    "status": { "type": "string" },
+                    "activeForm": { "type": "string" },
+                    "status": { "type": "string", "enum": ["pending", "in_progress", "completed", "deleted"] },
+                    "blockedBy": { "type": "array", "items": { "type": "integer" } },
+                    "addBlockedBy": { "type": "array", "items": { "type": "integer" } },
+                    "removeBlockedBy": { "type": "array", "items": { "type": "integer" } },
+                    "includeDeleted": { "type": "boolean" },
                     "tasks": { "type": "array" }
                 }
             }),
@@ -268,7 +273,9 @@ pub struct TodoItem {
     pub id: u64,
     pub subject: String,
     pub description: String,
+    pub active_form: Option<String>,
     pub status: String,
+    pub blocked_by: Vec<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -285,6 +292,34 @@ impl TodoStore {
     pub fn items(&self) -> &[TodoItem] {
         &self.items
     }
+
+    fn has_cycle(&self, from_id: u64, target_id: u64) -> bool {
+        if from_id == target_id {
+            return true;
+        }
+        let mut stack = vec![target_id];
+        let mut visited = std::collections::HashSet::new();
+        while let Some(cur) = stack.pop() {
+            if !visited.insert(cur) {
+                continue;
+            }
+            if cur == from_id {
+                return true;
+            }
+            if let Some(item) = self.items.iter().find(|i| i.id == cur) {
+                for &dep in &item.blocked_by {
+                    stack.push(dep);
+                }
+            }
+        }
+        false
+    }
+}
+
+fn parse_id_array(val: Option<&Value>) -> Vec<u64> {
+    val.and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(Value::as_u64).collect())
+        .unwrap_or_default()
 }
 
 pub fn execute_todo_tool(store: &mut TodoStore, args: &Value) -> Result<String, ToolError> {
@@ -295,25 +330,43 @@ pub fn execute_todo_tool(store: &mut TodoStore, args: &Value) -> Result<String, 
     match action {
         "create" => {
             if let Some(tasks) = args.get("tasks").and_then(Value::as_array) {
+                if tasks.is_empty() {
+                    return Err(ToolError::Edit("todo.tasks must be non-empty".into()));
+                }
+                // Validate whole batch before committing.
+                for t in tasks {
+                    let sub = t.get("subject").and_then(Value::as_str).unwrap_or("").trim();
+                    if sub.is_empty() {
+                        return Err(ToolError::Edit("each todo task requires a non-empty subject".into()));
+                    }
+                    for dep in parse_id_array(t.get("blockedBy")) {
+                        if !store.items.iter().any(|i| i.id == dep && i.status != "deleted") {
+                            return Err(ToolError::Edit(format!("blockedBy id #{dep} does not exist")));
+                        }
+                    }
+                }
                 let mut created = Vec::new();
                 for t in tasks {
-                    let subject = t
-                        .get("subject")
+                    let subject = t.get("subject").and_then(Value::as_str).unwrap_or("").trim().to_string();
+                    let description = t.get("description").and_then(Value::as_str).unwrap_or("").to_string();
+                    let active_form = t
+                        .get("activeForm")
                         .and_then(Value::as_str)
-                        .unwrap_or("Untitled task")
-                        .to_string();
-                    let description = t
-                        .get("description")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(ToString::to_string);
+                    let mut blocked_by = parse_id_array(t.get("blockedBy"));
+                    blocked_by.sort_unstable();
+                    blocked_by.dedup();
                     store.next_id += 1;
                     let id = store.next_id;
                     store.items.push(TodoItem {
                         id,
                         subject: subject.clone(),
                         description,
+                        active_form,
                         status: "pending".to_string(),
+                        blocked_by,
                     });
                     created.push(format!("Created #{id}: {subject} (pending)"));
                 }
@@ -322,20 +375,34 @@ pub fn execute_todo_tool(store: &mut TodoStore, args: &Value) -> Result<String, 
             let subject = args
                 .get("subject")
                 .and_then(Value::as_str)
-                .unwrap_or("Untitled task")
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| ToolError::Edit("todo.subject required for create".into()))?
                 .to_string();
-            let description = args
-                .get("description")
+            let description = args.get("description").and_then(Value::as_str).unwrap_or("").to_string();
+            let active_form = args
+                .get("activeForm")
                 .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string);
+            let mut blocked_by = parse_id_array(args.get("blockedBy"));
+            blocked_by.sort_unstable();
+            blocked_by.dedup();
+            for &dep in &blocked_by {
+                if !store.items.iter().any(|i| i.id == dep && i.status != "deleted") {
+                    return Err(ToolError::Edit(format!("blockedBy id #{dep} does not exist")));
+                }
+            }
             store.next_id += 1;
             let id = store.next_id;
             store.items.push(TodoItem {
                 id,
                 subject: subject.clone(),
                 description,
+                active_form,
                 status: "pending".to_string(),
+                blocked_by,
             });
             Ok(format!("Created #{id}: {subject} (pending)"))
         }
@@ -344,20 +411,60 @@ pub fn execute_todo_tool(store: &mut TodoStore, args: &Value) -> Result<String, 
                 .get("id")
                 .and_then(Value::as_u64)
                 .ok_or_else(|| ToolError::Edit("todo.id required for update".into()))?;
+            let add_deps = parse_id_array(args.get("addBlockedBy"));
+            let rem_deps = parse_id_array(args.get("removeBlockedBy"));
+            for &dep in &add_deps {
+                if !store.items.iter().any(|i| i.id == dep) {
+                    return Err(ToolError::Edit(format!("addBlockedBy id #{dep} does not exist")));
+                }
+                if store.has_cycle(id, dep) {
+                    return Err(ToolError::Edit(format!(
+                        "Dependency cycle rejected: #{id} cannot be blocked by #{dep}"
+                    )));
+                }
+            }
+            if let Some(st) = args.get("status").and_then(Value::as_str)
+                && !matches!(st, "pending" | "in_progress" | "completed" | "deleted")
+            {
+                return Err(ToolError::Edit(format!("Invalid todo status: {st}")));
+            }
             let item = store
                 .items
                 .iter_mut()
                 .find(|i| i.id == id)
                 .ok_or_else(|| ToolError::Edit(format!("todo #{id} not found")))?;
             let prev = item.status.clone();
+            let mut changed = false;
             if let Some(st) = args.get("status").and_then(Value::as_str) {
                 item.status = st.to_string();
+                changed = true;
             }
             if let Some(sub) = args.get("subject").and_then(Value::as_str) {
                 item.subject = sub.to_string();
+                changed = true;
             }
             if let Some(desc) = args.get("description").and_then(Value::as_str) {
                 item.description = desc.to_string();
+                changed = true;
+            }
+            if let Some(af) = args.get("activeForm").and_then(Value::as_str) {
+                item.active_form = (!af.trim().is_empty()).then(|| af.trim().to_string());
+                changed = true;
+            }
+            if !add_deps.is_empty() {
+                item.blocked_by.extend(add_deps);
+                item.blocked_by.sort_unstable();
+                item.blocked_by.dedup();
+                changed = true;
+            }
+            if !rem_deps.is_empty() {
+                item.blocked_by.retain(|d| !rem_deps.contains(d));
+                changed = true;
+            }
+            if !changed {
+                return Err(ToolError::Edit(
+                    "todo update requires at least one mutable field (status, subject, description, activeForm, addBlockedBy, removeBlockedBy)".into(),
+                ));
             }
             Ok(format!("Updated #{id} ({prev} -> {})", item.status))
         }
@@ -388,19 +495,37 @@ pub fn execute_todo_tool(store: &mut TodoStore, args: &Value) -> Result<String, 
                 .iter()
                 .find(|i| i.id == id)
                 .ok_or_else(|| ToolError::Edit(format!("todo #{id} not found")))?;
-            Ok(format!(
-                "#{} [{}] {}\n{}",
-                item.id, item.status, item.subject, item.description
-            ))
+            let mut out = format!("#{} [{}] {}", item.id, item.status, item.subject);
+            if let Some(af) = &item.active_form {
+                out.push_str(&format!("\nactiveForm: {af}"));
+            }
+            if !item.blocked_by.is_empty() {
+                out.push_str(&format!("\nblockedBy: {:?}", item.blocked_by));
+            }
+            if !item.description.is_empty() {
+                out.push_str(&format!("\n{}", item.description));
+            }
+            Ok(out)
         }
         _ => {
             let filter_status = args.get("status").and_then(Value::as_str);
+            let include_deleted = args
+                .get("includeDeleted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let lines: Vec<String> = store
                 .items
                 .iter()
-                .filter(|i| i.status != "deleted")
+                .filter(|i| include_deleted || i.status != "deleted")
                 .filter(|i| filter_status.is_none_or(|s| i.status == s))
-                .map(|i| format!("#{} [{}] {}", i.id, i.status, i.subject))
+                .map(|i| {
+                    let dep_tag = if i.blocked_by.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (blockedBy: {:?})", i.blocked_by)
+                    };
+                    format!("#{} [{}] {}{dep_tag}", i.id, i.status, i.subject)
+                })
                 .collect();
             if lines.is_empty() {
                 Ok("No todos.".to_string())

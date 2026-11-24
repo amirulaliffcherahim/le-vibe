@@ -552,11 +552,16 @@ pub(crate) fn build_optimization_digest(
 
     format!(
         "Analyze my recent le-vibe sessions, Headroom compression stats, `/learn` friction report, and event logs below, then propose 3-6 concrete, high-impact optimizations to le-vibe itself.\n\
-         Group suggestions into:\n\
-         1. **Model profile adjustments (saved via `memory_write` with `key=\"model:<provider>/<model>\"`, <=400 bytes)**: concise per-model behavior tweaks auto-loaded on session start / model switch without busting KV-cache.\n\
-         2. **Hot-reloadable RAG & config updates (apply + run `/reload`, no restart)**: `MEMORY.md` (`key=\"learn:...\"`), `~/.le-vibe/SYSTEM.md`, `~/.le-vibe/policy.json`, `~/.le-vibe/settings.json`, `~/.le-vibe/extensions/*.py`, `.le-vibe/skills/*/SKILL.md`.\n\
-         3. **Rust harness updates (`{self_repo}/crates/*`)**: exact file paths and changes.\n\
-         Number each suggestion (#1, #2, ...) so I can reply `apply #1` to have you apply it directly. Skip items already marked `[known]` in `<learn_report>`.\n\n\
+         Split every suggestion cleanly into Harness2-style scopes so project quirks never pollute global defaults:\n\
+         1. **Invariant (Global) — applies everywhere**:\n\
+            - Model profile adjustments (`memory_write` with `key=\"model:<provider>/<model>\"`, <=400 bytes, include `evidence: ...`).\n\
+            - Global harness config/rules (`~/.le-vibe/SYSTEM.md`, `~/.le-vibe/settings.json`, global `MEMORY.md` with `key=\"learn:...\"`).\n\
+            - Rust harness updates (`{self_repo}/crates/*`): exact file paths and changes.\n\
+         2. **Domain (Repo-Local) — applies only to this workspace**:\n\
+            - `<cwd>/.le-vibe/APPEND_SYSTEM.md`, project `MEMORY.md`, `<cwd>/.le-vibe/policy.json`, or project skills.\n\
+         3. **Refine / Retire Stale Rules**:\n\
+            - If `<learn_report>` lists any `[stale]` rule (still recurring >=3x despite existing in `MEMORY.md`), propose tightening or deleting it via `memory_delete`.\n\
+         Number each suggestion (#1, #2, ...) and tag `[invariant]` or `[domain]` so I can reply `apply #1` directly. Skip non-stale `[known]` items.\n\n\
          <learn_report>\n\
          {learn_summary}\n\
          </learn_report>\n\n\

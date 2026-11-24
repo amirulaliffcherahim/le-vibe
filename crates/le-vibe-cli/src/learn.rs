@@ -21,9 +21,10 @@ pub(crate) struct ModelStats {
 #[derive(Debug, Clone)]
 pub(crate) struct LearnCandidate {
     pub key: String,
+    pub scope: &'static str,
     pub title: String,
     pub body: String,
-    pub count: usize,
+    pub evidence: String,
     pub already_known: bool,
 }
 
@@ -43,6 +44,8 @@ pub(crate) struct LearnReport {
     pub tool_friction: BTreeMap<(String, String), usize>,
     pub top_bloated_tools: BTreeMap<String, usize>,
     pub candidates: Vec<LearnCandidate>,
+    /// Rules already present in MEMORY.md whose friction still recurs (>=3x): refine or retire.
+    pub stale_rules: Vec<(String, usize)>,
 }
 
 /// Normalize a model spec like `vibe/mistral-large-4-0:medium` -> `vibe/mistral-large-4-0`.
@@ -293,11 +296,22 @@ pub(crate) fn mine_sessions(
                 || h.body.contains(&format!("[key:{key}]"))
                 || h.score >= 0.72
         });
+        // Harness2 split: policy/repo-specific friction is "domain"; general tool/model habits are "invariant".
+        let scope = if key.contains("policy_denied") || key.contains("tool_timeout") {
+            "domain"
+        } else {
+            "invariant"
+        };
+        let evidence = format!("{count}x across {} session(s)", report.sessions_scanned);
+        if already_known && count >= 3 {
+            report.stale_rules.push((key.clone(), count));
+        }
         report.candidates.push(LearnCandidate {
             key,
+            scope,
             title,
             body,
-            count,
+            evidence,
             already_known,
         });
     }
@@ -370,7 +384,16 @@ pub(crate) fn format_learn_report(r: &LearnReport) -> String {
         ));
         for c in &r.candidates {
             let tag = if c.already_known { "[known]" } else { "[new]  " };
-            lines.push(format!("  {tag} [{}] {} ({}x) — {}", c.key, c.title, c.count, c.body));
+            lines.push(format!(
+                "  {tag} [{}] [{}] {} (evidence: {}) — {}",
+                c.scope, c.key, c.title, c.evidence, c.body
+            ));
+        }
+        if !r.stale_rules.is_empty() {
+            lines.push("Stale / Ineffective Known Rules (still recurring >=3x — refine or retire):".to_string());
+            for (key, count) in &r.stale_rules {
+                lines.push(format!("  [stale] {key} ({count}x despite existing rule)"));
+            }
         }
         lines.push("  Run /suggestion to curate and apply selected improvements.".to_string());
     }
@@ -459,8 +482,15 @@ mod tests {
             report
                 .candidates
                 .iter()
-                .any(|c| c.key == "learn:edit:edit_without_read" && c.already_known),
+                .any(|c| c.key == "learn:edit:edit_without_read" && c.already_known && c.scope == "invariant"),
             "existing RAG lesson must be marked already_known"
+        );
+        assert!(
+            report
+                .stale_rules
+                .iter()
+                .any(|(k, cnt)| k == "learn:edit:edit_without_read" && *cnt >= 3),
+            "recurring known lesson must be flagged as stale for refinement/retirement"
         );
         assert!(
             report
@@ -472,6 +502,8 @@ mod tests {
 
         let rendered = format_learn_report(&report);
         assert!(rendered.contains("Per-Model Breakdown:"));
+        assert!(rendered.contains("Stale / Ineffective Known Rules"));
+        assert!(rendered.contains("evidence:"));
         assert!(rendered.contains("vibe/mistral-large-4-0"));
         let _ = fs::remove_dir_all(&tmp);
     }

@@ -45,6 +45,7 @@ pub enum AgentEvent {
     ToolCallStart { id: String, name: String },
     ToolCallEnd { id: String, name: String, is_error: bool, output: String },
     SteeringInjected { text: String },
+    TurnUsage { input_tokens: u64, cache_read_tokens: u64 },
     TurnEnd { stop_reason: String },
 }
 
@@ -730,6 +731,12 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
             .cache_write_tokens
             .saturating_add(reply.usage.cache_write_tokens);
         cumulative_usage.cost_usd += reply.usage.cost_usd;
+        if reply.usage.input_tokens > 0 {
+            on_event(AgentEvent::TurnUsage {
+                input_tokens: reply.usage.input_tokens,
+                cache_read_tokens: reply.usage.cache_read_tokens,
+            });
+        }
 
         if !reply.content.trim().is_empty() {
             last_partial_text = reply.content.clone();

@@ -444,6 +444,7 @@ pub(crate) enum WorkerMsg {
     TurnDone {
         provider: String,
         input_tokens: u64,
+        context_tokens: u64,
         output_tokens: u64,
         cache_read_tokens: u64,
         cost_usd: f64,
@@ -1720,6 +1721,7 @@ pub(crate) fn spawn_tui_worker(
                     let mut stream_ms: u128 = 0;
                     let mut stream_start: Option<Instant> = None;
                     let mut last_delta_at: Option<Instant> = None;
+                    let mut last_turn_ctx_tokens: u64 = 0;
                     let res = run_turn_loop_cancellable(
                         &mut bridge,
                         &mut session,
@@ -1740,6 +1742,9 @@ pub(crate) fn spawn_tui_worker(
                                     if let (Some(s), Some(e)) = (stream_start.take(), last_delta_at.take()) {
                                         stream_ms += e.duration_since(s).as_millis();
                                     }
+                                }
+                                AgentEvent::TurnUsage { input_tokens, .. } => {
+                                    last_turn_ctx_tokens = *input_tokens;
                                 }
                                 _ => {}
                             }
@@ -1874,6 +1879,11 @@ pub(crate) fn spawn_tui_worker(
                             let _ = msg_tx.send(WorkerMsg::TurnDone {
                                 provider,
                                 input_tokens: reply.usage.input_tokens,
+                                context_tokens: if last_turn_ctx_tokens > 0 {
+                                    last_turn_ctx_tokens
+                                } else {
+                                    reply.usage.input_tokens
+                                },
                                 output_tokens: reply.usage.output_tokens,
                                 cache_read_tokens: reply.usage.cache_read_tokens,
                                 cost_usd: reply.usage.cost_usd,

@@ -183,6 +183,8 @@ pub struct TuiState {
     pub shell: String,
     pub model_default_thinking: BTreeMap<(String, String), String>,
     pub context_window: u64,
+    /// Prompt tokens of the most recent single LLM turn (used for context % and auto-compact).
+    pub context_tokens: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
@@ -287,6 +289,7 @@ impl TuiState {
             },
             model_default_thinking: BTreeMap::new(),
             context_window: 256_000,
+            context_tokens: 0,
             input_tokens: 0,
             output_tokens: 0,
             cache_read_tokens: 0,

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import html
 from html.parser import HTMLParser
 import os
 import re
@@ -156,6 +158,73 @@ async def _search_ddg(client: httpx.AsyncClient, query: str, num: int) -> list[d
     return parser.results[:num]
 
 
+async def _search_bing(client: httpx.AsyncClient, query: str, num: int) -> list[dict[str, str]]:
+    resp = await client.get(
+        "https://www.bing.com/search",
+        params={"q": query, "count": str(num), "setlang": "en-US"},
+        headers={"User-Agent": _USER_AGENT, "Accept-Language": "en-US,en;q=0.9"},
+    )
+    if not resp.is_success:
+        return []
+    out: list[dict[str, str]] = []
+    for m in re.finditer(r'<li class="b_algo"[^>]*>.*?</li>', resp.text, re.S):
+        block = m.group(0)
+        a = re.search(r'<h2[^>]*><a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block, re.S)
+        if not a:
+            continue
+        href = html.unescape(a.group(1))
+        if "bing.com/ck/a" in href:
+            u = parse_qs(urlparse(href).query).get("u", [""])[0]
+            if u.startswith("a1"):
+                b64 = u[2:] + "=" * (-len(u[2:]) % 4)
+                try:
+                    decoded = base64.urlsafe_b64decode(b64).decode("utf-8", errors="ignore")
+                    if decoded.startswith(("http://", "https://")):
+                        href = decoded
+                except Exception:
+                    pass
+        title = html.unescape(re.sub(r"<[^>]+>", "", a.group(2))).strip()
+        p = re.search(r"<p[^>]*>(.*?)</p>", block, re.S)
+        snip = html.unescape(re.sub(r"<[^>]+>", "", p.group(1))).strip() if p else ""
+        if title and href:
+            out.append({"title": title, "url": href, "snippet": snip})
+        if len(out) >= num:
+            break
+    return out
+
+
+async def _search_ddg_instant(client: httpx.AsyncClient, query: str, num: int) -> list[dict[str, str]]:
+    resp = await client.get(
+        "https://api.duckduckgo.com/",
+        params={"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"},
+        headers={"User-Agent": _USER_AGENT},
+    )
+    if not resp.is_success:
+        return []
+    data = resp.json()
+    out: list[dict[str, str]] = []
+    if data.get("AbstractURL") and data.get("AbstractText"):
+        out.append(
+            {
+                "title": str(data.get("Heading") or query),
+                "url": str(data["AbstractURL"]),
+                "snippet": str(data["AbstractText"]),
+            }
+        )
+    for topic in data.get("RelatedTopics") or []:
+        if isinstance(topic, dict) and topic.get("FirstURL") and topic.get("Text"):
+            out.append(
+                {
+                    "title": str(topic["Text"]).split(" - ")[0][:90],
+                    "url": str(topic["FirstURL"]),
+                    "snippet": str(topic["Text"]),
+                }
+            )
+        if len(out) >= num:
+            break
+    return out[:num]
+
+
 async def web_search(queries: list[str], *, num_results: int = 5) -> str:
     clean_queries = [q.strip() for q in queries if isinstance(q, str) and q.strip()][:4]
     if not clean_queries:
@@ -170,7 +239,13 @@ async def web_search(queries: list[str], *, num_results: int = 5) -> str:
                     res = await _search_brave(client, q, num, brave_key)
                     if res:
                         return q, res
-                return q, await _search_ddg(client, q, num)
+                res = await _search_bing(client, q, num)
+                if res:
+                    return q, res
+                res = await _search_ddg(client, q, num)
+                if res:
+                    return q, res
+                return q, await _search_ddg_instant(client, q, num)
             except Exception as exc:  # noqa: BLE001
                 return q, [{"title": f"Search error: {exc}", "url": "", "snippet": ""}]
 

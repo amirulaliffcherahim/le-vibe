@@ -136,7 +136,7 @@ def build_agy_payload(
                         "name": t.name,
                         "description": t.description,
                         **(
-                            {"parameters": t.parameters}
+                            {"parameters": _sanitize_legacy_schema(t.parameters)}
                             if use_legacy_params
                             else {"parametersJsonSchema": t.parameters}
                         ),
@@ -154,6 +154,35 @@ def build_agy_payload(
         "requestId": f"agent/{agent_id}/{int(time.time() * 1000)}/{traj_id}/{step}",
         "request": request,
     }
+
+
+_LEGACY_UNSUPPORTED_SCHEMA_KEYS = frozenset(
+    {
+        "$schema",
+        "$id",
+        "$defs",
+        "additionalProperties",
+        "minItems",
+        "maxItems",
+        "maxLength",
+        "minLength",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+    }
+)
+
+
+def _sanitize_legacy_schema(obj: Any) -> Any:
+    """Strip JSON-Schema keywords rejected by Google's legacy OpenAPI `parameters` proto (Claude/GPT-OSS)."""
+    if isinstance(obj, dict):
+        return {
+            k: _sanitize_legacy_schema(v)
+            for k, v in obj.items()
+            if k not in _LEGACY_UNSUPPORTED_SCHEMA_KEYS
+        }
+    if isinstance(obj, list):
+        return [_sanitize_legacy_schema(v) for v in obj]
+    return obj
 
 
 class AgyProvider:

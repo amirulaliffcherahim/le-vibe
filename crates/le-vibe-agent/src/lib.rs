@@ -980,6 +980,14 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                         text: "Running codemode script...".to_string(),
                     });
                     match run_codemode_script(script, timeout_ms, |sub_tool, sub_args| {
+                        if let Some(allow) = &config.allowed_tools
+                            && !allow.iter().any(|a| a == sub_tool)
+                        {
+                            return Err(format!(
+                                "[sub_tool={sub_tool}] Policy denied: tool '{sub_tool}' is not allowed in active mode ({}).",
+                                config.mode_name.as_deref().unwrap_or("restricted")
+                            ));
+                        }
                         match sub_tool {
                             "read" => codemode_used_read = true,
                             "retrieve_output" => codemode_used_retrieve = true,

@@ -443,7 +443,9 @@ impl PythonBridge {
         self.stdin.flush()?;
 
         let mut last_activity = std::time::Instant::now();
-        let watchdog_timeout = Duration::from_secs(90);
+        let mut received_any = false;
+        let first_byte_timeout = Duration::from_secs(180);
+        let mid_stream_timeout = Duration::from_secs(120);
         loop {
             if is_cancellable
                 && self
@@ -457,16 +459,24 @@ impl PythonBridge {
             let resp_line = match self.stdout_rx.recv_timeout(Duration::from_millis(25)) {
                 Ok(Ok(l)) => {
                     last_activity = std::time::Instant::now();
+                    received_any = true;
                     l
                 }
                 Ok(Err(e)) => return Err(BridgeError::Spawn(e)),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if is_cancellable && last_activity.elapsed() > watchdog_timeout {
+                    let limit = if received_any {
+                        mid_stream_timeout
+                    } else {
+                        first_byte_timeout
+                    };
+                    if is_cancellable && last_activity.elapsed() > limit {
                         let _ = self.respawn();
                         return Err(BridgeError::Remote {
                             kind: "StreamTimeout".to_string(),
-                            message: "Provider stream stalled (no bytes received for 90s)."
-                                .to_string(),
+                            message: format!(
+                                "Provider stream stalled (no bytes received for {}s).",
+                                limit.as_secs()
+                            ),
                         });
                     }
                     continue;

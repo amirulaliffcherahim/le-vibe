@@ -215,6 +215,8 @@ pub fn sanitize_messages_for_provider(provider: &str, messages: &mut Vec<ChatMes
 fn is_transient_error(err: &BridgeError) -> bool {
     let text = err.to_string();
     [
+        "HTTP 408",
+        "HTTP 409",
         "HTTP 429",
         "HTTP 500",
         "HTTP 502",
@@ -240,6 +242,14 @@ fn is_transient_error(err: &BridgeError) -> bool {
     ]
     .iter()
     .any(|needle| text.contains(needle))
+}
+
+fn parse_retry_after_secs(err_text: &str) -> Option<u64> {
+    let start = err_text.find("[retry_after=")?;
+    let rest = &err_text[start + 13..];
+    let end = rest.find("s]")?;
+    let secs = rest[..end].trim().parse::<u64>().ok()?;
+    Some(secs.clamp(1, 60))
 }
 
 const TOOL_RESULT_MAX_BYTES: usize = 24 * 1024;
@@ -539,6 +549,13 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
     let cwd_for_hooks = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let hooks = HookRegistry::load_default(&cwd_for_hooks, true);
     let mut last_partial_text = String::new();
+    let mut cumulative_usage = le_vibe_pybridge::Usage {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        cost_usd: 0.0,
+    };
     for turn in 0..config.max_turns {
         if is_cancelled(cancel) {
             let note = if last_partial_text.trim().is_empty() {
@@ -639,11 +656,12 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                         && !is_cancelled(cancel) =>
                 {
                     attempt += 1;
-                    let delay_secs = match attempt {
+                    let default_delay = match attempt {
                         1 => 1,
                         2 => 3,
                         _ => 6,
                     };
+                    let delay_secs = parse_retry_after_secs(&err.to_string()).unwrap_or(default_delay);
                     let short_err: String = err.to_string().chars().take(60).collect();
                     on_event(AgentEvent::Status {
                         text: format!(
@@ -679,17 +697,33 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
         };
         telemetry.finish_span(span);
 
+        cumulative_usage.input_tokens = cumulative_usage
+            .input_tokens
+            .saturating_add(reply.usage.input_tokens);
+        cumulative_usage.output_tokens = cumulative_usage
+            .output_tokens
+            .saturating_add(reply.usage.output_tokens);
+        cumulative_usage.cache_read_tokens = cumulative_usage
+            .cache_read_tokens
+            .saturating_add(reply.usage.cache_read_tokens);
+        cumulative_usage.cache_write_tokens = cumulative_usage
+            .cache_write_tokens
+            .saturating_add(reply.usage.cache_write_tokens);
+        cumulative_usage.cost_usd += reply.usage.cost_usd;
+
         if !reply.content.trim().is_empty() {
             last_partial_text = reply.content.clone();
         }
 
         if reply.tool_calls.is_empty() {
-            session.append("assistant", &reply.content)?;
+            let mut final_reply = reply;
+            final_reply.usage = cumulative_usage;
+            session.append("assistant", &final_reply.content)?;
             on_event(AgentEvent::TurnEnd {
-                stop_reason: reply.stop_reason.clone(),
+                stop_reason: final_reply.stop_reason.clone(),
             });
             hooks.run_stop();
-            return Ok(reply);
+            return Ok(final_reply);
         }
 
         messages.push(ChatMessage {
@@ -700,6 +734,30 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
             tool_call_id: None,
             name: None,
         });
+
+        // Pi pattern: if the model hit max output tokens ("length"/"max_tokens"), its tool
+        // arguments may be truncated — fail them safely instead of executing broken edits/scripts.
+        if matches!(reply.stop_reason.as_str(), "length" | "max_tokens") {
+            for tc in &reply.tool_calls {
+                let err_msg = "Tool error: response hit max output tokens (truncated tool arguments); re-issue in smaller chunks.".to_string();
+                let _ = session.append_tool_result(&tc.id, &tc.name, &err_msg);
+                on_event(AgentEvent::ToolCallEnd {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    is_error: true,
+                    output: err_msg.clone(),
+                });
+                messages.push(ChatMessage {
+                    role: "tool".to_string(),
+                    content: err_msg,
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    tool_call_id: Some(tc.id.clone()),
+                    name: Some(tc.name.clone()),
+                });
+            }
+            continue;
+        }
 
         // Fast path: execute pure read-only batches in parallel via std::thread::scope
         // (preserves exact tool_call_id ordering, policy checks, and PreToolUse/PostToolUse hooks).

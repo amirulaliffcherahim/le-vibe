@@ -62,7 +62,22 @@ async def stream_sse_json(
             ) as response:
                 if not response.is_success:
                     body = (await response.aread()).decode("utf-8", errors="replace")
-                    raise RuntimeError(f"HTTP {response.status_code} from {url}: {body[:500]}")
+                    retry_hint = ""
+                    ra_ms = response.headers.get("retry-after-ms")
+                    ra_s = response.headers.get("retry-after")
+                    if ra_ms:
+                        try:
+                            secs = max(1, min(60, int(float(ra_ms) / 1000.0 + 0.999)))
+                            retry_hint = f" [retry_after={secs}s]"
+                        except ValueError:
+                            pass
+                    elif ra_s:
+                        try:
+                            secs = max(1, min(60, int(float(ra_s) + 0.999)))
+                            retry_hint = f" [retry_after={secs}s]"
+                        except ValueError:
+                            pass
+                    raise RuntimeError(f"HTTP {response.status_code}{retry_hint} from {url}: {body[:500]}")
                 async for raw_line in response.aiter_lines():
                     line = raw_line.strip()
                     if not line or not line.startswith("data:"):

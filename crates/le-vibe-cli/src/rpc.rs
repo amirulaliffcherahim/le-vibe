@@ -1,12 +1,14 @@
-use le_vibe_agent::{AgentConfig, AgentEvent, run_turn_loop_streaming};
+use le_vibe_agent::{AgentConfig, AgentEvent, ApprovalChoice, run_turn_loop_cancellable};
 use le_vibe_durable::SessionStore;
+use le_vibe_mcp::McpManager;
 use le_vibe_pybridge::{ProviderPort, PythonBridge};
 use le_vibe_telemetry::TelemetryRecorder;
+use le_vibe_tools::TodoStore;
 use le_vibe_tui::{AgentMode, build_system_prompt};
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 
-use crate::settings::{cwd_string, self_repo_path};
+use crate::settings::{cwd_string, default_mcp_paths, self_repo_path};
 
 pub(crate) fn run_streaming_prompt(
     bridge: &mut PythonBridge,
@@ -16,22 +18,36 @@ pub(crate) fn run_streaming_prompt(
     prompt: &str,
     json_mode: bool,
 ) {
-    let res = run_turn_loop_streaming(bridge, session, telemetry, cfg, prompt, |ev| {
-        if json_mode {
-            println!("{}", serde_json::to_string(&ev).unwrap());
-            return;
-        }
-        match ev {
-            AgentEvent::TextDelta { delta } => {
-                print!("{delta}");
-                let _ = io::stdout().flush();
+    let mut todos = TodoStore::new();
+    let mut mcp = McpManager::from_config_files(&default_mcp_paths());
+    let res = run_turn_loop_cancellable(
+        bridge,
+        session,
+        telemetry,
+        &mut todos,
+        Some(&mut mcp),
+        None,
+        cfg,
+        prompt,
+        |ev| {
+            if json_mode {
+                println!("{}", serde_json::to_string(&ev).unwrap());
+                return;
             }
-            AgentEvent::ToolCallStart { name, .. } => {
-                eprintln!("\n[tool:{name}]");
+            match ev {
+                AgentEvent::TextDelta { delta } => {
+                    print!("{delta}");
+                    let _ = io::stdout().flush();
+                }
+                AgentEvent::ToolCallStart { name, .. } => {
+                    eprintln!("\n[tool:{name}]");
+                }
+                _ => {}
             }
-            _ => {}
-        }
-    });
+        },
+        |_| ApprovalChoice::AllowOnce,
+        |_| "No interactive UI available.".to_string(),
+    );
     if !json_mode {
         println!();
     }
@@ -66,6 +82,8 @@ pub(crate) fn run_rpc_mode(
     model: &mut String,
 ) {
     let stdin = io::stdin();
+    let mut todos = TodoStore::new();
+    let mut mcp = McpManager::from_config_files(&default_mcp_paths());
     let output_store = std::sync::Arc::new(std::sync::Mutex::new(le_vibe_agent::OutputStore::new()));
     let mut cached_model_note: Option<(String, Option<String>)> = None;
     for line in stdin.lock().lines().map_while(Result::ok) {
@@ -136,9 +154,21 @@ pub(crate) fn run_rpc_mode(
                     steering_queue: None,
                     output_store: Some(std::sync::Arc::clone(&output_store)),
                 };
-                match run_turn_loop_streaming(bridge, session, telemetry, &cfg, text, |ev| {
-                    println!("{}", json!({"id": id, "event": ev}));
-                }) {
+                match run_turn_loop_cancellable(
+                    bridge,
+                    session,
+                    telemetry,
+                    &mut todos,
+                    Some(&mut mcp),
+                    None,
+                    &cfg,
+                    text,
+                    |ev| {
+                        println!("{}", json!({"id": id, "event": ev}));
+                    },
+                    |_| ApprovalChoice::AllowOnce,
+                    |_| "No interactive UI available.".to_string(),
+                ) {
                     Ok(reply) => json!({"id": id, "result": reply}),
                     Err(e) => json!({"id": id, "error": e.to_string()}),
                 }

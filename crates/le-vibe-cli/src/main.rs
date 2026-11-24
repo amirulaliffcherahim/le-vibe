@@ -1305,65 +1305,12 @@ fn run_interactive_tui(
             }
             TuiAction::PasteClipboard => {
                 if let Some(item) = grab_clipboard_item() {
-                    match item {
-                        PastedItem::Image { name, mime, base64 } => {
-                            state.pending_attachments.push((name.clone(), mime, base64));
-                            state.blocks.push(TranscriptBlock::System(format!(
-                                "Attached clipboard image: {name}"
-                            )));
-                        }
-                        PastedItem::ImageTooLarge(msg) => {
-                            state.blocks.push(TranscriptBlock::System(format!(
-                                "Image skipped: {msg}"
-                            )));
-                        }
-                        PastedItem::FilePath(path) => {
-                            let ins = format!("@{path} ");
-                            state.input.insert_str(state.cursor, &ins);
-                            state.cursor += ins.len();
-                        }
-                        PastedItem::PlainText(txt) => {
-                            let norm = txt.replace("\r\n", "\n").replace('\r', "\n");
-                            state.input.insert_str(state.cursor, &norm);
-                            state.cursor += norm.len();
-                        }
-                    }
+                    apply_pasted_item(&mut state, item);
                 }
             }
-            TuiAction::Pasted(raw) => match classify_pasted_text(&raw) {
-                PastedItem::Image { name, mime, base64 } => {
-                    state.pending_attachments.push((name.clone(), mime, base64));
-                    state.blocks.push(TranscriptBlock::System(format!(
-                        "Attached pasted image: {name}"
-                    )));
-                }
-                PastedItem::ImageTooLarge(msg) => {
-                    state.blocks.push(TranscriptBlock::System(format!(
-                        "Image skipped: {msg}"
-                    )));
-                }
-                PastedItem::FilePath(path) => {
-                    let ins = format!("@{path} ");
-                    state.input.insert_str(state.cursor, &ins);
-                    state.cursor += ins.len();
-                    state.selected_slash_idx = 0;
-                }
-                PastedItem::PlainText(txt) => {
-                    let norm = txt.replace("\r\n", "\n").replace('\r', "\n");
-                    let line_count = norm.lines().count();
-                    if norm.chars().count() > 1000 || line_count > 10 {
-                        let idx = state.collapsed_pastes.len() + 1;
-                        let pill = format!("[pasted #{idx}: {line_count} lines]");
-                        state.collapsed_pastes.push((pill.clone(), norm));
-                        state.input.insert_str(state.cursor, &pill);
-                        state.cursor += pill.len();
-                    } else {
-                        state.input.insert_str(state.cursor, &norm);
-                        state.cursor += norm.len();
-                    }
-                    state.selected_slash_idx = 0;
-                }
-            },
+            TuiAction::Pasted(raw) => {
+                apply_pasted_item(&mut state, classify_pasted_text(&raw));
+            }
             TuiAction::CycleModel => {
                 let pool = state.cycle_pool();
                 if !pool.is_empty() {
@@ -2343,6 +2290,50 @@ fn run_interactive_tui(
     }
 }
 
+
+/// Insert a pasted image, file path, or text block into the editor using Pi-style `[...]` pills
+/// so multi-line blocks, files, and images never flood the input box or auto-submit.
+fn apply_pasted_item(state: &mut TuiState, item: PastedItem) {
+    match item {
+        PastedItem::Image { name, mime, base64 } => {
+            state.pending_attachments.push((name.clone(), mime, base64));
+            let idx = state.pending_attachments.len();
+            let pill = format!("[image #{idx}: {name}] ");
+            state.input.insert_str(state.cursor, &pill);
+            state.cursor += pill.len();
+            state.selected_slash_idx = 0;
+        }
+        PastedItem::ImageTooLarge(msg) => {
+            state
+                .blocks
+                .push(TranscriptBlock::System(format!("Image skipped: {msg}")));
+        }
+        PastedItem::FilePath(path) => {
+            let pill = format!("[file: {path}]");
+            let ins = format!("{pill} ");
+            state.collapsed_pastes.push((pill, format!("@{path}")));
+            state.input.insert_str(state.cursor, &ins);
+            state.cursor += ins.len();
+            state.selected_slash_idx = 0;
+        }
+        PastedItem::PlainText(txt) => {
+            let norm = txt.replace("\r\n", "\n").replace('\r', "\n");
+            let line_count = norm.lines().count();
+            if line_count >= 4 || norm.chars().count() > 300 {
+                let idx = state.collapsed_pastes.len() + 1;
+                let pill = format!("[paste #{idx} +{line_count} lines]");
+                let ins = format!("{pill} ");
+                state.collapsed_pastes.push((pill, norm));
+                state.input.insert_str(state.cursor, &ins);
+                state.cursor += ins.len();
+            } else {
+                state.input.insert_str(state.cursor, &norm);
+                state.cursor += norm.len();
+            }
+            state.selected_slash_idx = 0;
+        }
+    }
+}
 
 fn copy_to_clipboard(text: &str) -> bool {
     copy_to_clipboard_dual(text, None)

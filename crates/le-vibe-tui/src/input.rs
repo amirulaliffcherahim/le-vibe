@@ -21,7 +21,7 @@ fn next_terminal_event(timeout: Duration) -> io::Result<Option<Event>> {
 }
 
 /// Detect unbracketed multi-line pastes by peeking past ConPTY `Release` / `Mouse` noise
-/// for an immediately queued character/newline key press.
+/// for an immediately queued character/newline key press (20ms window covers ConPTY chunking).
 fn has_queued_paste_key() -> bool {
     if PENDING_EVENTS.with(|q| {
         q.borrow().iter().any(|ev| {
@@ -35,9 +35,14 @@ fn has_queued_paste_key() -> bool {
     }) {
         return true;
     }
-    while event::poll(Duration::ZERO).unwrap_or(false) {
+    let deadline = Instant::now() + Duration::from_millis(20);
+    loop {
+        let rem = deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() || !event::poll(rem).unwrap_or(false) {
+            return false;
+        }
         let Ok(ev) = event::read() else {
-            break;
+            return false;
         };
         match &ev {
             Event::Key(k) if k.kind == KeyEventKind::Release => continue,
@@ -62,7 +67,96 @@ fn has_queued_paste_key() -> bool {
             }
         }
     }
-    false
+}
+
+/// Coalesce an unbracketed ConPTY paste burst (e.g. right-click or Shift+Insert) into a single
+/// `TuiAction::Pasted(text)` so newlines never auto-submit and multi-line pastes collapse cleanly.
+fn try_coalesce_unbracketed_paste(first_ch: char) -> Option<String> {
+    let initial_deadline = Instant::now() + Duration::from_millis(6);
+    let ev = loop {
+        if let Some(ev) = PENDING_EVENTS.with(|q| q.borrow_mut().pop_front()) {
+            break ev;
+        }
+        let rem = initial_deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() || !event::poll(rem).unwrap_or(false) {
+            return None;
+        }
+        let Ok(ev) = event::read() else {
+            return None;
+        };
+        match &ev {
+            Event::Key(k) if k.kind == KeyEventKind::Release => continue,
+            Event::Mouse(m)
+                if !matches!(
+                    m.kind,
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                ) =>
+            {
+                continue;
+            }
+            _ => break ev,
+        }
+    };
+    let mut buf = String::new();
+    buf.push(first_ch);
+    let push_key = |buf: &mut String, ev: Event| -> bool {
+        match ev {
+            Event::Key(k)
+                if matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                    && !k.modifiers.contains(KeyModifiers::CONTROL)
+                    && !k.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                match k.code {
+                    KeyCode::Char(c) => {
+                        buf.push(c);
+                        true
+                    }
+                    KeyCode::Enter => {
+                        buf.push('\n');
+                        true
+                    }
+                    KeyCode::Tab => {
+                        buf.push('\t');
+                        true
+                    }
+                    _ => {
+                        PENDING_EVENTS.with(|q| q.borrow_mut().push_back(Event::Key(k)));
+                        false
+                    }
+                }
+            }
+            other => {
+                PENDING_EVENTS.with(|q| q.borrow_mut().push_back(other));
+                false
+            }
+        }
+    };
+    if !push_key(&mut buf, ev) {
+        return None;
+    }
+
+    // Drain the rest of the burst with a 20ms inter-chunk window (up to 64KB safety cap).
+    while buf.len() < 65_536 {
+        let Some(next) = next_terminal_event(Duration::from_millis(20)).ok().flatten() else {
+            break;
+        };
+        match &next {
+            Event::Key(k) if k.kind == KeyEventKind::Release => continue,
+            Event::Mouse(m)
+                if !matches!(
+                    m.kind,
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                ) =>
+            {
+                continue;
+            }
+            _ => {}
+        }
+        if !push_key(&mut buf, next) {
+            break;
+        }
+    }
+    Some(buf)
 }
 
 use crate::commands::filter_slash_commands_with_dynamic;
@@ -238,6 +332,14 @@ pub fn poll_tui_action(state: &mut TuiState, timeout: Duration) -> io::Result<Tu
                         return Ok(TuiAction::Redraw);
                     }
                     continue;
+                }
+                if state.modal == ActiveModal::None
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                    && let KeyCode::Char(c) = key.code
+                    && let Some(burst) = try_coalesce_unbracketed_paste(c)
+                {
+                    return Ok(TuiAction::Pasted(burst));
                 }
                 let action = handle_key_event(state, key)?;
                 if matches!(action, TuiAction::None) {

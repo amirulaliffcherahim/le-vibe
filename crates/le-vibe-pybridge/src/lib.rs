@@ -146,6 +146,20 @@ pub trait ProviderPort {
     fn list_providers(&mut self) -> Result<Vec<String>, BridgeError>;
     fn list_models(&mut self, provider: Option<&str>) -> Result<Vec<ModelSpec>, BridgeError>;
     fn complete(&mut self, request: CompletionRequest) -> Result<AssistantMessage, BridgeError>;
+    fn web_search(&mut self, queries: &[String], num_results: usize) -> Result<String, BridgeError> {
+        let _ = (queries, num_results);
+        Err(BridgeError::Remote {
+            kind: "Unsupported".to_string(),
+            message: "web_search not implemented on this bridge".to_string(),
+        })
+    }
+    fn fetch_content(&mut self, url: &str, mode: &str) -> Result<String, BridgeError> {
+        let _ = (url, mode);
+        Err(BridgeError::Remote {
+            kind: "Unsupported".to_string(),
+            message: "fetch_content not implemented on this bridge".to_string(),
+        })
+    }
     fn stream_complete(
         &mut self,
         request: CompletionRequest,
@@ -606,6 +620,27 @@ impl ProviderPort for PythonBridge {
     fn complete(&mut self, request: CompletionRequest) -> Result<AssistantMessage, BridgeError> {
         let val = self.call("providers.complete", serde_json::to_value(request)?)?;
         Ok(serde_json::from_value(val)?)
+    }
+
+    fn web_search(&mut self, queries: &[String], num_results: usize) -> Result<String, BridgeError> {
+        let val = self.call(
+            "web.search",
+            json!({ "queries": queries, "num_results": num_results }),
+        )?;
+        Ok(val
+            .get("output")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string())
+    }
+
+    fn fetch_content(&mut self, url: &str, mode: &str) -> Result<String, BridgeError> {
+        let val = self.call("web.fetch", json!({ "url": url, "mode": mode }))?;
+        Ok(val
+            .get("output")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string())
     }
 
     fn stream_complete(

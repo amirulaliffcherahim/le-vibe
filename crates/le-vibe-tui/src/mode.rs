@@ -64,6 +64,8 @@ impl AgentMode {
                 "memory_search".into(),
                 "memory_read".into(),
                 "retrieve_output".into(),
+                "web_search".into(),
+                "fetch_content".into(),
             ]),
             AgentMode::Rea => Some(vec![
                 "read".into(),
@@ -75,6 +77,8 @@ impl AgentMode {
                 "memory_search".into(),
                 "memory_read".into(),
                 "retrieve_output".into(),
+                "web_search".into(),
+                "fetch_content".into(),
             ]),
         }
     }

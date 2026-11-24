@@ -363,6 +363,25 @@ class BridgeRuntime:
         if method == "policy.status":
             return self.policy.summary()
 
+        if method == "web.search":
+            from le_vibe.providers.web import web_search
+
+            raw_queries = params.get("queries")
+            if isinstance(raw_queries, list) and raw_queries:
+                queries = [str(q) for q in raw_queries]
+            else:
+                q = str(params.get("query") or "").strip()
+                queries = [q] if q else []
+            num = int(params.get("num_results") or params.get("numResults") or 5)
+            return {"output": await web_search(queries, num_results=num)}
+
+        if method == "web.fetch":
+            from le_vibe.providers.web import fetch_content
+
+            url = str(params.get("url") or "")
+            mode = str(params.get("mode") or "readable")
+            return {"output": await fetch_content(url, mode=mode)}
+
         raise ValueError(f"Unknown bridge method: {method!r}")
 
 

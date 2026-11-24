@@ -165,6 +165,30 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "web_search".to_string(),
+            description: "Search the web concurrently (prefer `queries` with 2-4 varied angles, or single `query`). Returns titles, URLs, and snippets.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "queries": { "type": "array", "items": { "type": "string" } },
+                    "numResults": { "type": "integer" }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "fetch_content".to_string(),
+            description: "Fetch a web page over HTTP(S) and extract clean readable Markdown/text (`mode='readable'`, default) or exact raw body (`mode='raw'`).".to_string(),
+            parameters: json!({
+                "type": "object",
+                "required": ["url"],
+                "properties": {
+                    "url": { "type": "string" },
+                    "mode": { "type": "string", "enum": ["readable", "raw"] }
+                }
+            }),
+        },
+        ToolDefinition {
             name: "retrieve_output".to_string(),
             description: "Retrieve exact lines from a previously compressed tool output by ref id (e.g. 'out_1'), optionally filtered by substring query or 1-based line offset/limit.".to_string(),
             parameters: json!({
@@ -255,7 +279,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "codemode".to_string(),
-            description: "Run one Python script that batches tools.<name>(**kwargs) (read, grep, find, ls, write, edit, bash, powershell, todo, retrieve_output, mcp__*) and filters/aggregates results in Python before printing only the concise answer. Globals: tools, text(v), print(...), store(k,v), load(k), json, re, Path.".to_string(),
+            description: "Run one Python script that batches tools.<name>(**kwargs) (read, grep, find, ls, write, edit, bash, powershell, todo, retrieve_output, web_search, fetch_content, mcp__*) and filters/aggregates results in Python before printing only the concise answer. Globals: tools, text(v), print(...), store(k,v), load(k), json, re, Path.".to_string(),
             parameters: json!({
                 "type": "object",
                 "required": ["script"],

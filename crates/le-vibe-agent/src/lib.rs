@@ -244,6 +244,26 @@ fn is_transient_error(err: &BridgeError) -> bool {
     .any(|needle| text.contains(needle))
 }
 
+fn extract_web_queries(args: &Value) -> Vec<String> {
+    if let Some(arr) = args.get("queries").and_then(Value::as_array) {
+        let qs: Vec<String> = arr
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !qs.is_empty() {
+            return qs;
+        }
+    }
+    args.get("query")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| vec![s.to_string()])
+        .unwrap_or_default()
+}
+
 fn parse_retry_after_secs(err_text: &str) -> Option<u64> {
     let start = err_text.find("[retry_after=")?;
     let rest = &err_text[start + 13..];
@@ -963,7 +983,9 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                         match sub_tool {
                             "read" => codemode_used_read = true,
                             "retrieve_output" => codemode_used_retrieve = true,
-                            "bash" | "powershell" => codemode_used_exec = true,
+                            "bash" | "powershell" | "web_search" | "fetch_content" => {
+                                codemode_used_exec = true
+                            }
                             s if s.starts_with("mcp__") => codemode_used_exec = true,
                             _ => {}
                         }
@@ -993,6 +1015,26 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                         if sub_tool == "todo" {
                             return execute_todo_tool(todos, &sub_args)
                                 .map_err(|e| format!("[sub_tool={sub_tool}] {e}"));
+                        }
+                        if sub_tool == "web_search" {
+                            let queries = extract_web_queries(&sub_args);
+                            let num = sub_args
+                                .get("numResults")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(5) as usize;
+                            return bridge
+                                .web_search(&queries, num)
+                                .map_err(|e| format!("[sub_tool=web_search] {e}"));
+                        }
+                        if sub_tool == "fetch_content" {
+                            let url = sub_args.get("url").and_then(Value::as_str).unwrap_or("");
+                            let mode = sub_args
+                                .get("mode")
+                                .and_then(Value::as_str)
+                                .unwrap_or("readable");
+                            return bridge
+                                .fetch_content(url, mode)
+                                .map_err(|e| format!("[sub_tool=fetch_content] {e}"));
                         }
                         if sub_tool.starts_with("mcp__")
                             && let Some(m) = mcp.as_deref_mut()
@@ -1062,6 +1104,28 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                         Ok(child_reply) => (child_reply.content, false),
                         Err(err) => (format!("Subagent error: {err}"), true),
                     }
+                }
+            } else if tc.name == "web_search" {
+                let queries = extract_web_queries(&tc.arguments);
+                let num = tc
+                    .arguments
+                    .get("numResults")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(5) as usize;
+                match bridge.web_search(&queries, num) {
+                    Ok(out) => (out, false),
+                    Err(err) => (format!("Tool error: {err}"), true),
+                }
+            } else if tc.name == "fetch_content" {
+                let url = tc.arguments.get("url").and_then(Value::as_str).unwrap_or("");
+                let mode = tc
+                    .arguments
+                    .get("mode")
+                    .and_then(Value::as_str)
+                    .unwrap_or("readable");
+                match bridge.fetch_content(url, mode) {
+                    Ok(out) => (out, false),
+                    Err(err) => (format!("Tool error: {err}"), true),
                 }
             } else if tc.name == "retrieve_output" {
                 let id = tc.arguments.get("id").and_then(Value::as_str).unwrap_or("");

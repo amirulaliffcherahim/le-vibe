@@ -224,6 +224,8 @@ fn is_transient_error(err: &BridgeError) -> bool {
         "HTTP 522",
         "HTTP 524",
         "ReadTimeout",
+        "StreamTimeout",
+        "stream stalled",
         "ConnectTimeout",
         "WriteTimeout",
         "PoolTimeout",

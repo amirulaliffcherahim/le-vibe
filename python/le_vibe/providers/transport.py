@@ -42,7 +42,7 @@ async def stream_sse_json(
     *,
     headers: Mapping[str, str],
     payload: dict[str, Any],
-    timeout_s: float = 120.0,
+    timeout_s: float = 180.0,
     client: httpx.AsyncClient | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """POST JSON and yield parsed SSE `data:` payloads until `[DONE]`."""

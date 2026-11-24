@@ -984,16 +984,24 @@ pub(crate) fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         Some(tps) => format!("⚡ {tps:.1} t/s"),
         None => "⚡ —".to_string(),
     };
-    let ctx_pct = if state.context_window > 0 {
-        (state.input_tokens as f64 / state.context_window as f64) * 100.0
+    // After compaction `context_tokens` resets to 0 while cumulative `input_tokens > 0`:
+    // mirror Pi's footer (`?/1.0M (auto)`) until the next LLM turn reports exact prompt size.
+    let (ctx_pct, ctx_text) = if state.context_window == 0 {
+        (0.0, "◔ ?".to_string())
+    } else if state.context_tokens == 0 && state.input_tokens > 0 {
+        (
+            0.0,
+            format!("◔ ?/{} (auto)", format_tokens(state.context_window)),
+        )
     } else {
-        0.0
-    };
-    // Pi colors context pressure at the same thresholds and shows the window size.
-    let ctx_text = if state.context_window > 0 {
-        format!("◔ {ctx_pct:.1}%/{} (auto)", format_tokens(state.context_window))
-    } else {
-        "◔ ?".to_string()
+        let pct = (state.context_tokens as f64 / state.context_window as f64) * 100.0;
+        (
+            pct,
+            format!(
+                "◔ {pct:.1}%/{} (auto)",
+                format_tokens(state.context_window)
+            ),
+        )
     };
     let ctx_color = if ctx_pct > 90.0 {
         pal.error

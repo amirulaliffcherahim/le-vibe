@@ -864,6 +864,7 @@ fn run_interactive_tui(
                 WorkerMsg::TurnDone {
                     provider,
                     input_tokens,
+                    context_tokens,
                     output_tokens,
                     cache_read_tokens,
                     cost_usd,
@@ -881,6 +882,9 @@ fn run_interactive_tui(
                         .unwrap_or(0);
                     state.last_tps = tps;
                     state.git_badges = git_badges;
+                    if context_tokens > 0 {
+                        state.context_tokens = context_tokens;
+                    }
                     state.record_usage(
                         &provider,
                         input_tokens,
@@ -924,6 +928,9 @@ fn run_interactive_tui(
                     if text.starts_with("Interrupted") {
                         active_prompt = false;
                     }
+                    if text.starts_with("Compacted session") {
+                        state.context_tokens = 0;
+                    }
                     state.blocks.push(TranscriptBlock::System(text));
                 }
                 WorkerMsg::InfoModal { title, lines } => {
@@ -964,6 +971,7 @@ fn run_interactive_tui(
                 } => {
                     if reset_usage {
                         state.input_tokens = 0;
+                        state.context_tokens = 0;
                         state.output_tokens = 0;
                         state.cache_read_tokens = 0;
                         state.cost_usd = 0.0;
@@ -1681,6 +1689,7 @@ fn run_interactive_tui(
                 }
                 if input == "/new" {
                     state.input_tokens = 0;
+                    state.context_tokens = 0;
                     state.output_tokens = 0;
                     state.cache_read_tokens = 0;
                     state.cost_usd = 0.0;
@@ -2250,7 +2259,7 @@ fn run_interactive_tui(
 
                 if state.auto_compact
                     && state.context_window > 0
-                    && state.input_tokens
+                    && state.context_tokens
                         >= (state.context_window * state.compact_threshold_pct) / 100
                 {
                     state.blocks.push(TranscriptBlock::System(format!(

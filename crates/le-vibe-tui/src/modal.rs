@@ -657,7 +657,13 @@ fn draw_question_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let custom_sel = state.modal_idx == custom_idx;
     let custom_ptr = if custom_sel { "▸ " } else { "  " };
     let custom_label = if item.custom_text.is_empty() {
-        "Type something.".to_string()
+        if custom_sel {
+            "Type something. ▌".to_string()
+        } else {
+            "Type something.".to_string()
+        }
+    } else if custom_sel {
+        format!("{}▌", item.custom_text)
     } else {
         item.custom_text.clone()
     };
@@ -676,7 +682,8 @@ fn draw_question_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         ),
     ]));
 
-    if has_preview && inner_area.width >= 72 {
+    // Pi rpiv-ask-user-question UX: expand to full width while typing on "Type something."
+    if has_preview && !custom_sel && inner_area.width >= 72 {
         let panes = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])

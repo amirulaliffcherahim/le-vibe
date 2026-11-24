@@ -155,12 +155,39 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "ask_user_question".to_string(),
-            description: "Ask the user 1-4 structured clarifying questions with 2-4 options each".to_string(),
+            description: "Ask the user 1-4 structured clarifying questions (rpiv-ask-user-question parity). Each question has header (<=16 chars), question, optional multiSelect, and 2-4 options ({label, description, preview?}). Do not author 'Other' or 'Type something.' — it is appended automatically.".to_string(),
             parameters: json!({
                 "type": "object",
                 "required": ["questions"],
                 "properties": {
-                    "questions": { "type": "array" }
+                    "questions": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 4,
+                        "items": {
+                            "type": "object",
+                            "required": ["header", "question", "options"],
+                            "properties": {
+                                "header": { "type": "string", "maxLength": 16 },
+                                "question": { "type": "string" },
+                                "multiSelect": { "type": "boolean" },
+                                "options": {
+                                    "type": "array",
+                                    "minItems": 2,
+                                    "maxItems": 4,
+                                    "items": {
+                                        "type": "object",
+                                        "required": ["label", "description"],
+                                        "properties": {
+                                            "label": { "type": "string", "maxLength": 60 },
+                                            "description": { "type": "string" },
+                                            "preview": { "type": "string" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }),
         },

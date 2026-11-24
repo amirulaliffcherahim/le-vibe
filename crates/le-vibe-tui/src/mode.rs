@@ -149,7 +149,9 @@ pub fn build_system_prompt(
          - Be concise, direct, and easy to understand: use plain, simple language instead of heavy technical jargon; if a technical term is unavoidable, explain it in a few plain words.\n\
          - Make every output copy-paste friendly: put ready-to-run commands, configs, and code in clean fenced code blocks (` ```lang `), and keep Markdown tables compact with short cell values.\n\
          - Show exact file paths. Only report results directly observed from tool output.\n\
-         - Use `todo` for multi-step work (3+ steps); keep exactly one task `in_progress` and verify before marking `completed`.\n\
+         - `todo` (4-state: `pending` -> `in_progress` -> `completed`, plus `deleted`): use for 3+ step work; batch independent tasks via `tasks[]`; pass `activeForm` (e.g. `'writing tests'`) when marking `in_progress`; keep exactly one `in_progress`; mark `completed` immediately when verified (never while failing).\n\
+         - `ask_user_question`: group clarifying questions into 1 call (1-4 questions, 2-4 options each, `header` <=16 chars, recommended option first with `(Recommended)`, optional `preview` for mockups/snippets; never author 'Other' or 'Type something.').\n\
+         - `web_search` / `fetch_content`: use only for external or current docs; prefer `queries: [...]` with 2-4 varied angles.\n\
          </rules>\n\n\
          <efficiency>\n\
          - Context engineering: start with manifests/entry points (`README.md`, `Cargo.toml`, `package.json`), locate symbols with `grep`/`find`, then `read` targeted `offset`/`limit` ranges instead of dumping whole files.\n\

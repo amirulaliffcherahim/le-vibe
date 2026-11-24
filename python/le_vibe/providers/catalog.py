@@ -283,9 +283,14 @@ def _agy_group_models(
     """Collapse thinking variants into one base model whose thinking_level_map routes them."""
     groups: dict[str, _AgyGroup] = {}
     for runtime_id, info in models_map.items():
-        if not isinstance(runtime_id, str) or not runtime_id.startswith(("gemini-", "claude-", "gpt-oss-")):
+        if not isinstance(runtime_id, str) or not runtime_id.strip():
             continue
-        if runtime_id.startswith(("chat_", "tab_")) or "image" in runtime_id.lower() or runtime_id.endswith("-disabled"):
+        lower_id = runtime_id.lower()
+        if (
+            lower_id.startswith(("chat_", "tab_", "embed", "tts", "whisper"))
+            or any(tok in lower_id for tok in ("image", "embedding", "moderation", "audio"))
+            or lower_id.endswith("-disabled")
+        ):
             continue
         info_dict = info if isinstance(info, dict) else {}
         if info_dict.get("isInternal"):

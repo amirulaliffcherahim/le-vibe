@@ -340,6 +340,26 @@ def test_ids_without_a_display_name_are_humanized() -> None:
     assert names["gemini-4-neon-lite"] == "Gemini 4 Neon Lite"
 
 
+def test_agy_auto_discovers_future_model_families_without_allowlist() -> None:
+    from le_vibe.providers.catalog import _agy_group_models
+
+    raw = {
+        "helium-1-pro-low": {"displayName": "Helium 1 Pro (Low)", "supportsThinking": True},
+        "helium-1-pro-high": {"displayName": "Helium 1 Pro (High)", "supportsThinking": True},
+        "glm-5.4": {"displayName": "GLM 5.4"},
+        "tab_autocomplete_v2": {"displayName": "Tab"},
+        "imagen-4-image-gen": {"displayName": "Image"},
+        "internal-canary": {"displayName": "Canary", "isInternal": True},
+    }
+    models = _agy_group_models(raw, "https://example.invalid")
+    ids = [m.id for m in models]
+    assert "helium-1-pro" in ids
+    assert "glm-5.4" in ids
+    assert "tab_autocomplete_v2" not in ids
+    assert "imagen-4-image-gen" not in ids
+    assert "internal-canary" not in ids
+
+
 def test_catalog_reports_freshness_and_can_skip_a_fresh_refresh() -> None:
     import asyncio
 

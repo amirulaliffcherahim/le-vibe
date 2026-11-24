@@ -121,8 +121,13 @@ pub fn mode_transition_reminder(prev: Option<&str>, current: &str) -> Option<Str
 }
 
 pub fn sanitize_messages_for_provider(provider: &str, messages: &mut Vec<ChatMessage>) {
-    // Drop stale mode-change reminders from historical replay
-    messages.retain(|m| !m.content.starts_with(MODE_REMINDER_PREFIX));
+    // Drop stale mode-change reminders and empty assistant turns from historical replay
+    messages.retain(|m| {
+        !m.content.starts_with(MODE_REMINDER_PREFIX)
+            && (m.role != "assistant"
+                || !m.content.trim().is_empty()
+                || !m.tool_calls.is_empty())
+    });
 
     let mut normalized: Vec<ChatMessage> = Vec::with_capacity(messages.len());
     let mut i = 0;
@@ -576,6 +581,45 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                     _ => {}
                 },
             ) {
+                Ok(r)
+                    if r.content.trim().is_empty()
+                        && r.tool_calls.is_empty()
+                        && attempt < config.max_retries
+                        && !is_cancelled(cancel) =>
+                {
+                    attempt += 1;
+                    let delay_secs = match attempt {
+                        1 => 1,
+                        2 => 2,
+                        _ => 4,
+                    };
+                    on_event(AgentEvent::Status {
+                        text: format!(
+                            "Empty response from model — retrying ({attempt}/{}) in {delay_secs}s...",
+                            config.max_retries
+                        ),
+                    });
+                    for _ in 0..(delay_secs * 20) {
+                        if is_cancelled(cancel) {
+                            telemetry.finish_span(span);
+                            let note = if last_partial_text.trim().is_empty() {
+                                "[Interrupted by user]".to_string()
+                            } else {
+                                format!("{last_partial_text}\n\n[Interrupted by user]")
+                            };
+                            let _ = session.append("assistant", &note);
+                            return Err(AgentError::Cancelled);
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+                Ok(r) if r.content.trim().is_empty() && r.tool_calls.is_empty() => {
+                    telemetry.finish_span(span);
+                    return Err(AgentError::Bridge(BridgeError::Remote {
+                        kind: "EmptyResponse".to_string(),
+                        message: "Provider returned an empty response (0 text, 0 tool calls). Resend or switch model.".to_string(),
+                    }));
+                }
                 Ok(r) => break r,
                 Err(BridgeError::Cancelled) => {
                     telemetry.finish_span(span);

@@ -549,9 +549,11 @@ impl TuiState {
         self.output_tokens += out_tok;
         self.cache_read_tokens += cache_tok;
         self.cost_usd += cost;
-        let prompt = in_tok + cache_tok;
+        // All 3 providers (agy, vibe, deepseek) report total prompt tokens in `in_tok`
+        // (already including `cache_tok`), so never add `cache_tok` a second time.
+        let prompt = in_tok.max(cache_tok);
         if prompt > 0 {
-            self.last_cache_rate = Some((cache_tok as f64 / prompt as f64) * 100.0);
+            self.last_cache_rate = Some(((cache_tok as f64 / prompt as f64) * 100.0).min(100.0));
         }
         let entry = self
             .provider_usage

@@ -48,15 +48,17 @@ def build_agy_payload(
     project_id: str = "",
 ) -> dict[str, Any]:
     runtime_model = resolve_agy_runtime_model(model, options.thinking_level)
+    is_claude = runtime_model.startswith("claude-")
     contents: list[dict[str, Any]] = []
     for msg in context.messages:
         if msg.role == "tool":
-            resp_part = {
-                "functionResponse": {
-                    "name": msg.name or "tool",
-                    "response": {"output": msg.content},
-                }
+            fr_body: dict[str, Any] = {
+                "name": msg.name or "tool",
+                "response": {"output": msg.content},
             }
+            if is_claude and msg.tool_call_id:
+                fr_body["id"] = msg.tool_call_id
+            resp_part = {"functionResponse": fr_body}
             if contents and contents[-1]["role"] == "user" and all(
                 "functionResponse" in p for p in contents[-1]["parts"]
             ):
@@ -77,7 +79,10 @@ def build_agy_payload(
             else:
                 parts.append({"text": msg.content})
         for tc in msg.tool_calls:
-            fc_part: dict[str, Any] = {"functionCall": {"name": tc.name, "args": tc.arguments}}
+            fc_body: dict[str, Any] = {"name": tc.name, "args": tc.arguments}
+            if is_claude and tc.id:
+                fc_body["id"] = tc.id
+            fc_part: dict[str, Any] = {"functionCall": fc_body}
             if tc.thought_signature:
                 fc_part["thoughtSignature"] = tc.thought_signature
             elif runtime_model.startswith("gemini-"):
@@ -88,7 +93,6 @@ def build_agy_payload(
     if not contents:
         contents.append({"role": "user", "parts": [{"text": "Apply the active system instructions."}]})
 
-    is_claude = runtime_model.startswith("claude-")
     is_non_gemini = (
         is_claude
         or runtime_model.startswith("gpt-oss-")
@@ -173,13 +177,18 @@ _LEGACY_UNSUPPORTED_SCHEMA_KEYS = frozenset(
 
 
 def _sanitize_legacy_schema(obj: Any) -> Any:
-    """Strip JSON-Schema keywords rejected by Google's legacy OpenAPI `parameters` proto (Claude/GPT-OSS)."""
+    """Strip JSON-Schema keywords and flatten list `type` fields rejected by Google's legacy OpenAPI `parameters` proto."""
     if isinstance(obj, dict):
-        return {
-            k: _sanitize_legacy_schema(v)
-            for k, v in obj.items()
-            if k not in _LEGACY_UNSUPPORTED_SCHEMA_KEYS
-        }
+        out: dict[str, Any] = {}
+        for k, v in obj.items():
+            if k in _LEGACY_UNSUPPORTED_SCHEMA_KEYS:
+                continue
+            if k == "type" and isinstance(v, list):
+                non_null = [t for t in v if isinstance(t, str) and t != "null"]
+                out["type"] = non_null[0] if non_null else "string"
+                continue
+            out[k] = _sanitize_legacy_schema(v)
+        return out
     if isinstance(obj, list):
         return [_sanitize_legacy_schema(v) for v in obj]
     return obj

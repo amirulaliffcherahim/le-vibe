@@ -24,9 +24,39 @@ def store(key, val):
 def load(key):
     return _store.get(str(key))
 
+_POS_KEYS = {
+    "read": ("path", "offset", "limit"),
+    "ls": ("path",),
+    "grep": ("pattern", "path"),
+    "find": ("pattern", "path"),
+    "write": ("path", "content"),
+    "edit": ("path", "old_text", "new_text"),
+    "bash": ("command",),
+    "powershell": ("command",),
+    "load_skill": ("name",),
+    "web_search": ("query",),
+    "fetch_content": ("url", "mode"),
+    "retrieve_output": ("id", "query", "offset", "limit"),
+    "memory_search": ("query", "limit", "scope"),
+}
+
 class _ToolsProxy:
     def __getattr__(self, name):
-        def _call(**kwargs):
+        def _call(*args, **kwargs):
+            if args:
+                keys = _POS_KEYS.get(name, ())
+                for k, v in zip(keys, args):
+                    kwargs.setdefault(k, v)
+            if name in ("read", "write", "edit", "ls") and "path" not in kwargs:
+                for alias in ("file", "file_path", "filepath", "filename"):
+                    if alias in kwargs:
+                        kwargs["path"] = kwargs.pop(alias)
+                        break
+            if name in ("bash", "powershell") and "command" not in kwargs:
+                for alias in ("cmd", "script"):
+                    if alias in kwargs:
+                        kwargs["command"] = kwargs.pop(alias)
+                        break
             sys.stdout.write(json.dumps({"call": name, "args": kwargs}, ensure_ascii=False) + "\n")
             sys.stdout.flush()
             line = sys.stdin.readline()

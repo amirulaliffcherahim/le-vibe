@@ -360,6 +360,35 @@ def test_agy_auto_discovers_future_model_families_without_allowlist() -> None:
     assert "internal-canary" not in ids
 
 
+def test_agy_keeps_stable_session_and_trajectory_ids_across_turns() -> None:
+    from le_vibe.providers.agy import build_agy_payload
+    from le_vibe.providers.types import Message, ModelSpec, StreamOptions, TranscriptContext
+
+    model = ModelSpec(
+        id="gemini-4-neon",
+        name="Gemini 4 Neon",
+        provider="agy",
+        base_url="https://example.invalid",
+    )
+    ctx1 = TranscriptContext(
+        system_prompt="sys prompt",
+        messages=[Message(role="user", content="hello")],
+    )
+    ctx2 = TranscriptContext(
+        system_prompt="sys prompt",
+        messages=[
+            Message(role="user", content="hello"),
+            Message(role="assistant", content="hi"),
+            Message(role="user", content="next step"),
+        ],
+    )
+    p1 = build_agy_payload(model, ctx1, StreamOptions(), project_id="proj-1")
+    p2 = build_agy_payload(model, ctx2, StreamOptions(), project_id="proj-1")
+    assert p1["request"]["sessionId"] == p2["request"]["sessionId"]
+    assert p1["request"]["labels"]["trajectory_id"] == p2["request"]["labels"]["trajectory_id"]
+    assert p1["request"]["labels"]["request_id"] != p2["request"]["labels"]["request_id"]
+
+
 def test_catalog_reports_freshness_and_can_skip_a_fresh_refresh() -> None:
     import asyncio
 

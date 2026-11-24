@@ -11,6 +11,7 @@ from pathlib import Path
 
 _out = []
 _store = {}
+_last_result = None
 
 def text(val):
     _out.append(val if isinstance(val, str) else json.dumps(val, ensure_ascii=False, separators=(",", ":")))
@@ -65,7 +66,10 @@ class _ToolsProxy:
             resp = json.loads(line)
             if resp.get("error"):
                 raise RuntimeError(resp["error"])
-            return resp.get("result", "")
+            global _last_result
+            res = resp.get("result", "")
+            _last_result = res
+            return res
         return _call
 
 tools = _ToolsProxy()
@@ -79,6 +83,8 @@ code = payload["script"]
 ns = {"tools": tools, "text": text, "print": _print, "store": store, "load": load, "json": json, "re": re, "Path": Path}
 try:
     exec(compile(code, "<codemode>", "exec"), ns, ns)
+    if not _out and _last_result is not None:
+        _out.append(_last_result if isinstance(_last_result, str) else json.dumps(_last_result, ensure_ascii=False, separators=(",", ":")))
     sys.stdout.write(json.dumps({"done": True, "output": "\n".join(_out)}, ensure_ascii=False) + "\n")
     sys.stdout.flush()
 except Exception as e:

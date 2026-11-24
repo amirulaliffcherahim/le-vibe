@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Sequence
+import hashlib
 import time
 import re
 from typing import Any
@@ -93,8 +94,17 @@ def build_agy_payload(
         or runtime_model.startswith("gpt-oss-")
         or not runtime_model.startswith("gemini-")
     )
-    traj_id = str(uuid.uuid4())
-    agent_id = str(uuid.uuid4())
+    # Derive a stable sessionId / trajectory_id / agent_id from the conversation's initial seed
+    # so Google's KV-cache router pins every turn of the session to the same warm cache shard.
+    first_user_text = next(
+        (m.content[:256] for m in context.messages if m.role == "user" and m.content),
+        "",
+    )
+    seed = f"{project_id}|{runtime_model}|{(context.system_prompt or '')[:256]}|{first_user_text}"
+    digest = hashlib.sha256(seed.encode("utf-8", errors="ignore")).digest()
+    traj_id = str(uuid.UUID(bytes=digest[:16]))
+    agent_id = str(uuid.UUID(bytes=digest[16:32]))
+    session_id = str(int.from_bytes(digest[:8], "big") & 0x7FFF_FFFF_FFFF_FFFF)
     step = max(1, len(contents))
     last_step_index = str(max(0, step - 1))
 
@@ -103,10 +113,10 @@ def build_agy_payload(
         "generationConfig": {
             "maxOutputTokens": options.max_tokens or model.max_tokens,
         },
-        "sessionId": str(int(time.time() * 1000)),
+        "sessionId": session_id,
         "labels": {
             "last_step_index": last_step_index,
-            "request_id": f"{traj_id}-0",
+            "request_id": f"{traj_id}-{step}",
             "trajectory_id": traj_id,
             "used_claude": "true" if is_claude else "false",
             "used_claude_conservative": "true" if is_claude else "false",

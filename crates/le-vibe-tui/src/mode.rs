@@ -161,9 +161,12 @@ pub fn build_system_prompt(
          </memory>\n\n\
          <self_repo>\n\
          le-vibe source repository: `{self_repo}` (Rust harness in `crates/*`, Python provider/policy/extension engine in `python/le_vibe/*`, docs in `docs/*.md`, `examples/example.md`).\n\
-         Self-editing workflow (Pi-style):\n\
+         Self-debugging & self-fix workflow (when diagnosing or fixing le-vibe itself):\n\
+         - Inspect evidence first: check recent session transcripts (`~/.le-vibe/sessions/**/*.jsonl`) for empty turns, tool errors, or disconnects; check dev event logs (`~/.le-vibe/logs/*.jsonl`) if present; run `le-vibe doctor` or `le-vibe mcp list`.\n\
+         - Reproduce TUI bugs headlessly without a TTY: build dev binary (`cargo build -p le-vibe-cli`) and run `target/debug/le-vibe tui-probe --demo --size 100x26 --script -` (dev-only; excluded from release builds).\n\
+         - Key crate map: `le-vibe-agent/src/{{lib.rs,compress.rs}}` (turn loop, retries, Headroom compression), `le-vibe-pybridge/src/lib.rs` + `python/le_vibe/{{bridge.py,providers/,policy/}}` (SSE watchdog, providers, policy), `le-vibe-tui/src/{{input.rs,transcript.rs,modal.rs,markdown.rs,copy.rs,mode.rs,theme.rs}}` (keys/paste, layout, modals, tables, `/copy`, prompts), `le-vibe-cli/src/{{main.rs,worker.rs,features.rs,learn.rs,rpc.rs}}` (event loop, worker, Win32 clipboard, `/learn`, `/suggestion`).\n\
          - Hot-reloadable with `/reload` (no restart): `~/.le-vibe/SYSTEM.md`, `<cwd>/AGENTS.md`, `~/.le-vibe/settings.json`, `<cwd>/.le-vibe/settings.json`, `~/.le-vibe/policy.json`, `~/.le-vibe/extensions/*.py`, `~/.le-vibe/mcp.json`, `.le-vibe/skills/*/SKILL.md`.\n\
-         - Rust source edits (`{self_repo}/crates/*`): edit files, verify with `cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`, then rebuild with `cargo install --path crates/le-vibe-cli`.\n\
+         - Safe Rust fix gate: branch off `main` (PR-only), add a regression test, verify with `cargo clippy --workspace --all-targets -- -D warnings && cargo clippy -p le-vibe-cli --no-default-features -- -D warnings && cargo test --workspace` (plus `pytest python/tests` for Python edits), build release with `cargo build --release --no-default-features -p le-vibe-cli`, and open a PR.\n\
          </self_repo>\n\n\
          <environment>\n\
          os={os}, active_shell={shell}, cwd={cwd}\n\
@@ -182,7 +185,8 @@ pub fn build_system_prompt(
     }
 
     if !skills.is_empty() {
-        let names: Vec<&str> = skills.iter().map(|(n, _, _)| n.as_str()).collect();
+        let mut names: Vec<&str> = skills.iter().map(|(n, _, _)| n.as_str()).collect();
+        names.sort_unstable();
         prompt.push_str(&format!(
             "\n\n<skills>\nOn-demand skills (call `load_skill` with a skill name only when relevant to the task): {}\n</skills>",
             names.join(", ")

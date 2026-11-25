@@ -176,6 +176,7 @@ fn modal_len(state: &TuiState) -> usize {
         ActiveModal::ModelPicker => state.picker_rows().len(),
         ActiveModal::LoginPicker | ActiveModal::LogoutPicker => 3,
         ActiveModal::ModePicker => ALL_MODES.len(),
+        ActiveModal::WorkflowPicker => state.mode.workflows().len(),
         ActiveModal::TermPicker => ALL_SHELLS.len(),
         ActiveModal::ConfigModal => state.config_rows().len().max(1),
         ActiveModal::ThemePicker => ALL_THEMES.len(),
@@ -722,6 +723,17 @@ pub fn handle_key_event(state: &mut TuiState, key: crossterm::event::KeyEvent) -
                         let mode = ALL_MODES[idx.min(ALL_MODES.len() - 1)];
                         return Ok(TuiAction::Submit(format!("/mode {}", mode.name())));
                     }
+                    ActiveModal::WorkflowPicker => {
+                        let wfs = state.mode.workflows();
+                        if let Some(wf) = wfs.get(idx) {
+                            if wf.prompt_template.starts_with('/') && !wf.prompt_template.ends_with(' ') {
+                                return Ok(TuiAction::Submit(wf.prompt_template.to_string()));
+                            }
+                            state.input = wf.prompt_template.to_string();
+                            state.cursor = state.input.len();
+                            return Ok(TuiAction::None);
+                        }
+                    }
                     ActiveModal::TermPicker => {
                         let (shell, _) = ALL_SHELLS[idx.min(ALL_SHELLS.len() - 1)];
                         if shell == "other" {
@@ -846,6 +858,11 @@ pub fn handle_key_event(state: &mut TuiState, key: crossterm::event::KeyEvent) -
     match key.code {
         KeyCode::BackTab => {
             state.mode = state.mode.next();
+            return Ok(TuiAction::None);
+        }
+        KeyCode::Char('w') | KeyCode::Char('W') if key.modifiers.contains(KeyModifiers::ALT) => {
+            state.modal = ActiveModal::WorkflowPicker;
+            state.modal_idx = 0;
             return Ok(TuiAction::None);
         }
         KeyCode::Up | KeyCode::Char('q') | KeyCode::Char('Q')

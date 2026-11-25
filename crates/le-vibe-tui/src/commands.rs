@@ -27,6 +27,24 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandSpec] = &[
         picker_on_bare: true,
     },
     SlashCommandSpec {
+        name: "/workflow",
+        hint: "",
+        description: "Open active mode's workflow launcher (Alt+W: EGM Plan, Proof Loop, REA/Ghidra, Cyber)",
+        picker_on_bare: true,
+    },
+    SlashCommandSpec {
+        name: "/goldfish",
+        hint: " [path|diff]",
+        description: "Spawn fresh zero-history Goldfish reviewer over a spec, last plan, or git diff (EGM)",
+        picker_on_bare: false,
+    },
+    SlashCommandSpec {
+        name: "/goal",
+        hint: " <binary stop condition | clear>",
+        description: "Start Claude-Code-style Proof Loop with binary exit condition (max 5 auto-verify turns)",
+        picker_on_bare: false,
+    },
+    SlashCommandSpec {
         name: "/thinking",
         hint: "",
         description: "Set reasoning effort level",

@@ -398,6 +398,14 @@ pub(crate) enum WorkerCmd {
         model: String,
         repo: String,
     },
+    /// Spawn a fresh zero-history Goldfish reviewer (Elephant-Goldfish Model) over a spec, last plan, or `git diff`.
+    GoldfishReview {
+        provider: String,
+        model: String,
+        thinking_level: String,
+        target: String,
+        fallback_text: String,
+    },
     Skills,
     McpStatus,
     RecordModelChange(String),
@@ -734,6 +742,88 @@ pub(crate) fn spawn_tui_worker(
         while let Ok(cmd) = cmd_rx.recv() {
             let cmd_started = Instant::now();
             match cmd {
+                WorkerCmd::GoldfishReview {
+                    provider,
+                    model,
+                    thinking_level,
+                    target,
+                    fallback_text,
+                } => {
+                    let trimmed = target.trim();
+                    let (source_label, content) = if trimmed.eq_ignore_ascii_case("diff") {
+                        let out = std::process::Command::new("git")
+                            .args(["diff", "HEAD"])
+                            .output()
+                            .ok()
+                            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                            .unwrap_or_default();
+                        if out.trim().is_empty() {
+                            ("git diff HEAD".to_string(), "(working tree has no uncommitted diff against HEAD)".to_string())
+                        } else {
+                            ("git diff HEAD".to_string(), out.chars().take(24_000).collect())
+                        }
+                    } else if !trimmed.is_empty() {
+                        match std::fs::read_to_string(trimmed) {
+                            Ok(text) => (trimmed.to_string(), text.chars().take(24_000).collect()),
+                            Err(err) => {
+                                let _ = msg_tx.send(WorkerMsg::Notice(format!(
+                                    "Goldfish review: failed to read `{trimmed}`: {err}"
+                                )));
+                                let _ = msg_tx.send(WorkerMsg::Idle);
+                                continue;
+                            }
+                        }
+                    } else if !fallback_text.trim().is_empty() {
+                        ("latest assistant plan".to_string(), fallback_text.chars().take(24_000).collect())
+                    } else {
+                        let _ = msg_tx.send(WorkerMsg::Notice(
+                            "Goldfish review: nothing to review yet. Pass a file path (`/goldfish docs/spec.md`), `/goldfish diff`, or draft a plan first.".to_string(),
+                        ));
+                        let _ = msg_tx.send(WorkerMsg::Idle);
+                        continue;
+                    };
+
+                    let goldfish_sys = "\
+You are a FRESH-CONTEXT GOLDFISH REVIEWER (Elephant-Goldfish Model). You have ZERO prior conversation history — only the artifact below.
+Critique it ruthlessly and constructively across the 5 EGM lenses:
+1. **Comprehension**: ambiguous requirements, undefined terms, unstated assumptions.
+2. **Structural**: missing failure modes, state transitions, concurrency/rollback edge cases.
+3. **Codebase Fit**: claims or interfaces that need concrete verification against real files/symbols.
+4. **Design Critic**: simpler alternatives, hidden coupling, over-engineering.
+5. **Implementation Readiness**: missing binary acceptance criteria or deterministic verification commands.
+End with a crisp **Verdict** (`APPROVE` / `REVISE`) and a numbered list of top concrete fixes.";
+                    let req = CompletionRequest {
+                        provider: provider.clone(),
+                        model: model.clone(),
+                        system_prompt: Some(goldfish_sys.to_string()),
+                        messages: vec![ChatMessage {
+                            role: "user".to_string(),
+                            content: format!("Review artifact (`{source_label}`):\n\n{content}"),
+                            reasoning_content: None,
+                            name: None,
+                            tool_call_id: None,
+                            tool_calls: Vec::new(),
+                        }],
+                        tools: Vec::new(),
+                        thinking_level,
+                    };
+                    match bridge.complete(req) {
+                        Ok(reply) => {
+                            let header = format!(
+                                "## Goldfish Review (Fresh Context · `{source_label}`)\n\n"
+                            );
+                            let _ = msg_tx.send(WorkerMsg::Agent(AgentEvent::TextDelta {
+                                delta: format!("{header}{}", reply.content.trim()),
+                            }));
+                        }
+                        Err(err) => {
+                            let _ = msg_tx.send(WorkerMsg::TurnError(format!(
+                                "Goldfish review failed: {err}"
+                            )));
+                        }
+                    }
+                    let _ = msg_tx.send(WorkerMsg::Idle);
+                }
                 WorkerCmd::Shutdown => {
                     logger.log("worker", "shutdown", None, "worker stopping");
                     break;

@@ -15,6 +15,14 @@ pub const ALL_MODES: &[AgentMode] = &[
     AgentMode::Cyber,
 ];
 
+#[derive(Debug, Clone, Copy)]
+pub struct ModeWorkflow {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub description: &'static str,
+    pub prompt_template: &'static str,
+}
+
 impl AgentMode {
     pub fn name(self) -> &'static str {
         match self {
@@ -28,11 +36,134 @@ impl AgentMode {
 
     pub fn description(self) -> &'static str {
         match self {
-            AgentMode::Normal => "Standard coding assistant (all tools)",
-            AgentMode::Plan => "Read-only architecture & planning mode (no file edits or shell)",
-            AgentMode::Ask => "Read-only Q&A and code explanation mode",
-            AgentMode::Rea => "Reverse-engineering & binary/app inspection mode (read/search/shell)",
-            AgentMode::Cyber => "Defensive cybersecurity, code/config audit & hardening mode (all tools)",
+            AgentMode::Normal => "Execute mode — Claude Code Proof Loop (Act → Run → Inspect → Assert → Terminate)",
+            AgentMode::Plan => "Elephant-Goldfish Model (EGM) — Brainstorm, Draft Spec & Fresh Goldfish Review",
+            AgentMode::Ask => "Read-only Q&A and code architecture explanation",
+            AgentMode::Rea => "Reverse-engineering — Red-Hat Worker + REA (morluto/rea) & Ghidra pipeline",
+            AgentMode::Cyber => "Defensive cybersecurity — Authorized Recon, White-Box Audit & Hardening",
+        }
+    }
+
+    pub fn workflows(self) -> &'static [ModeWorkflow] {
+        match self {
+            AgentMode::Plan => &[
+                ModeWorkflow {
+                    id: "egm_brainstorm",
+                    label: "EGM Brainstorm (Elephant)",
+                    description: "Explore idea, surface trade-offs with ask_user_question, draft concepts_brief.md",
+                    prompt_template: "Run an Elephant-Goldfish Model (EGM) Brainstorm: explore the problem with full project context, inspect relevant code first, ask clarifying trade-offs via ask_user_question, and produce a concise Concepts Brief (goals, non-goals, options, open questions) for: ",
+                },
+                ModeWorkflow {
+                    id: "egm_draft",
+                    label: "EGM Draft Spec (Elephant)",
+                    description: "Turn brief into structured Feature Spec (Heilmeier + architecture + failure modes)",
+                    prompt_template: "Run an EGM Draft: turn our agreed direction into a concrete Feature Specification (Heilmeier framing, exact file:line touchpoints, data/API contracts, failure modes, edge cases, and binary verification criteria). Pause for approval before any implementation: ",
+                },
+                ModeWorkflow {
+                    id: "egm_goldfish",
+                    label: "EGM Goldfish Review (Fresh Context)",
+                    description: "Spawn isolated zero-history reviewer across 5 EGM lenses (Comprehension/Structural/Codebase/Critic/Readiness)",
+                    prompt_template: "/goldfish",
+                },
+                ModeWorkflow {
+                    id: "egm_drift",
+                    label: "EGM Drift Report",
+                    description: "Compare existing design docs/specs against live source code and flag divergences",
+                    prompt_template: "Run an EGM Drift Report: inspect the design docs/README against the live source code and list every divergence with exact file:line citations and whether to update docs or code: ",
+                },
+                ModeWorkflow {
+                    id: "egm_lite",
+                    label: "EGM Lite (Fast-Track Spec)",
+                    description: "Compact single-pass spec for small refactors, revisions, and bug fixes",
+                    prompt_template: "Run EGM Lite: inspect the relevant files and produce a compact 1-page spec (root cause, minimal file:line plan, edge cases, exact test command) for: ",
+                },
+            ],
+            AgentMode::Normal => &[
+                ModeWorkflow {
+                    id: "proof_goal",
+                    label: "Proof Loop Goal (/goal)",
+                    description: "Set a strict binary stop condition (max 5 auto-verify iterations until proven)",
+                    prompt_template: "/goal ",
+                },
+                ModeWorkflow {
+                    id: "proof_loop",
+                    label: "Verified Fix (Act → Run → Inspect → Assert)",
+                    description: "Make minimal surgical edit and prove it with deterministic test/lint/build evidence",
+                    prompt_template: "Execute using the strict Proof Loop (1. Act minimal diff -> 2. Run smallest deterministic test/lint/build -> 3. Inspect raw stdout/stderr/diff -> 4. Assert & rerun on failure -> 5. Terminate only on concrete pass evidence): ",
+                },
+                ModeWorkflow {
+                    id: "fresh_review",
+                    label: "Fresh-Context Diff Review",
+                    description: "Audit current git diff with zero-bias checklist for regressions & edge cases",
+                    prompt_template: "/goldfish diff",
+                },
+            ],
+            AgentMode::Rea => &[
+                ModeWorkflow {
+                    id: "rea_triage",
+                    label: "Stage 1 · Binary / App Triage (Red-Hat Worker)",
+                    description: "Identify format, arch, runtime, packers, strings, imports/exports & entry points",
+                    prompt_template: "Run REA Stage 1 (Triage): identify target format, architecture, runtime/packing, strings, imports/exports, and entry points. Separate Confirmed observations from Hypotheses for: ",
+                },
+                ModeWorkflow {
+                    id: "rea_ghidra",
+                    label: "Stage 2 · REA / Ghidra Decompile & Trace",
+                    description: "List functions, decompile key routines & trace xrefs via REA MCP/CLI or Ghidra headless",
+                    prompt_template: "Run REA Stage 2 (REA + Ghidra Decompile): use connected REA MCP/CLI tools (or Ghidra analyzeHeadless fallback) to list key functions, decompile entry/handler routines, trace xrefs, and record exact addresses/symbols for: ",
+                },
+                ModeWorkflow {
+                    id: "rea_protocol",
+                    label: "Stage 3 · Protocol / IPC & Struct Map",
+                    description: "Reconstruct wire schemas, IPC endpoints, state machines & auth/crypto boundaries",
+                    prompt_template: "Run REA Stage 3 (Protocol & Struct Reconstruction): trace IPC/network/file handlers, reconstruct message schemas and auth/crypto boundaries with confirmed addresses/file:line evidence for: ",
+                },
+                ModeWorkflow {
+                    id: "rea_diff",
+                    label: "Stage 4 · Version Diff & Clean-Room Spec",
+                    description: "Compare two builds and produce a clean-room behavior spec",
+                    prompt_template: "Run REA Stage 4 (Version Diff & Clean-Room Spec): compare symbols/functions/strings between versions and document confirmed behavioral deltas for: ",
+                },
+            ],
+            AgentMode::Cyber => &[
+                ModeWorkflow {
+                    id: "cyber_recon",
+                    label: "Stage 1 · Attack Surface & Trust Map",
+                    description: "Map endpoints, auth boundaries, secrets, dependencies & headers (authorized scope only)",
+                    prompt_template: "Run Cyber Stage 1 (Authorized Recon & Attack Surface Map — local/authorized scope only): map entry points, auth/session boundaries, secrets/config, dependencies, and trust boundaries with file:line citations for: ",
+                },
+                ModeWorkflow {
+                    id: "cyber_audit",
+                    label: "Stage 2 · White-Box Code & Config Audit",
+                    description: "OWASP/CWE review: auth/RBAC, injection sinks, SSRF, path traversal, crypto & least privilege",
+                    prompt_template: "Run Cyber Stage 2 (White-Box Audit): audit auth/RBAC, input validation, injection sinks, SSRF/path traversal, crypto, and secret handling. Report severity, file:line evidence, and minimal remediation for: ",
+                },
+                ModeWorkflow {
+                    id: "cyber_verify",
+                    label: "Stage 3 · Safe Proof-of-Control Check",
+                    description: "Benign/read-only verification via unit tests or local 127.0.0.1 checks (no offensive payloads)",
+                    prompt_template: "Run Cyber Stage 3 (Safe Verification): write or run deterministic defensive unit/integration checks on authorized local code/127.0.0.1 to prove controls hold (no offensive exploit artifacts): ",
+                },
+                ModeWorkflow {
+                    id: "cyber_harden",
+                    label: "Stage 4 · Hardening & Remediation Patch",
+                    description: "Apply minimal defense-in-depth fixes and prove them with regression tests",
+                    prompt_template: "Run Cyber Stage 4 (Hardening): apply minimal surgical hardening fixes for confirmed findings and verify with deterministic tests: ",
+                },
+            ],
+            AgentMode::Ask => &[
+                ModeWorkflow {
+                    id: "ask_trace",
+                    label: "Trace Execution Path",
+                    description: "Trace a feature end-to-end with exact file:line citations",
+                    prompt_template: "Trace the execution path end-to-end with exact file:line and symbol citations for: ",
+                },
+                ModeWorkflow {
+                    id: "ask_arch",
+                    label: "Explain Architecture & Contracts",
+                    description: "Explain crate/module boundaries, state flow, and invariants",
+                    prompt_template: "Explain the architecture, module boundaries, and key invariants for: ",
+                },
+            ],
         }
     }
 
@@ -61,6 +192,8 @@ impl AgentMode {
                 "grep".into(),
                 "find".into(),
                 "ls".into(),
+                "todo".into(),
+                "ask_user_question".into(),
                 "memory_search".into(),
                 "memory_read".into(),
                 "retrieve_output".into(),
@@ -86,26 +219,39 @@ impl AgentMode {
     pub fn system_prompt(self) -> &'static str {
         match self {
             AgentMode::Normal => "\
-You are le-vibe in NORMAL mode (full coding agent).
-- Workflow: inspect relevant manifests/files first (`read` before `edit`/`write`), check sibling patterns in the repo, make minimal surgical diffs, then verify with the real test/lint/build command.
-- Integrity: never claim success from reading code alone; report exact file paths, commands run, and observed pass/fail output. If blocked after 2 repair attempts on the same error, stop and report the exact blocker.",
+You are le-vibe in EXECUTE mode (Claude Code Verification / Proof Loop).
+- Mandatory 5-Step Proof Loop:
+  1. ACT: inspect manifests/files (`read` before `edit`/`write`), check sibling patterns, make the minimal surgical diff.
+  2. RUN: execute the smallest deterministic command that exposes failure (unit test, type-check, linter, build).
+  3. INSPECT: read raw stdout/stderr, logs, or `git diff` for the exact pass/fail signal.
+  4. ASSERT & RERUN: if anything fails, diagnose from raw output, patch root cause, and rerun (stop and report exact blocker after 2 failed attempts on the same error, or at the active `/goal` turn cap).
+  5. TERMINATE ON EVIDENCE: never claim success from reading code alone; finish only with exact file paths, commands run, and observed pass/fail output.",
             AgentMode::Plan => "\
-You are le-vibe in PLAN mode (read-only architecture & planning).
-- Allowed tools: `read`, `grep`, `find`, `ls`, `memory_search`, `memory_read`. Never edit files or run shell commands.
-- Workflow: trace entry points, data/type contracts, and sibling implementations first.
-- Output: deliver a concrete, ordered implementation plan citing exact `file:line` / symbol names, key edge cases, trade-offs, and exact verification commands.",
+You are le-vibe in PLAN mode — Elephant-Goldfish Model (EGM: Design with an Elephant, Review with a Goldfish).
+- Allowed tools: read-only inspection (`read`, `grep`, `find`, `ls`, `web_search`, `fetch_content`, `memory_*`), `todo`, and `ask_user_question`. Never edit code or run shell commands.
+- Elephant Role (you, holding full project context):
+  1. Brainstorm: inspect entry points, data contracts, and sibling patterns; surface architectural trade-offs via `ask_user_question`.
+  2. Draft Spec: produce a crisp, ordered specification citing exact `file:line`/symbols, failure modes, edge cases, and binary verification stop conditions.
+  3. Goldfish Review: recommend running `/goldfish` (or `Alt+W` -> Goldfish Review) to spawn a fresh zero-history reviewer pass over the spec across 5 lenses (Comprehension, Structural, Codebase Details, Design Critic, Implementation Readiness) before switching to Execute mode.",
             AgentMode::Ask => "\
 You are le-vibe in ASK mode (read-only Q&A and code explanation).
-- Allowed tools: `read`, `grep`, `find`, `ls`, `memory_search`, `memory_read`. Never modify files or run shell commands.
+- Allowed tools: read-only inspection (`read`, `grep`, `find`, `ls`, `memory_*`, `web_search`, `fetch_content`). Never modify files or run shell commands.
 - Output: answer the question directly in the first sentence, then support it with exact file paths, symbol names, and concrete behavior observed in inspected files.",
             AgentMode::Rea => "\
-You are le-vibe in REA mode (reverse-engineering & binary/app inspection).
-- Allowed tools: `read`, `grep`, `find`, `ls`, `bash`, `powershell`, `memory_search`, `memory_read` (no source edits unless switched to normal).
-- Workflow: identify target format/runtime (`file`, headers, strings, exports, symbols), trace entry points, IPC/protocol schemas, and auth/crypto boundaries; separate confirmed observations from hypotheses.",
+You are le-vibe in REA mode (Reverse Engineering — Red-Hat Worker + REA `morluto/rea` + Ghidra pipeline).
+- Allowed tools: `read`, `grep`, `find`, `ls`, `bash`, `powershell`, `memory_*`, `web_*` + connected REA/Ghidra MCP tools (no source edits unless switched to normal).
+- Pipeline:
+  1. Triage: target format, arch, runtime, packers, strings, imports/exports, entry points.
+  2. REA / Ghidra Analysis: prefer connected REA MCP/CLI tools (or Ghidra `analyzeHeadless` fallback) to list functions, decompile key routines, and trace xrefs.
+  3. Evidence Ledger: strictly separate CONFIRMED facts (exact addresses, symbols, decompiled logic) from HYPOTHESES, and map IPC/protocol/auth boundaries cleanly.",
             AgentMode::Cyber => "\
-You are le-vibe in CYBER mode (defensive cybersecurity, audit & hardening).
-- Scope: only authorized local targets or explicitly scoped hosts (default `127.0.0.1`). Never generate offensive exploit/payload/CVE artifacts or dump credentials.
-- Workflow: audit trust boundaries, auth/session handling, input validation, secret exposure, and least-privilege defaults; report `file:line` or command evidence, severity, and minimal remediation diffs.",
+You are le-vibe in CYBER mode (Authorized Defensive Cybersecurity — Recon -> White-Box Audit -> Safe Verification -> Hardening).
+- Strict Authorization Gate: authorized local/owned targets only (default `127.0.0.1`). Never dump credentials/DPAPI, never create offensive exploit/payload/CVE artifacts, never scan non-owned hosts.
+- Pipeline:
+  1. Attack Surface & Trust Map: routes, auth/session boundaries, secrets, dependencies, headers.
+  2. White-Box Audit: OWASP/CWE sinks (auth/RBAC, injection, SSRF, path traversal, crypto, least privilege).
+  3. Safe Proof-of-Control: deterministic unit/config checks on authorized local code/127.0.0.1.
+  4. Hardening: severity-ranked findings (`file:line`), minimal remediation diffs, and regression tests.",
         }
     }
 }

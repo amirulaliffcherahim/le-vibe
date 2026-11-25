@@ -913,10 +913,55 @@ fn run_interactive_tui(
                     }
                     if state.mode == AgentMode::Plan {
                         state.blocks.push(TranscriptBlock::System(
-                            "Plan ready — press Shift+Tab to switch mode.".to_string(),
+                            "Plan ready — run `/goldfish` (fresh EGM review), `Alt+W` for EGM stages, or `Shift+Tab` to Execute.".to_string(),
                         ));
                     }
                     active_prompt = false;
+                    // Claude-Code-style `/goal` Proof Loop evaluator: keep iterating until
+                    // `PROOF_VERIFIED:` or `PROOF_BLOCKED:` or turn cap reached.
+                    if let Some((cond, attempt, max_att)) = state.active_goal.clone() {
+                        let last_reply = state
+                            .blocks
+                            .iter()
+                            .rev()
+                            .find_map(|b| match b {
+                                TranscriptBlock::Assistant(t) => Some(t.as_str()),
+                                _ => None,
+                            })
+                            .unwrap_or("");
+                        if last_reply.contains("PROOF_VERIFIED:") {
+                            state.active_goal = None;
+                            state.blocks.push(TranscriptBlock::System(format!(
+                                "✓ Proof Loop verified on attempt {attempt}/{max_att}: {cond}"
+                            )));
+                        } else if last_reply.contains("PROOF_BLOCKED:") || attempt >= max_att {
+                            state.active_goal = None;
+                            state.blocks.push(TranscriptBlock::System(format!(
+                                "Proof Loop ended at attempt {attempt}/{max_att} (not verified)."
+                            )));
+                        } else {
+                            let next = attempt + 1;
+                            state.active_goal = Some((cond.clone(), next, max_att));
+                            let cont = format!(
+                                "PROOF LOOP CONTINUATION (attempt {next}/{max_att})\nStop condition still not proven: {cond}\nRun the deterministic check, inspect raw stdout/stderr, fix any remaining issue, and end with `PROOF_VERIFIED: <command & pass output>` or `PROOF_BLOCKED: <exact blocker>`."
+                            );
+                            state.is_busy = true;
+                            active_prompt = true;
+                            cancel.store(false, Ordering::SeqCst);
+                            state.active_started = Some(Instant::now());
+                            state.status_text = Some(format!("Proof Loop ({next}/{max_att})…"));
+                            let _ = cmd_tx.send(WorkerCmd::RunPrompt {
+                                provider: state.provider.clone(),
+                                model: state.model.clone(),
+                                thinking_level: state.thinking_level.clone(),
+                                mode: state.mode,
+                                shell: state.shell.clone(),
+                                max_turns: state.max_turns,
+                                retry_max: state.retry_max,
+                                prompt: cont,
+                            });
+                        }
+                    }
                 }
                 WorkerMsg::TurnError(err) => {
                     active_prompt = false;
@@ -1566,6 +1611,84 @@ fn run_interactive_tui(
                     } else {
                         "YOLO mode disabled (ask mode restored).".to_string()
                     }));
+                    continue;
+                }
+                if input == "/workflow" || input == "/workflows" {
+                    state.modal = ActiveModal::WorkflowPicker;
+                    state.modal_idx = 0;
+                    continue;
+                }
+                if input == "/egm" {
+                    state.mode = AgentMode::Plan;
+                    let _ = cmd_tx.send(WorkerCmd::RecordModeChange("plan".to_string()));
+                    state.modal = ActiveModal::WorkflowPicker;
+                    state.modal_idx = 0;
+                    continue;
+                }
+                if input == "/goldfish" || input.starts_with("/goldfish ") {
+                    let target = input.strip_prefix("/goldfish").unwrap_or("").trim().to_string();
+                    let fallback_text = state
+                        .blocks
+                        .iter()
+                        .rev()
+                        .find_map(|b| match b {
+                            TranscriptBlock::Assistant(t) if !t.trim().is_empty() => Some(t.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    state.is_busy = true;
+                    state.active_started = Some(Instant::now());
+                    state.status_text = Some("Goldfish reviewing (fresh zero-history context)…".to_string());
+                    let _ = cmd_tx.send(WorkerCmd::GoldfishReview {
+                        provider: state.provider.clone(),
+                        model: state.model.clone(),
+                        thinking_level: state.thinking_level.clone(),
+                        target,
+                        fallback_text,
+                    });
+                    continue;
+                }
+                if input == "/goal" || input.starts_with("/goal ") {
+                    let arg = input.strip_prefix("/goal").unwrap_or("").trim();
+                    if arg.is_empty() {
+                        if let Some((ref cond, att, max_att)) = state.active_goal {
+                            state.blocks.push(TranscriptBlock::System(format!(
+                                "Active Proof Loop goal ({att}/{max_att}): {cond}\nUse `/goal clear` to stop."
+                            )));
+                        } else {
+                            state.blocks.push(TranscriptBlock::System(
+                                "Usage: `/goal <binary stop condition>` (e.g. `/goal cargo test --workspace passes with 0 warnings`) or `/goal clear`.".to_string(),
+                            ));
+                        }
+                        continue;
+                    }
+                    if arg.eq_ignore_ascii_case("clear") || arg.eq_ignore_ascii_case("stop") {
+                        state.active_goal = None;
+                        state.blocks.push(TranscriptBlock::System("Proof Loop goal cleared.".to_string()));
+                        continue;
+                    }
+                    state.mode = AgentMode::Normal;
+                    state.active_goal = Some((arg.to_string(), 1, 5));
+                    let goal_prompt = format!(
+                        "PROOF LOOP GOAL (attempt 1/5)\nBinary stop condition: {arg}\n\nFollow the 5-step Proof Loop (1. Act minimal diff -> 2. Run deterministic check -> 3. Inspect raw output -> 4. Assert & fix -> 5. Terminate on evidence).\nWhen the binary stop condition is proven with real command output, end your reply with:\nPROOF_VERIFIED: <exact command and observed pass output>\nIf genuinely blocked after retries, end with:\nPROOF_BLOCKED: <exact blocker>"
+                    );
+                    state.blocks.push(TranscriptBlock::User(format!("/goal {arg}")));
+                    state.is_busy = true;
+                    active_prompt = true;
+                    cancel.store(false, Ordering::SeqCst);
+                    state.scroll_offset = 0;
+                    state.active_started = Some(Instant::now());
+                    state.status_text = Some("Proof Loop (1/5)…".to_string());
+                    let _ = cmd_tx.send(WorkerCmd::RunPrompt {
+                        provider: state.provider.clone(),
+                        model: state.model.clone(),
+                        thinking_level: state.thinking_level.clone(),
+                        mode: state.mode,
+                        shell: state.shell.clone(),
+                        max_turns: state.max_turns,
+                        retry_max: state.retry_max,
+                        prompt: goal_prompt,
+                    });
                     continue;
                 }
                 if input == "/mode" {

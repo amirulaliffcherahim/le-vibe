@@ -250,10 +250,22 @@ pub(crate) fn draw_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             ],
         ),
         ActiveModal::ModePicker => (
-            " Select Mode (↑/↓ Enter Esc · Shift+Tab cycles) ".to_string(),
+            " Select Mode (↑/↓ Enter Esc · Shift+Tab cycles · Alt+W workflows) ".to_string(),
             ALL_MODES
                 .iter()
                 .map(|m| (m.name().to_string(), String::new(), m.description().to_string()))
+                .collect(),
+        ),
+        ActiveModal::WorkflowPicker => (
+            format!(
+                " {} Workflows — Pick a workflow to initiate (↑/↓ Enter Esc) ",
+                state.mode.name().to_uppercase()
+            ),
+            state
+                .mode
+                .workflows()
+                .iter()
+                .map(|w| (w.label.to_string(), String::new(), w.description.to_string()))
                 .collect(),
         ),
         ActiveModal::TermPicker => (

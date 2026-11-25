@@ -553,21 +553,23 @@ fn render_block_wrapped(
                 lines.push(Line::from(""));
                 let line_count = text.lines().count().max(1);
                 if state.show_thinking {
-                    for l in text.lines() {
-                        lines.push(Line::from(vec![
-                            Span::styled(" ", Style::default()),
-                            Span::styled(
-                                l.to_string(),
-                                Style::default()
-                                    .fg(pal.muted)
-                                    .add_modifier(Modifier::ITALIC),
-                            ),
-                        ]));
-                    }
+                    let think_style = Style::default()
+                        .fg(pal.muted)
+                        .add_modifier(Modifier::ITALIC);
+                    let raw_lines: Vec<Line<'static>> = text
+                        .lines()
+                        .map(|l| Line::from(vec![Span::raw(" "), Span::styled(l.to_string(), think_style)]))
+                        .collect();
+                    lines.extend(wrap_lines_exact(raw_lines, wrap_width));
                 } else {
                     let unit = if line_count == 1 { "line" } else { "lines" };
+                    let label = if state.is_busy {
+                        format!(" Thinking… ({line_count} {unit} · ctrl+t)")
+                    } else {
+                        format!(" Thought ({line_count} {unit} · ctrl+t)")
+                    };
                     lines.push(Line::from(Span::styled(
-                        format!(" Thinking... ({line_count} {unit}, ctrl+t to expand)"),
+                        label,
                         Style::default()
                             .fg(pal.muted)
                             .add_modifier(Modifier::ITALIC),
@@ -578,7 +580,15 @@ fn render_block_wrapped(
         TranscriptBlock::Assistant(text) => {
             if !text.is_empty() {
                 lines.push(Line::from(""));
-                lines.extend(render_markdown_lines(text, &pal, area_width, state.expand_tools));
+                // Align assistant prose to the same 1-column left rhythm as user & tool cards.
+                let pad_w = area_width.saturating_sub(1).max(20);
+                let md_lines = render_markdown_lines(text, &pal, pad_w, state.expand_tools);
+                for line in md_lines {
+                    let mut spans = Vec::with_capacity(line.spans.len() + 1);
+                    spans.push(Span::raw(" "));
+                    spans.extend(line.spans);
+                    lines.push(Line::from(spans).style(line.style));
+                }
             }
         }
         TranscriptBlock::Tool {
@@ -587,7 +597,8 @@ fn render_block_wrapped(
             output,
         } => {
             lines.push(Line::from(""));
-            let is_err = status == "failed";
+            let is_err = status.starts_with("failed");
+            let is_running = status.starts_with("running") || status == "pending";
             let title = format!("{name} · {status}");
             let all_out: Vec<&str> = output.trim().lines().collect();
             let max_lines = if state.expand_tools { 40 } else { 5 };
@@ -607,7 +618,7 @@ fn render_block_wrapped(
                     title: if is_err { pal.error } else { pal.fg },
                     bg: if is_err {
                         pal.card_err_bg
-                    } else if status == "running" || status == "pending" {
+                    } else if is_running {
                         pal.card_quiet_bg
                     } else {
                         pal.card_ok_bg
@@ -850,6 +861,25 @@ fn draw_status_strip(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         );
         push_clamped(&mut spans, &mut used, status.to_string(), Style::default().fg(pal.fg));
+        if state.is_busy {
+            if let Some(started) = state.active_started {
+                let secs = started.elapsed().as_secs_f64();
+                push_clamped(
+                    &mut spans,
+                    &mut used,
+                    format!(" · {secs:.1}s"),
+                    Style::default().fg(pal.muted),
+                );
+            }
+            if state.steering_prompts.is_empty() && state.queued_prompts.is_empty() {
+                push_clamped(
+                    &mut spans,
+                    &mut used,
+                    "  Esc interrupt · Alt+Enter queue".to_string(),
+                    Style::default().fg(Color::DarkGray),
+                );
+            }
+        }
     } else if !state.todos.is_empty() {
         let total = state.todos.len();
         let done = state.todos.iter().filter(|(_, _, s)| s == "completed").count();

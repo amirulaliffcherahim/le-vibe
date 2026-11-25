@@ -42,7 +42,7 @@ pub enum AgentEvent {
     Status { text: String },
     ThinkingDelta { delta: String },
     TextDelta { delta: String },
-    ToolCallStart { id: String, name: String },
+    ToolCallStart { id: String, name: String, #[serde(skip_serializing_if = "String::is_empty")] summary: String },
     ToolCallEnd { id: String, name: String, is_error: bool, output: String },
     SteeringInjected { text: String },
     TurnUsage { input_tokens: u64, cache_read_tokens: u64 },
@@ -63,6 +63,53 @@ pub enum ApprovalChoice {
     AllowSession,
     AllowYolo,
     Deny,
+}
+
+/// Concise 1-line human target summary for tool card headers (e.g. `Cargo.toml`, `$ git status`).
+fn summarize_tool_args(name: &str, args: &Value) -> String {
+    let pick = |keys: &[&str]| -> Option<String> {
+        for k in keys {
+            if let Some(s) = args.get(*k).and_then(Value::as_str) {
+                let line = s.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+                if !line.is_empty() {
+                    return Some(line.chars().take(64).collect());
+                }
+            }
+        }
+        None
+    };
+    match name {
+        "read" | "edit" | "write" | "ls" => pick(&["path", "file", "file_path"]).unwrap_or_default(),
+        "grep" | "find" => pick(&["pattern", "query", "path"]).unwrap_or_default(),
+        "bash" | "powershell" => pick(&["command", "cmd"]).map(|c| format!("$ {c}")).unwrap_or_default(),
+        "web_search" => pick(&["query"]).unwrap_or_else(|| {
+            args.get("queries")
+                .and_then(Value::as_array)
+                .and_then(|a| a.first())
+                .and_then(Value::as_str)
+                .map(|s| s.chars().take(64).collect())
+                .unwrap_or_default()
+        }),
+        "fetch_content" => pick(&["url"]).unwrap_or_default(),
+        "codemode" => {
+            if let Some(code) = args.get("code").and_then(Value::as_str) {
+                let calls: Vec<&str> = code
+                    .split("tools.")
+                    .skip(1)
+                    .filter_map(|s| s.split('(').next())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && s.len() <= 24)
+                    .take(3)
+                    .collect();
+                if !calls.is_empty() {
+                    return calls.join(" + ");
+                }
+            }
+            String::new()
+        }
+        "todo" => pick(&["action", "subject"]).unwrap_or_default(),
+        _ => pick(&["path", "query", "url", "command", "action"]).unwrap_or_default(),
+    }
 }
 
 pub struct AgentConfig {
@@ -812,6 +859,7 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                 on_event(AgentEvent::ToolCallStart {
                     id: tc.id.clone(),
                     name: tc.name.clone(),
+                    summary: summarize_tool_args(&tc.name, &tc.arguments),
                 });
                 let args_json_str = tc.arguments.to_string();
                 let hook_res = bridge
@@ -945,6 +993,7 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
             on_event(AgentEvent::ToolCallStart {
                 id: tc.id.clone(),
                 name: tc.name.clone(),
+                summary: summarize_tool_args(&tc.name, &tc.arguments),
             });
             let args_json_str = tc.arguments.to_string();
             let hook_res = bridge

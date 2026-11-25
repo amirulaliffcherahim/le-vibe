@@ -86,15 +86,26 @@ pub(crate) fn draw_editor(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     };
     let end_row = (start_row + visible_rows).min(wrapped.len());
 
-    let display_lines: Vec<Line<'_>> = wrapped[start_row..end_row]
-        .iter()
-        .map(|l| {
-            Line::from(vec![
-                Span::styled(" ", Style::default()),
-                Span::styled(l.clone(), Style::default().fg(Color::White)),
-            ])
-        })
-        .collect();
+    let display_lines: Vec<Line<'_>> = if state.input.is_empty() && !state.is_busy {
+        let pal = state.theme.palette();
+        vec![Line::from(vec![
+            Span::styled(" ", Style::default()),
+            Span::styled(
+                "Ask anything…  / commands · @ files · Shift+Tab mode · Alt+W workflows",
+                Style::default().fg(pal.muted),
+            ),
+        ])]
+    } else {
+        wrapped[start_row..end_row]
+            .iter()
+            .map(|l| {
+                Line::from(vec![
+                    Span::styled(" ", Style::default()),
+                    Span::styled(l.clone(), Style::default().fg(Color::White)),
+                ])
+            })
+            .collect()
+    };
     frame.render_widget(Paragraph::new(display_lines), inner);
 
     if state.modal == ActiveModal::None && (!state.is_busy || !state.input.is_empty()) {

@@ -762,12 +762,17 @@ fn run_interactive_tui(
                         }
                         state.blocks.push(TranscriptBlock::User(text));
                     }
-                    AgentEvent::ToolCallStart { name, .. } => {
+                    AgentEvent::ToolCallStart { name, summary, .. } => {
                         turn_tools_count += 1;
-                        logger.log("tool", "start", None, name.clone());
-                        state.status_text = Some(format!("Running tool {name}..."));
+                        let display_name = if summary.is_empty() {
+                            name.clone()
+                        } else {
+                            format!("{name} {summary}")
+                        };
+                        logger.log("tool", "start", None, display_name.clone());
+                        state.status_text = Some(format!("Running {display_name}…"));
                         state.blocks.push(TranscriptBlock::Tool {
-                            name,
+                            name: display_name,
                             status: "running...".to_string(),
                             output: String::new(),
                         });
@@ -811,7 +816,7 @@ fn run_interactive_tui(
                             matches!(
                                 b,
                                 TranscriptBlock::Tool { name: n, status: s, .. }
-                                if *n == name && s == "running..."
+                                if (*n == name || n.starts_with(&format!("{name} "))) && s == "running..."
                             )
                         }) {
                             *st = label.to_string();
@@ -920,9 +925,16 @@ fn run_interactive_tui(
                             .active_ms
                             .saturating_add(started.elapsed().as_millis() as u64);
                     }
-                    state
-                        .blocks
-                        .push(TranscriptBlock::System(format!("Error: {err}")));
+                    let clean_err = err
+                        .trim_start_matches("provider bridge error: ")
+                        .trim_start_matches("python error (RuntimeError): ")
+                        .trim_start_matches("python error: ")
+                        .to_string();
+                    state.blocks.push(TranscriptBlock::Tool {
+                        name: "error".to_string(),
+                        status: "failed".to_string(),
+                        output: clean_err,
+                    });
                 }
                 WorkerMsg::Notice(text) => {
                     if text.starts_with("Interrupted") {

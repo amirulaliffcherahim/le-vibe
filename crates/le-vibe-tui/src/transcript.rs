@@ -896,6 +896,15 @@ fn draw_status_strip(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             Style::default().fg(pal.muted),
         );
     }
+    if let Some((ref cond, attempt, max_att)) = state.active_goal {
+        let short_cond: String = cond.chars().take(32).collect();
+        push_clamped(
+            &mut spans,
+            &mut used,
+            format!("  ◎ goal {attempt}/{max_att}: {short_cond}"),
+            Style::default().fg(pal.success).add_modifier(Modifier::BOLD),
+        );
+    }
     if let Some(first_s) = state.steering_prompts.front() {
         let one_line: String = first_s.lines().next().unwrap_or("").chars().take(36).collect();
         push_clamped(

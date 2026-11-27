@@ -9,7 +9,8 @@ use regex::{Regex, RegexBuilder};
 use serde_json::{Value, json};
 use std::fs;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -688,6 +689,10 @@ fn run_read(args: &Value) -> Result<String, ToolError> {
 fn run_write(args: &Value) -> Result<String, ToolError> {
     let path = args.get("path").and_then(Value::as_str).expect("validated");
     let content = args.get("content").and_then(Value::as_str).expect("validated");
+    // Writes share the same per-file queue as edits: a write landing between an edit's read and
+    // write would otherwise be dropped.
+    let lock = mutation_lock(path);
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(parent) = Path::new(path).parent()
         && !parent.as_os_str().is_empty()
     {
@@ -697,12 +702,71 @@ fn run_write(args: &Value) -> Result<String, ToolError> {
     Ok(format!("Wrote {} bytes to {path}", content.len()))
 }
 
+/// Normalise every shape a model uses for edits into a single `Vec<Value>` of
+/// `{oldText, newText}` pairs.
+///
+/// Models send `edits` as an array, as a JSON **string**, as one object instead of a one-element
+/// array, or as the legacy top-level `oldText`/`newText` pair — sometimes a mix. Rejecting any of
+/// those burns a whole turn on a formatting mistake, so all of them are accepted.
+fn normalize_edits(args: &Value) -> Result<Vec<Value>, ToolError> {
+    let mut out: Vec<Value> = Vec::new();
+    match args.get("edits") {
+        Some(Value::Array(items)) => out.extend(items.iter().cloned()),
+        Some(Value::String(raw)) => {
+            let parsed: Value = serde_json::from_str(raw).map_err(|e| {
+                ToolError::Edit(format!("edits was a string but not valid JSON: {e}"))
+            })?;
+            match parsed {
+                Value::Array(items) => out.extend(items),
+                obj @ Value::Object(_) => out.push(obj),
+                _ => return Err(ToolError::Edit("edits must be an array of edits".into())),
+            }
+        }
+        Some(obj @ Value::Object(_)) => out.push(obj.clone()),
+        Some(Value::Null) | None => {}
+        Some(_) => return Err(ToolError::Edit("edits must be an array of edits".into())),
+    }
+
+    // Legacy pair: appended after the array so "merge nearby changes" still applies.
+    if let (Some(old), Some(new)) = (
+        args.get("oldText").and_then(Value::as_str),
+        args.get("newText").and_then(Value::as_str),
+    ) {
+        out.push(json!({ "oldText": old, "newText": new }));
+    }
+
+    if out.is_empty() {
+        return Err(ToolError::Edit(
+            "no edits supplied: pass edits[] or oldText/newText".into(),
+        ));
+    }
+    Ok(out)
+}
+
+/// Serialises mutations per canonical path (pi's `file-mutation-queue.ts`).
+///
+/// `edit` is read-modify-write, so two concurrent edits to one file would both read the same
+/// original and the later write would drop the earlier change. Different files keep separate locks
+/// and stay parallel.
+fn mutation_lock(path: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static QUEUES: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+    let map = QUEUES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    Arc::clone(
+        guard
+            .entry(canonical)
+            .or_insert_with(|| Arc::new(Mutex::new(()))),
+    )
+}
+
 fn run_edit(args: &Value) -> Result<String, ToolError> {
     let path = args.get("path").and_then(Value::as_str).expect("validated");
-    let edits = args
-        .get("edits")
-        .and_then(Value::as_array)
-        .ok_or_else(|| ToolError::Edit("edits must be an array".into()))?;
+    let edits = normalize_edits(args)?;
+    let lock = mutation_lock(path);
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
     let original = fs::read_to_string(path)?;
     let mut spans: Vec<(usize, usize, String)> = Vec::with_capacity(edits.len());
@@ -1049,7 +1113,15 @@ fn tail_notice(output: &str, stdout_buf: &str, stderr_buf: &str) -> String {
     body
 }
 
-fn run_shell(shell: &str, args: &Value) -> Result<String, ToolError> {
+fn run_shell_cancellable(
+    shell: &str,
+    args: &Value,
+    cancel: Option<&AtomicBool>,
+) -> Result<String, ToolError> {
+    let is_cancelled = |flag: Option<&AtomicBool>| flag.is_some_and(|f| f.load(Ordering::SeqCst));
+    if is_cancelled(cancel) {
+        return Err(ToolError::Tool("Command aborted".to_string()));
+    }
     let cmd = args.get("command").and_then(Value::as_str).expect("validated");
     let timeout_secs = args
         .get("timeout_secs")
@@ -1076,6 +1148,7 @@ fn run_shell(shell: &str, args: &Value) -> Result<String, ToolError> {
         .spawn()?;
 
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let started_at = Instant::now();
     let status = loop {
         if let Some(st) = child.try_wait()? {
             break st;
@@ -1088,6 +1161,12 @@ fn run_shell(shell: &str, args: &Value) -> Result<String, ToolError> {
             return Err(ToolError::Tool(format!(
                 "command timed out after {timeout_secs}s"
             )));
+        }
+        if is_cancelled(cancel) {
+            kill_process_tree(child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ToolError::Tool("Command aborted".to_string()));
         }
         std::thread::sleep(Duration::from_millis(50));
     };
@@ -1125,6 +1204,7 @@ fn run_shell(shell: &str, args: &Value) -> Result<String, ToolError> {
     } else {
         format!("{stdout_buf}\n{stderr_buf}")
     };
+    let wall = started_at.elapsed().as_secs_f64();
     if code != 0 {
         // pi reports a non-zero exit as a tool **error** so the UI renders an error card instead of a
         // normal result. The body still starts with the verbatim `exit_code=N` line: VerificationGate
@@ -1140,14 +1220,17 @@ fn run_shell(shell: &str, args: &Value) -> Result<String, ToolError> {
         };
         let body = tail_notice(&body, &stdout_buf, &stderr_buf);
         return Err(ToolError::Tool(format!(
-            "{body}\n\nCommand exited with code {code}"
+            "{body}\n\nCommand exited with code {code}\nwall_time_seconds={wall:.1}"
         )));
     }
-    Ok(tail_notice(
+    // `exit_code=N` stays a standalone first line so VerificationGate keeps parsing it; the wall
+    // time rides on its own trailing line (pi exposes it as a structured field instead).
+    let body = tail_notice(
         &format!("exit_code={code}\n{combined}"),
         &stdout_buf,
         &stderr_buf,
-    ))
+    );
+    Ok(format!("{body}\nwall_time_seconds={wall:.1}"))
 }
 
 pub fn execute_builtin_tool(
@@ -1178,6 +1261,25 @@ pub fn execute_builtin_tool(
 
 /// Execute a validated built-in tool after user approval.
 pub fn execute_builtin_tool_approved(name: &str, args: &Value) -> Result<String, ToolError> {
+    execute_builtin_tool_approved_cancellable(name, args, None)
+}
+
+/// Same as [`execute_builtin_tool_approved`], but a running shell command is killed (with its whole
+/// process tree) as soon as `cancel` flips.
+pub fn execute_builtin_tool_approved_with_cancel(
+    name: &str,
+    args: &Value,
+    cancel: &AtomicBool,
+) -> Result<String, ToolError> {
+    execute_builtin_tool_approved_cancellable(name, args, Some(cancel))
+}
+
+/// Cancellation-aware dispatch used by the agent loop, which may have no cancel flag at all.
+pub fn execute_builtin_tool_approved_cancellable(
+    name: &str,
+    args: &Value,
+    cancel: Option<&AtomicBool>,
+) -> Result<String, ToolError> {
     match name {
         "read" => run_read(args),
         "write" => run_write(args),
@@ -1185,8 +1287,8 @@ pub fn execute_builtin_tool_approved(name: &str, args: &Value) -> Result<String,
         "grep" => run_grep(args),
         "find" => run_find(args),
         "ls" => run_ls(args),
-        "bash" => run_shell("bash", args),
-        "powershell" => run_shell("powershell", args),
+        "bash" => run_shell_cancellable("bash", args, cancel),
+        "powershell" => run_shell_cancellable("powershell", args, cancel),
         "memory_search" | "memory_write" | "memory_read" | "memory_delete" => {
             memory::execute_memory_tool(name, args).map_err(ToolError::Edit)
         }

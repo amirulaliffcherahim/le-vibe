@@ -453,6 +453,7 @@ fn main() {
                         // overflow recovery still works from provider error text.
                         context_window: 0,
                         reserve_tokens: le_vibe_agent::DEFAULT_RESERVE_TOKENS,
+                        verify_edits: true,
                         allowed_tools,
                         mode_name: Some(agent_mode.name().to_string()),
                         codemode: load_layered_settings()
@@ -541,6 +542,7 @@ fn run_interactive_tui(
     state.quiet_startup = parse_bool("quiet_startup", false);
     state.bell_on_done = parse_bool("bell_on_done", false);
     state.auto_compact = parse_bool("auto_compact", true);
+    state.verify_edits = parse_bool("verify_edits", true);
     if let Some(mt) = layered.get("max_turns").and_then(|s| s.parse::<usize>().ok()) {
         state.max_turns = mt.clamp(5, 200);
     }
@@ -981,6 +983,7 @@ fn run_interactive_tui(
                                     max_turns: state.max_turns,
                                     retry_max: state.retry_max,
                                     context_window: state.agent_context_window(),
+                                    verify_edits: state.verify_edits,
                                     prompt: cont,
                                 });
                             }
@@ -1121,6 +1124,7 @@ fn run_interactive_tui(
                                 max_turns: state.max_turns,
                                 retry_max: state.retry_max,
                                 context_window: state.agent_context_window(),
+                                    verify_edits: state.verify_edits,
                                 prompt: next_prompt,
                             });
                         }
@@ -1159,6 +1163,7 @@ fn run_interactive_tui(
                 max_turns: state.max_turns,
                 retry_max: state.retry_max,
                 context_window: state.agent_context_window(),
+                                    verify_edits: state.verify_edits,
                 prompt: due_prompt,
             });
         }
@@ -1514,6 +1519,10 @@ fn run_interactive_tui(
                         state.auto_compact = !state.auto_compact;
                         Some(state.auto_compact.to_string())
                     }
+                    "verify_edits" => {
+                        state.verify_edits = !state.verify_edits;
+                        Some(state.verify_edits.to_string())
+                    }
                     "max_turns" => {
                         let opts = [20usize, 40, 80];
                         let cur = opts.iter().position(|v| *v == state.max_turns).unwrap_or(1);
@@ -1719,6 +1728,7 @@ fn run_interactive_tui(
                         max_turns: state.max_turns,
                         retry_max: state.retry_max,
                         context_window: state.agent_context_window(),
+                                    verify_edits: state.verify_edits,
                         prompt: goal_prompt,
                     });
                     continue;
@@ -1983,6 +1993,7 @@ fn run_interactive_tui(
                         max_turns: state.max_turns,
                         retry_max: state.retry_max,
                         context_window: state.agent_context_window(),
+                                    verify_edits: state.verify_edits,
                         prompt,
                     });
                     continue;
@@ -2137,6 +2148,7 @@ fn run_interactive_tui(
                             max_turns: state.max_turns,
                             retry_max: state.retry_max,
                             context_window: state.agent_context_window(),
+                                    verify_edits: state.verify_edits,
                             prompt: distill_prompt,
                         });
                     }
@@ -2402,6 +2414,7 @@ fn run_interactive_tui(
                             max_turns: state.max_turns,
                             retry_max: state.retry_max,
                             context_window: state.agent_context_window(),
+                                    verify_edits: state.verify_edits,
                             prompt: expanded,
                         });
                     } else if state
@@ -2458,6 +2471,7 @@ fn run_interactive_tui(
                     max_turns: state.max_turns,
                     retry_max: state.retry_max,
                     context_window: state.agent_context_window(),
+                                    verify_edits: state.verify_edits,
                     prompt: input,
                 });
             }

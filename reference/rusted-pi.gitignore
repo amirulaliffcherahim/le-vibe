@@ -1,0 +1,8 @@
+/target
+/.ref
+/pi-src/node_modules
+**/*.rs.bk
+*.pdb
+.DS_Store
+Thumbs.db
+/rust/*/target

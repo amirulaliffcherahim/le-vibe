@@ -12,7 +12,7 @@ use crate::editor::{draw_editor, wrap_editor_lines};
 use crate::markdown::render_markdown_lines;
 use crate::modal::{draw_at_file_popup, draw_modal, draw_slash_popup};
 use crate::mode::AgentMode;
-use crate::state::{ActiveModal, TranscriptBlock, TuiState, format_tokens};
+use crate::state::{ActiveModal, StatusKind, TranscriptBlock, TuiState, format_tokens};
 
 pub fn draw_frame(frame: &mut Frame<'_>, state: &TuiState) {
     let area = frame.area();
@@ -353,6 +353,7 @@ fn push_pi_surface(
     title: &str,
     body: &str,
     hidden_count: usize,
+    hidden_is_earlier: bool,
     style: SurfaceStyle,
 ) {
     // Pad to the wrap width (callers reserve 2 columns for the scrollbar) so a surface line never
@@ -384,7 +385,10 @@ fn push_pi_surface(
     );
 
     if hidden_count > 0 {
-        let hint = format!("... ({hidden_count} earlier lines, ctrl+o to expand)");
+        let hint = format!(
+            "... ({hidden_count} {} lines, ctrl+o to expand)",
+            if hidden_is_earlier { "earlier" } else { "more" }
+        );
         let (hint_fit, _) = split_at_width(&hint, inner_w);
         let pad = total_w.saturating_sub(1 + Span::raw(hint_fit).width());
         lines.push(
@@ -504,11 +508,13 @@ fn hash_block(block: &TranscriptBlock) -> u64 {    let mut h = DefaultHasher::ne
             2u8.hash(&mut h);
             t.hash(&mut h);
         }
-        TranscriptBlock::Tool { name, status, output } => {
+        TranscriptBlock::Tool(card) => {
             3u8.hash(&mut h);
-            name.hash(&mut h);
-            status.hash(&mut h);
-            output.hash(&mut h);
+            card.name.hash(&mut h);
+            card.args_json.hash(&mut h);
+            card.status.hash(&mut h);
+            card.output.hash(&mut h);
+            card.duration_ms.hash(&mut h);
         }
         TranscriptBlock::Script { command, output, in_context } => {
             4u8.hash(&mut h);
@@ -591,29 +597,51 @@ fn render_block_wrapped(
                 }
             }
         }
-        TranscriptBlock::Tool {
-            name,
-            status,
-            output,
-        } => {
+        TranscriptBlock::Tool(card) => {
             lines.push(Line::from(""));
-            let is_err = status.starts_with("failed");
-            let is_running = status.starts_with("running") || status == "pending";
-            let title = format!("{name} · {status}");
-            let all_out: Vec<&str> = output.trim().lines().collect();
-            let max_lines = if state.expand_tools { 40 } else { 5 };
-            let hidden = all_out.len().saturating_sub(max_lines);
-            let preview = if hidden > 0 {
-                all_out[all_out.len() - max_lines..].join("\n")
+            let is_err = card.is_error();
+            let is_running = card.is_running();
+            let header = tool_call_header(&card.name, &card.args_json, state.expand_tools);
+            let mut title = header.title;
+            if !card.status.is_empty() {
+                title.push_str(" · ");
+                title.push_str(&card.status);
+            }
+            if let Some(ms) = card.duration_ms {
+                title.push_str(&format!(" ({})", format_tool_duration(ms)));
+            }
+
+            // pi hides the body of collapsed compact `read` cards (`[skill]`, resource, docs).
+            let (preview, hidden) = if header.suppress_body && !state.expand_tools {
+                (String::new(), 0)
             } else {
-                all_out.join("\n")
+                let all_out: Vec<&str> = card.output.trim().lines().collect();
+                // pi: 10 preview lines by default, 5 for shell tools (keep the tail for shells).
+                let (max_lines, keep_tail) = if state.expand_tools {
+                    (40, is_shell_tool(&card.name))
+                } else if is_shell_tool(&card.name) {
+                    (5, true)
+                } else {
+                    (10, false)
+                };
+                let hidden = all_out.len().saturating_sub(max_lines);
+                let slice = if hidden > 0 && keep_tail {
+                    all_out[all_out.len() - max_lines..].join("\n")
+                } else if hidden > 0 {
+                    all_out[..max_lines].join("\n")
+                } else {
+                    all_out.join("\n")
+                };
+                (slice, hidden)
             };
+            let tail_slice = is_shell_tool(&card.name);
             push_pi_surface(
                 &mut lines,
                 area_width,
                 &title,
                 &preview,
                 hidden,
+                tail_slice,
                 SurfaceStyle {
                     title: if is_err { pal.error } else { pal.fg },
                     bg: if is_err {
@@ -654,6 +682,7 @@ fn render_block_wrapped(
                 &tag,
                 &preview,
                 hidden,
+                true,
                 SurfaceStyle {
                     title: Color::White,
                     bg: pal.card_quiet_bg,
@@ -844,21 +873,24 @@ fn draw_status_strip(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         }
     };
 
-    let effective_status = state
-        .status_text
-        .as_deref()
-        .or_else(|| state.is_busy.then_some("Working..."));
+    let effective_status = state.status_label();
     if let Some(status) = effective_status {
         let glyph = if state.is_busy || state.usage_loading {
             format!(" {} ", state.spinner_glyph())
         } else {
             " • ".to_string()
         };
+        // pi colours only retry indicators with the warning tone; the rest stay accent.
+        let tone = if state.status_kind.is_warning() {
+            pal.warning
+        } else {
+            accent
+        };
         push_clamped(
             &mut spans,
             &mut used,
             glyph,
-            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            Style::default().fg(tone).add_modifier(Modifier::BOLD),
         );
         push_clamped(&mut spans, &mut used, status.to_string(), Style::default().fg(pal.fg));
         if state.is_busy {
@@ -871,7 +903,15 @@ fn draw_status_strip(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                     Style::default().fg(pal.muted),
                 );
             }
-            if state.steering_prompts.is_empty() && state.queued_prompts.is_empty() {
+            // Retry / compaction / branch-summary labels already carry their own cancel hint.
+            let kind_has_hint = !matches!(
+                state.status_kind,
+                StatusKind::Idle | StatusKind::Working
+            );
+            if !kind_has_hint
+                && state.steering_prompts.is_empty()
+                && state.queued_prompts.is_empty()
+            {
                 push_clamped(
                     &mut spans,
                     &mut used,
@@ -954,6 +994,205 @@ fn draw_status_strip(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     }
 }
 
+
+/// Tool duration exactly as pi renders it: `4.2s`, then `1m 30s`, then `2h 3m 4s`.
+pub fn format_tool_duration(ms: u64) -> String {
+    if ms < 60_000 {
+        return format!("{:.1}s", ms as f64 / 1000.0);
+    }
+    let total_secs = ms / 1000;
+    let minutes = total_secs / 60;
+    let seconds = total_secs % 60;
+    if minutes < 60 {
+        return format!("{minutes}m {seconds}s");
+    }
+    format!(
+        "{}h {}m {seconds}s",
+        minutes / 60,
+        minutes % 60
+    )
+}
+
+fn is_shell_tool(name: &str) -> bool {
+    matches!(name, "bash" | "powershell" | "shell" | "exec")
+}
+
+/// A rendered tool header plus whether its body should stay collapsed.
+pub struct ToolHeader {
+    pub title: String,
+    /// pi collapses `SKILL.md` / resource reads to a single header line.
+    pub suppress_body: bool,
+}
+
+fn arg_str<'a>(args: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter().find_map(|k| {
+        args.get(*k)
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+    })
+}
+
+fn arg_u64(args: &serde_json::Value, key: &str) -> Option<u64> {
+    let v = args.get(key)?;
+    v.as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+}
+
+fn file_basename(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+fn file_parent(path: &str) -> &str {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    match trimmed.rfind(['/', '\\']) {
+        Some(idx) => file_basename(&trimmed[..idx]),
+        None => "",
+    }
+}
+
+/// pi's `formatReadLineRange`: `:10-39` for offset+limit, `:10` for offset only.
+pub fn format_read_line_range(offset: Option<u64>, limit: Option<u64>) -> String {
+    let Some(start) = offset else {
+        return limit.map(|l| format!(":1-{l}")).unwrap_or_default();
+    };
+    match limit {
+        Some(count) if count > 0 => format!(":{start}-{}", start + count - 1),
+        _ => format!(":{start}"),
+    }
+}
+
+/// Build the tool card header from the raw model arguments.
+///
+/// Mirrors pi's renderers: `read <path>:<range>`, shell tools show the command, and unknown
+/// tools fall back to `name key=json ...`. Collapsed `read`s of skills/resources/docs collapse.
+pub fn tool_call_header(name: &str, args_json: &str, expanded: bool) -> ToolHeader {
+    let plain = |title: String| ToolHeader {
+        title,
+        suppress_body: false,
+    };
+    let args: serde_json::Value =
+        serde_json::from_str(args_json).unwrap_or(serde_json::Value::Null);
+    if args.is_null() {
+        return plain(name.to_string());
+    }
+
+    match name {
+        "read" => {
+            let Some(path) = arg_str(&args, &["path", "file", "file_path"]) else {
+                return plain(name.to_string());
+            };
+            let range = format_read_line_range(arg_u64(&args, "offset"), arg_u64(&args, "limit"));
+            let base = file_basename(path);
+            let hint = " (ctrl+o to expand)";
+            if !expanded {
+                if base.eq_ignore_ascii_case("SKILL.md") {
+                    return ToolHeader {
+                        title: format!("[skill] {}{range}{hint}", file_parent(path)),
+                        suppress_body: true,
+                    };
+                }
+                if matches!(
+                    base.to_ascii_uppercase().as_str(),
+                    "AGENTS.MD" | "AGENTS.OVERRIDE.MD" | "CLAUDE.MD"
+                ) {
+                    return ToolHeader {
+                        title: format!("read resource {path}{range}{hint}"),
+                        suppress_body: true,
+                    };
+                }
+            }
+            plain(format!("read {path}{range}"))
+        }
+        n if is_shell_tool(n) => {
+            let Some(command) = arg_str(&args, &["command", "cmd"]) else {
+                return plain(format!("{n} ..."));
+            };
+            let line = command.lines().next().unwrap_or("").trim();
+            let shown: String = line.chars().take(120).collect();
+            let timeout = arg_u64(&args, "timeout")
+                .map(|t| format!(" (timeout {t}s)"))
+                .unwrap_or_default();
+            plain(format!("{n} {shown}{timeout}"))
+        }
+        "edit" | "write" => arg_str(&args, &["path", "file", "file_path"])
+            .map(|p| plain(format!("{name} {p}")))
+            .unwrap_or_else(|| plain(name.to_string())),
+        "grep" | "find" => {
+            let pattern = arg_str(&args, &["pattern", "query"]).unwrap_or("");
+            let path = arg_str(&args, &["path"]).map(|p| format!(" {p}")).unwrap_or_default();
+            plain(format!("{name} {pattern}{path}"))
+        }
+        "ls" => arg_str(&args, &["path"])
+            .map(|p| plain(format!("ls {p}")))
+            .unwrap_or_else(|| plain("ls".to_string())),
+        "web_search" => {
+            let query = arg_str(&args, &["query"]).or_else(|| {
+                args.get("queries")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|a| a.first())
+                    .and_then(serde_json::Value::as_str)
+            });
+            plain(format!("web_search {}", query.unwrap_or("")))
+        }
+        "fetch_content" => plain(format!(
+            "fetch_content {}",
+            arg_str(&args, &["url"]).unwrap_or("")
+        )),
+        "codemode" => {
+            let calls: Vec<&str> = arg_str(&args, &["code"])
+                .unwrap_or("")
+                .split("tools.")
+                .skip(1)
+                .filter_map(|s| s.split('(').next())
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && s.len() <= 24)
+                .take(3)
+                .collect();
+            if calls.is_empty() {
+                plain("codemode".to_string())
+            } else {
+                plain(format!("codemode {}", calls.join(" + ")))
+            }
+        }
+        _ => {
+            // pi's generic fallback: `title key=JSON key=JSON`, truncated when collapsed.
+            let Some(obj) = args.as_object() else {
+                return plain(name.to_string());
+            };
+            if obj.is_empty() {
+                return plain(name.to_string());
+            }
+            if expanded {
+                let mut title = name.to_string();
+                for (k, v) in obj {
+                    let text = match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    title.push_str(&format!("\n  {k}: {}", text.replace('\n', "\n    ")));
+                }
+                ToolHeader {
+                    title,
+                    suppress_body: false,
+                }
+            } else {
+                let pairs: String = obj
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let shown: String = if pairs.chars().count() > 60 {
+                    let mut s: String = pairs.chars().take(57).collect();
+                    s.push_str("...");
+                    s
+                } else {
+                    pairs
+                };
+                plain(format!("{name} {shown}"))
+            }
+        }
+    }
+}
 
 pub fn format_duration_ms(milliseconds: u64) -> String {
     let total = milliseconds / 1_000;
@@ -1050,14 +1289,36 @@ pub(crate) fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         c_context
     };
 
-    let stats: [(&str, String, Color); 6] = [
-        ("", format!("↑ {}", format_tokens(state.input_tokens)), c_input),
-        ("", format!("↓ {}", format_tokens(state.output_tokens)), c_output),
-        ("", cache_str, c_cache),
-        ("", tps_str, c_tps),
-        ("", format!("$ {:.3}", state.cost_usd), c_cost),
-        ("", ctx_text, ctx_color),
-    ];
+    // pi omits every zero-valued counter instead of printing padding zeros.
+    let mut stats: Vec<(String, Color)> = Vec::new();
+    if state.input_tokens > 0 {
+        stats.push((format!("↑ {}", format_tokens(state.input_tokens)), c_input));
+    }
+    if state.output_tokens > 0 {
+        stats.push((format!("↓ {}", format_tokens(state.output_tokens)), c_output));
+    }
+    if state.cache_read_tokens > 0 {
+        stats.push((
+            format!("R {}", format_tokens(state.cache_read_tokens)),
+            c_cache,
+        ));
+    }
+    if state.cache_write_tokens > 0 {
+        stats.push((
+            format!("W {}", format_tokens(state.cache_write_tokens)),
+            c_cache,
+        ));
+    }
+    if state.last_cache_rate.is_some() {
+        stats.push((cache_str, c_cache));
+    }
+    if state.last_tps.is_some() {
+        stats.push((tps_str, c_tps));
+    }
+    if state.cost_usd > 0.0 {
+        stats.push((format!("$ {:.3}", state.cost_usd), c_cost));
+    }
+    stats.push((ctx_text, ctx_color));
 
     let right_model = format!("({}) {} ", state.provider, state.model);
     let right_sep = "• ";
@@ -1069,7 +1330,7 @@ pub(crate) fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let mut line2_spans: Vec<Span<'_>> = vec![Span::raw(" ")];
     let mut left_len = 1usize;
     let mut added = 0usize;
-    for (_, text, col) in &stats {
+    for (text, col) in &stats {
         let sep_len = if added > 0 { 3 } else { 0 };
         let item_len = text.chars().count();
         if left_len + sep_len + item_len > max_left {

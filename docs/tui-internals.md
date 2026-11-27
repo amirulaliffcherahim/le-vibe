@@ -1,5 +1,24 @@
 # TUI Internals (`crates/le-vibe-tui`)
 
+## Pi Parity Contract (P0)
+
+`le-vibe-tui` is a strict leaf crate: it owns every user-visible string, layout rule and colour.
+`le-vibe-agent` and `le-vibe-cli` only forward plain values, so a formatting change never touches
+the agent loop.
+
+| Concern | Owner | Parity rule |
+| --- | --- | --- |
+| Tool card header | `transcript::tool_call_header` | `read <path>:<start>-<end>`, `<shell> <command> (timeout Ns)`, `<name> key=json ...`; collapsed `SKILL.md` reads become `[skill] <name> (ctrl+o to expand)` with no body |
+| Tool duration | `transcript::format_tool_duration` | `4.2s`, then `1m 30s`, then `2h 3m 4s` |
+| Preview budget | `render_block_wrapped` | 10 lines (40 expanded); shell tools keep the **last** 5 and say `... (N earlier lines, ctrl+o to expand)`, other tools keep the **first** and say `... (N more lines, ...)` |
+| Status strip | `state::StatusKind` | `Working` / `Retrying (a/max) in Ns... (esc to cancel)` with a live countdown / `Compacting context...` / `Auto-compacting...` / `Context overflow detected, Auto-compacting...` / `Summarizing branch...`; only retries use the warning colour |
+| Footer counters | `draw_footer` | `↑ ↓ R<cacheRead> W<cacheWrite> ↺hit% ⚡t/s $cost ◔ctx`; every zero-valued counter is omitted, and `◔ ?/1.0M (auto)` holds until the next turn reports a prompt size |
+
+`le-vibe-agent` emits `ToolCallStart { args_json }`, `ToolCallEnd { duration_ms }` and
+`Retry { attempt, max_attempts, delay_ms }`; nothing in the agent layer formats them. The status
+strip's row is always allocated, so idle → busy never reflows the editor or footer
+(`idle_status_reserves_height` in `tests/render_tests.rs`).
+
 ## Module Layout
 
 - `theme.rs` — 9 full-app palettes (`pi`, `owl-cyan`, `rose-pine`, `kanagawa`, `tokyo-night`, `catppuccin`, `nord`, `gruvbox`, `dracula`); `pi` uses Pi's `dark.json` okhsl tokens converted to sRGB and is the default

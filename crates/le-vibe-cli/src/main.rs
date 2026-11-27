@@ -13,10 +13,11 @@ use le_vibe_durable::SessionStore;
 use le_vibe_pybridge::{PolicyPort, ProviderPort, PythonBridge};
 use le_vibe_telemetry::TelemetryRecorder;
 use le_vibe_tui::{
-    ALL_SHELLS, ALL_THEMES, ActiveModal, AgentMode, TerminalGuard, ThemeId, TranscriptBlock,
-    TuiAction, TuiState, build_system_prompt, draw_frame, export_session_html,
-    export_session_markdown, extract_last_code_block, extract_latest_xml_block, format_chat_html,
-    format_chat_plain, format_tokens, poll_tui_action, project_xml_diagram, render_status_bar,
+    ALL_SHELLS, ALL_THEMES, ActiveModal, AgentMode, CompactionReason, TerminalGuard, ThemeId,
+    ToolCard, TranscriptBlock, TuiAction, TuiState, build_system_prompt, draw_frame,
+    export_session_html, export_session_markdown, extract_last_code_block, extract_latest_xml_block,
+    format_chat_html, format_chat_plain, format_tokens, poll_tui_action, project_xml_diagram,
+    render_status_bar,
 };
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -742,6 +743,13 @@ fn run_interactive_tui(
                     AgentEvent::Status { text } => {
                         state.status_text = Some(text);
                     }
+                    AgentEvent::Retry {
+                        attempt,
+                        max_attempts,
+                        delay_ms,
+                    } => {
+                        state.set_retry(attempt, max_attempts, delay_ms);
+                    }
                     AgentEvent::ThinkingDelta { delta } => {
                         if let Some(TranscriptBlock::Thinking(buf)) = state.blocks.last_mut() {
                             buf.push_str(&delta);
@@ -762,25 +770,22 @@ fn run_interactive_tui(
                         }
                         state.blocks.push(TranscriptBlock::User(text));
                     }
-                    AgentEvent::ToolCallStart { name, summary, .. } => {
+                    AgentEvent::ToolCallStart {
+                        name, args_json, ..
+                    } => {
                         turn_tools_count += 1;
-                        let display_name = if summary.is_empty() {
-                            name.clone()
-                        } else {
-                            format!("{name} {summary}")
-                        };
-                        logger.log("tool", "start", None, display_name.clone());
-                        state.status_text = Some(format!("Running {display_name}…"));
-                        state.blocks.push(TranscriptBlock::Tool {
-                            name: display_name,
-                            status: "running...".to_string(),
-                            output: String::new(),
-                        });
+                        logger.log("tool", "start", None, name.clone());
+                        state.set_working();
+                        state.status_text = Some(format!("Running {name}…"));
+                        state.blocks.push(TranscriptBlock::Tool(
+                            ToolCard::new(&name, &args_json).with_status("running..."),
+                        ));
                     }
                     AgentEvent::ToolCallEnd {
                         name,
                         is_error,
                         output,
+                        duration_ms,
                         ..
                     } => {
                         let label = if is_error { "failed" } else { "done" };
@@ -807,26 +812,26 @@ fn run_interactive_tui(
                             None,
                             log_msg,
                         );
-                        let preview: String = output.lines().take(8).collect::<Vec<_>>().join("\n");
-                        if let Some(TranscriptBlock::Tool {
-                            status: st,
-                            output: out,
-                            ..
-                        }) = state.blocks.iter_mut().rev().find(|b| {
-                            matches!(
-                                b,
-                                TranscriptBlock::Tool { name: n, status: s, .. }
-                                if (*n == name || n.starts_with(&format!("{name} "))) && s == "running..."
-                            )
-                        }) {
-                            *st = label.to_string();
-                            *out = preview;
+                        // Keep the full output: the renderer owns the preview budget (pi parity).
+                        if let Some(TranscriptBlock::Tool(card)) =
+                            state.blocks.iter_mut().rev().find(|b| {
+                                matches!(
+                                    b,
+                                    TranscriptBlock::Tool(c)
+                                    if c.name == name && c.status == "running..."
+                                )
+                            })
+                        {
+                            card.status = label.to_string();
+                            card.output = output.clone();
+                            card.duration_ms = Some(duration_ms);
                         }
                         if state.is_busy
                             && !state.blocks.iter().any(|b| {
-                                matches!(b, TranscriptBlock::Tool { status: s, .. } if s == "running...")
+                                matches!(b, TranscriptBlock::Tool(c) if c.is_running())
                             })
                         {
+                            state.set_working();
                             state.status_text = Some("Thinking...".to_string());
                         }
                     }
@@ -872,6 +877,7 @@ fn run_interactive_tui(
                     context_tokens,
                     output_tokens,
                     cache_read_tokens,
+                    cache_write_tokens,
                     cost_usd,
                     tps,
                     git_badges,
@@ -887,6 +893,7 @@ fn run_interactive_tui(
                         .unwrap_or(0);
                     state.last_tps = tps;
                     state.git_badges = git_badges;
+                    state.clear_status_kind();
                     if context_tokens > 0 {
                         state.context_tokens = context_tokens;
                     }
@@ -895,6 +902,7 @@ fn run_interactive_tui(
                         input_tokens,
                         output_tokens,
                         cache_read_tokens,
+                        cache_write_tokens,
                         cost_usd,
                     );
                     if turn_tools_count > 0 {
@@ -975,11 +983,11 @@ fn run_interactive_tui(
                         .trim_start_matches("python error (RuntimeError): ")
                         .trim_start_matches("python error: ")
                         .to_string();
-                    state.blocks.push(TranscriptBlock::Tool {
-                        name: "error".to_string(),
-                        status: "failed".to_string(),
-                        output: clean_err,
-                    });
+                    state.blocks.push(TranscriptBlock::Tool(
+                        ToolCard::new("error", "")
+                            .with_status("failed")
+                            .with_output(&clean_err),
+                    ));
                 }
                 WorkerMsg::Notice(text) => {
                     if text.starts_with("Interrupted") {
@@ -987,6 +995,7 @@ fn run_interactive_tui(
                     }
                     if text.starts_with("Compacted session") {
                         state.context_tokens = 0;
+                        state.clear_status_kind();
                     }
                     state.blocks.push(TranscriptBlock::System(text));
                 }
@@ -1767,7 +1776,7 @@ fn run_interactive_tui(
                 }
                 if input == "/compact" {
                     state.is_busy = true;
-                    state.status_text = Some("Compacting session via LLM...".to_string());
+                    state.set_compaction(CompactionReason::Manual);
                     let _ = cmd_tx.send(WorkerCmd::Compact {
                         provider: state.provider.clone(),
                         model: state.model.clone(),
@@ -1777,7 +1786,7 @@ fn run_interactive_tui(
                 }
                 if let Some(arg) = input.strip_prefix("/compact ") {
                     state.is_busy = true;
-                    state.status_text = Some("Compacting session via LLM...".to_string());
+                    state.set_compaction(CompactionReason::Manual);
                     let _ = cmd_tx.send(WorkerCmd::Compact {
                         provider: state.provider.clone(),
                         model: state.model.clone(),
@@ -2401,6 +2410,7 @@ fn run_interactive_tui(
                         "Context >= {}% — running auto-compaction before turn...",
                         state.compact_threshold_pct
                     )));
+                    state.set_compaction(CompactionReason::Threshold);
                     let _ = cmd_tx.send(WorkerCmd::Compact {
                         provider: state.provider.clone(),
                         model: state.model.clone(),

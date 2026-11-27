@@ -57,12 +57,56 @@ pub fn format_tokens(count: u64) -> String {
     }
 }
 
+/// One tool invocation's presentation state (all formatting lives in `transcript.rs`).
+#[derive(Debug, Clone, Default)]
+pub struct ToolCard {
+    pub name: String,
+    /// Raw JSON arguments exactly as the model sent them; parsed by the renderer.
+    pub args_json: String,
+    pub status: String,
+    pub output: String,
+    pub duration_ms: Option<u64>,
+}
+
+impl ToolCard {
+    pub fn new(name: &str, args_json: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            args_json: args_json.to_string(),
+            ..Default::default()
+        }
+    }
+
+    pub fn with_status(mut self, status: &str) -> Self {
+        self.status = status.to_string();
+        self
+    }
+
+    pub fn with_output(mut self, output: &str) -> Self {
+        self.output = output.to_string();
+        self
+    }
+
+    pub fn with_duration(mut self, ms: u64) -> Self {
+        self.duration_ms = Some(ms);
+        self
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.status.starts_with("running") || self.status == "pending"
+    }
+
+    pub fn is_error(&self) -> bool {
+        self.status.starts_with("failed")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum TranscriptBlock {
     User(String),
     Thinking(String),
     Assistant(String),
-    Tool { name: String, status: String, output: String },
+    Tool(ToolCard),
     Script { command: String, output: String, in_context: bool },
     System(String),
     /// Preformatted output (reports, tables): rendered verbatim, without a bullet or indent.
@@ -112,6 +156,76 @@ pub enum ActiveModal {
 }
 
 pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Why the harness started compacting (pi shows a different sentence per reason).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionReason {
+    /// User ran `/compact`.
+    Manual,
+    /// Auto-compact threshold was crossed.
+    Threshold,
+    /// Provider reported a context overflow.
+    Overflow,
+}
+
+/// Which kind of work the status strip is reporting.
+///
+/// pi renders four distinct indicators; keeping the kind (instead of a free-form string) lets
+/// `le-vibe-tui` own all wording, colouring and countdown maths.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum StatusKind {
+    #[default]
+    Idle,
+    Working,
+    Retry {
+        attempt: usize,
+        max_attempts: usize,
+        /// When the next attempt starts; the remaining seconds are recomputed every frame.
+        deadline: Instant,
+    },
+    Compaction {
+        reason: CompactionReason,
+    },
+    BranchSummary,
+}
+
+impl StatusKind {
+    /// Whether the strip should use the warning colour (only retries do, as in pi).
+    pub fn is_warning(&self) -> bool {
+        matches!(self, StatusKind::Retry { .. })
+    }
+
+    pub fn is_idle(&self) -> bool {
+        matches!(self, StatusKind::Idle)
+    }
+
+    /// Status label for this kind, or `None` when idle (callers fall back to `status_text`).
+    pub fn label(&self) -> Option<String> {
+        Some(match self {
+            StatusKind::Idle => return None,
+            StatusKind::Working => "Working...".to_string(),
+            StatusKind::Retry {
+                attempt,
+                max_attempts,
+                deadline,
+            } => {
+                let secs = deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_secs_f64()
+                    .ceil() as u64;
+                format!("Retrying ({attempt}/{max_attempts}) in {secs}s... (esc to cancel)")
+            }
+            StatusKind::Compaction { reason } => match reason {
+                CompactionReason::Manual => "Compacting context... (esc to cancel)".to_string(),
+                CompactionReason::Threshold => "Auto-compacting... (esc to cancel)".to_string(),
+                CompactionReason::Overflow => {
+                    "Context overflow detected, Auto-compacting... (esc to cancel)".to_string()
+                }
+            },
+            StatusKind::BranchSummary => "Summarizing branch... (esc to cancel)".to_string(),
+        })
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuestionOption {
@@ -189,6 +303,7 @@ pub struct TuiState {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
     pub last_cache_rate: Option<f64>,
     pub last_tps: Option<f64>,
     pub cost_usd: f64,
@@ -198,6 +313,8 @@ pub struct TuiState {
     pub provider_auth: BTreeMap<String, (bool, String)>,
     pub provider_quota_badge: BTreeMap<String, String>,
     pub status_text: Option<String>,
+    /// Structured status kind; `Idle` falls back to `status_text`.
+    pub status_kind: StatusKind,
     pub is_busy: bool,
     pub yolo: bool,
     pub codemode: String,
@@ -296,6 +413,7 @@ impl TuiState {
             input_tokens: 0,
             output_tokens: 0,
             cache_read_tokens: 0,
+            cache_write_tokens: 0,
             last_cache_rate: None,
             last_tps: None,
             cost_usd: 0.0,
@@ -305,6 +423,7 @@ impl TuiState {
             provider_auth: BTreeMap::new(),
             provider_quota_badge: BTreeMap::new(),
             status_text: None,
+            status_kind: StatusKind::Idle,
             is_busy: false,
             yolo: false,
             codemode: "off".to_string(),
@@ -372,6 +491,41 @@ impl TuiState {
     pub fn advance_spinner(&mut self) {
         if !self.reduced_motion {
             self.spinner_tick = (self.spinner_tick + 1) % SPINNER_FRAMES.len();
+        }
+    }
+
+    pub fn set_retry(&mut self, attempt: usize, max_attempts: usize, delay_ms: u64) {
+        self.status_kind = StatusKind::Retry {
+            attempt,
+            max_attempts,
+            deadline: Instant::now() + std::time::Duration::from_millis(delay_ms),
+        };
+    }
+
+    pub fn set_compaction(&mut self, reason: CompactionReason) {
+        self.status_kind = StatusKind::Compaction { reason };
+    }
+
+    pub fn set_branch_summary(&mut self) {
+        self.status_kind = StatusKind::BranchSummary;
+    }
+
+    pub fn set_working(&mut self) {
+        self.status_kind = StatusKind::Working;
+    }
+
+    pub fn clear_status_kind(&mut self) {
+        self.status_kind = StatusKind::Idle;
+    }
+
+    /// Effective status label: structured kind wins, then any free-form `status_text`.
+    pub fn status_label(&self) -> Option<String> {
+        match self.status_kind.label() {
+            Some(label) => Some(label),
+            None => self
+                .status_text
+                .clone()
+                .or_else(|| self.is_busy.then(|| "Working...".to_string())),
         }
     }
 
@@ -550,11 +704,13 @@ impl TuiState {
         in_tok: u64,
         out_tok: u64,
         cache_tok: u64,
+        cache_write_tok: u64,
         cost: f64,
     ) {
         self.input_tokens += in_tok;
         self.output_tokens += out_tok;
         self.cache_read_tokens += cache_tok;
+        self.cache_write_tokens += cache_write_tok;
         self.cost_usd += cost;
         // All 3 providers (agy, vibe, deepseek) report total prompt tokens in `in_tok`
         // (already including `cache_tok`), so never add `cache_tok` a second time.

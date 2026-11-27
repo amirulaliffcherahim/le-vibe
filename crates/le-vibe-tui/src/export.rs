@@ -42,11 +42,8 @@ pub fn export_session_markdown(state: &TuiState) -> String {
                 out.push_str(text);
                 out.push_str("\n\n");
             }
-            TranscriptBlock::Tool {
-                name,
-                status,
-                output,
-            } => {
+            TranscriptBlock::Tool(card) => {
+                let (name, status, output) = (&card.name, &card.status, &card.output);
                 out.push_str(&format!("### Tool: `{name}` ({status})\n\n"));
                 if !output.trim().is_empty() {
                     out.push_str("```\n");
@@ -118,11 +115,8 @@ pub fn export_session_html(state: &TuiState) -> String {
                     escape_html(text)
                 ));
             }
-            TranscriptBlock::Tool {
-                name,
-                status,
-                output,
-            } => {
+            TranscriptBlock::Tool(card) => {
+                let (name, status, output) = (&card.name, &card.status, &card.output);
                 let cls = if status == "failed" { "tool err" } else { "tool" };
                 let body_html = if output.trim().is_empty() {
                     String::new()

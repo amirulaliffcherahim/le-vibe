@@ -926,8 +926,10 @@ fn decode_shell_output(bytes: &[u8]) -> String {
             >= 4
     {
         let u16s: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
             .collect();
         return String::from_utf16_lossy(&u16s).replace(['\0', '\r'], "");
     }

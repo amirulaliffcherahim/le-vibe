@@ -25,12 +25,15 @@ pub use input::{apply_wheel_scroll, handle_key_event, poll_tui_action};
 pub use mode::{ALL_MODES, ALL_SHELLS, AgentMode, append_model_profile, build_system_prompt};
 pub use probe::{ProbeFrame, key_from_spec, press, render_frame, render_frame_text};
 pub use state::{
-    ActiveModal, FrameBuffer, ProviderUsageStats, QuestionItem, QuestionOption, QuestionSession,
-    SPINNER_FRAMES, TerminalGuard, TranscriptBlock, TuiAction, TuiState, format_tokens,
-    render_status_bar,
+    ActiveModal, CompactionReason, FrameBuffer, ProviderUsageStats, QuestionItem, QuestionOption,
+    QuestionSession, SPINNER_FRAMES, StatusKind, TerminalGuard, ToolCard, TranscriptBlock,
+    TuiAction, TuiState, format_tokens, render_status_bar,
 };
 pub use theme::{ALL_THEMES, ThemeId, ThemePalette};
-pub use transcript::{draw_frame, format_duration_ms};
+pub use transcript::{
+    ToolHeader, draw_frame, format_duration_ms, format_read_line_range, format_tool_duration,
+    tool_call_header,
+};
 
 #[cfg(test)]
 mod tests {

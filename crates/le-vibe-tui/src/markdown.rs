@@ -291,7 +291,11 @@ pub fn render_markdown_lines(
                     push_full_width_line(
                         &mut out,
                         width,
-                        &format!("... ({} lines raw XML, ctrl+o to expand or /diagram)", xml_buf.len()),
+                        &format!(
+                            "... ({} lines raw XML, {} to expand or /diagram)",
+                            xml_buf.len(),
+                            crate::keyhint::key_text(crate::keyhint::KeyAction::ExpandTools)
+                        ),
                         Style::default().fg(Color::DarkGray),
                         bg,
                     );

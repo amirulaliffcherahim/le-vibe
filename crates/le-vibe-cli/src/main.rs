@@ -750,20 +750,8 @@ fn run_interactive_tui(
                     } => {
                         state.set_retry(attempt, max_attempts, delay_ms);
                     }
-                    AgentEvent::ThinkingDelta { delta } => {
-                        if let Some(TranscriptBlock::Thinking(buf)) = state.blocks.last_mut() {
-                            buf.push_str(&delta);
-                        } else {
-                            state.blocks.push(TranscriptBlock::Thinking(delta));
-                        }
-                    }
-                    AgentEvent::TextDelta { delta } => {
-                        if let Some(TranscriptBlock::Assistant(buf)) = state.blocks.last_mut() {
-                            buf.push_str(&delta);
-                        } else {
-                            state.blocks.push(TranscriptBlock::Assistant(delta));
-                        }
-                    }
+                    AgentEvent::ThinkingDelta { delta } => state.push_stream_delta(true, &delta),
+                    AgentEvent::TextDelta { delta } => state.push_stream_delta(false, &delta),
                     AgentEvent::SteeringInjected { text } => {
                         if state.steering_prompts.front().is_some_and(|s| s == &text) {
                             state.steering_prompts.pop_front();

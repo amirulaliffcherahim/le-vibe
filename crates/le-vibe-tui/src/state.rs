@@ -510,6 +510,23 @@ impl TuiState {
         self.status_kind = StatusKind::BranchSummary;
     }
 
+    /// Append a streamed delta to the current thinking / text run.
+    ///
+    /// Runs merge only while they are the newest block, so an interleaved
+    /// `thinking → text → thinking` stream keeps its arrival order instead of collapsing into one
+    /// block per kind.
+    pub fn push_stream_delta(&mut self, thinking: bool, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        match (thinking, self.blocks.last_mut()) {
+            (true, Some(TranscriptBlock::Thinking(buf))) => buf.push_str(delta),
+            (false, Some(TranscriptBlock::Assistant(buf))) => buf.push_str(delta),
+            (true, _) => self.blocks.push(TranscriptBlock::Thinking(delta.to_string())),
+            (false, _) => self.blocks.push(TranscriptBlock::Assistant(delta.to_string())),
+        }
+    }
+
     pub fn set_working(&mut self) {
         self.status_kind = StatusKind::Working;
     }

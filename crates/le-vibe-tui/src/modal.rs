@@ -250,7 +250,11 @@ pub(crate) fn draw_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             ],
         ),
         ActiveModal::ModePicker => (
-            " Select Mode (↑/↓ Enter Esc · Shift+Tab cycles · Alt+W workflows) ".to_string(),
+            format!(
+                " Select Mode (↑/↓ Enter Esc · {} cycles · {} workflows) ",
+                crate::keyhint::key_text(crate::keyhint::KeyAction::CycleMode),
+                crate::keyhint::key_text(crate::keyhint::KeyAction::OpenWorkflows)
+            ),
             ALL_MODES
                 .iter()
                 .map(|m| (m.name().to_string(), String::new(), m.description().to_string()))

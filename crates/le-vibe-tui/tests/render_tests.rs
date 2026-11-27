@@ -443,6 +443,152 @@ fn edit_card_previews_word_level_diff() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// P2 parity (OSC 133 zones / central key hints / interleaved thinking+text)
+// ---------------------------------------------------------------------------
+
+/// OSC 133 sequences are byte-exact and never reach a cell symbol (that would break width math).
+#[test]
+fn osc133_sequences_are_byte_exact_and_never_enter_cells() {
+    assert_eq!(le_vibe_tui::OSC133_ZONE_START, "\x1b]133;A\x07");
+    assert_eq!(le_vibe_tui::OSC133_ZONE_END, "\x1b]133;B\x07");
+    assert_eq!(le_vibe_tui::OSC133_ZONE_FINAL, "\x1b]133;C\x07");
+
+    // Rendering must keep the cell grid clean: no ESC bytes in any cell symbol.
+    let mut state = base_state();
+    state.blocks.push(TranscriptBlock::User("hello".into()));
+    state.blocks.push(TranscriptBlock::Assistant("answer".into()));
+    let rows = render_text(&state, 100, 30);
+    for row in &rows {
+        assert!(
+            !row.contains('\x1b') && !row.contains("]133;"),
+            "OSC 133 must never be written into the cell grid: {row:?}"
+        );
+    }
+}
+
+/// Assistant messages that contain tool calls must not open a prompt zone (pi's rule).
+#[test]
+fn assistant_with_tool_calls_skips_prompt_zone() {
+    let mut plain = base_state();
+    plain.blocks.push(TranscriptBlock::Assistant("just text".into()));
+    assert!(
+        le_vibe_tui::prompt_zone_for(&plain.blocks, 0),
+        "plain assistant reply should be a prompt zone"
+    );
+
+    let mut with_tools = base_state();
+    with_tools
+        .blocks
+        .push(TranscriptBlock::Assistant("let me look".into()));
+    with_tools
+        .blocks
+        .push(TranscriptBlock::Tool(le_vibe_tui::ToolCard::new(
+            "read",
+            r#"{"path":"a.rs"}"#,
+        )));
+    assert!(
+        !le_vibe_tui::prompt_zone_for(&with_tools.blocks, 0),
+        "assistant message followed by tool calls must not open a 133 zone"
+    );
+}
+
+/// Every hint comes from one keybinding table, so a remap only touches `keyhint.rs`.
+#[test]
+fn key_hints_come_from_the_central_table() {
+    use le_vibe_tui::{KeyAction, key_hint, key_text};
+
+    assert_eq!(key_text(KeyAction::ExpandTools), "ctrl+o");
+    assert_eq!(key_text(KeyAction::ToggleThinking), "ctrl+t");
+    assert_eq!(key_text(KeyAction::Interrupt), "Esc");
+    assert_eq!(key_text(KeyAction::QueueFollowUp), "Alt+Enter");
+    assert_eq!(key_hint(KeyAction::ExpandTools, "to expand"), "ctrl+o to expand");
+
+    // Rendered text must use the table, not a hardcoded copy.
+    let mut state = base_state();
+    let long: String = (1..=20)
+        .map(|i| format!("line{i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    state.blocks.push(TranscriptBlock::Tool(
+        le_vibe_tui::ToolCard::new("grep", r#"{"pattern":"x"}"#)
+            .with_status("done")
+            .with_output(&long),
+    ));
+    // Collapsed thinking is the only state that shows a hint string.
+    state.show_thinking = false;
+    state.blocks.push(TranscriptBlock::Thinking("one line".into()));
+    let text = render_text(&state, 120, 30).join("\n");
+    assert!(
+        text.contains(&format!(
+            "... (10 more lines, {} to expand)",
+            key_text(KeyAction::ExpandTools)
+        )),
+        "tool hint must be built from the key table:\n{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "Thought (1 line · {})",
+            key_text(KeyAction::ToggleThinking)
+        )),
+        "thinking hint must be built from the key table:\n{text}"
+    );
+}
+
+/// Interleaved thinking/text runs keep arrival order and gain no blank gaps between them.
+#[test]
+fn interleaved_thinking_and_text_keep_positions() {
+    let mut state = base_state();
+    state.show_thinking = true;
+    state.blocks.push(TranscriptBlock::User("go".into()));
+    state.blocks.push(TranscriptBlock::Thinking("think-one".into()));
+    state.blocks.push(TranscriptBlock::Assistant("answer-one".into()));
+    state.blocks.push(TranscriptBlock::Thinking("think-two".into()));
+    state.blocks.push(TranscriptBlock::Assistant("answer-two".into()));
+
+    let rows = render_text(&state, 100, 34);
+    let find = |needle: &str| {
+        rows.iter()
+            .position(|r| r.contains(needle))
+            .unwrap_or_else(|| panic!("missing {needle:?} in:\n{}", rows.join("\n")))
+    };
+    let (t1, a1, t2, a2) = (
+        find("think-one"),
+        find("answer-one"),
+        find("think-two"),
+        find("answer-two"),
+    );
+    assert!(t1 < a1 && a1 < t2 && t2 < a2, "arrival order lost");
+    assert_eq!(a1, t1 + 1, "blank gap between thinking run and its text:\n{}", rows.join("\n"));
+    assert_eq!(t2, a1 + 1, "blank gap before the next thinking run");
+    assert_eq!(a2, t2 + 1, "blank gap before the next text run");
+}
+
+/// Streaming deltas append to the current run instead of opening a block per token.
+#[test]
+fn streaming_deltas_append_to_the_current_run() {
+    let mut state = base_state();
+    state.push_stream_delta(true, "thi");
+    state.push_stream_delta(true, "nk");
+    state.push_stream_delta(false, "an");
+    state.push_stream_delta(false, "swer");
+    state.push_stream_delta(true, "again");
+
+    let kinds: Vec<String> = state
+        .blocks
+        .iter()
+        .map(|b| match b {
+            TranscriptBlock::Thinking(t) => format!("thinking:{t}"),
+            TranscriptBlock::Assistant(t) => format!("assistant:{t}"),
+            _ => "other".to_string(),
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["thinking:think", "assistant:answer", "thinking:again"]
+    );
+}
+
 /// pi's `formatToolDuration`: seconds below a minute, then `Xm Ys`, then `Xh Ym Zs`.
 #[test]
 fn tool_duration_format_matches_pi() {

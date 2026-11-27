@@ -34,7 +34,7 @@
 | `le-vibe-telemetry` | In-memory span & timing recorder |
 | `le-vibe-pybridge` | Stdio NDJSON/JSON-RPC bridge (`PythonBridge`, `ProviderPort`, `PolicyPort`, `ExtensionPort`) |
 | `le-vibe-durable` | Append-only JSONL session DAG (`SessionStore`, branching, compaction boundary, fork/clone, tree & label projection, rewind checkpoints) |
-| `le-vibe-tools` | Native coding tools (`read`, `write`, `edit`, `grep`, `find`, `ls`, `bash`, `powershell`, `todo`, `ask_user_question`) |
+| `le-vibe-tools` | Native coding tools (`truncate` owns the 2000-line/50 KB caps)  (`read`, `write`, `edit`, `grep`, `find`, `ls`, `bash`, `powershell`, `todo`, `ask_user_question`) |
 | `le-vibe-mcp` | Stdio JSON-RPC 2.0 MCP client & `McpManager` (`mcp__<server>__<tool>`) |
 | `le-vibe-agent` | Event-driven turn loop (`run_turn_loop_cancellable`), retry, context lifecycle (`overflow`, `compact`), and slash-command builders (`workflows`: Proof Loop, Goldfish reviewer, skill distillation, compaction instructions) |
 | `le-vibe-tui` | Modular `ratatui` UI (`theme`, `mode`, `commands`, `state`, `editor`, `markdown`, `transcript`, `modal`, `input`, `export`) |

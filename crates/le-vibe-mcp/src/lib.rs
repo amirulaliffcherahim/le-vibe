@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -17,7 +17,15 @@ pub enum McpError {
     Closed,
     #[error("mcp rpc error ({code}): {message}")]
     Rpc { code: i64, message: String },
+    #[error("mcp request timed out after {seconds}s")]
+    Timeout { seconds: u64 },
+    /// A successful RPC whose result carries `isError: true`.
+    #[error("mcp tool error: {0}")]
+    Tool(String),
 }
+
+/// Default per-request timeout, matching pi's `mcpServers[].timeout` default.
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct McpTool {
@@ -31,8 +39,10 @@ pub struct McpTool {
 pub struct McpClient {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    /// Lines produced by a dedicated reader thread, so a wedged server cannot block the caller.
+    responses: std::sync::mpsc::Receiver<String>,
     next_id: u64,
+    timeout: std::time::Duration,
 }
 
 fn build_platform_command(command: &str, args: &[String]) -> Command {
@@ -78,12 +88,34 @@ impl McpClient {
             .stdout(Stdio::piped())
             .spawn()?;
         let stdin = child.stdin.take().ok_or(McpError::Closed)?;
-        let stdout = BufReader::new(child.stdout.take().ok_or(McpError::Closed)?);
+        Self::from_child(child, stdin)
+    }
+
+    /// Hands stdout to a reader thread so every request can be awaited with a deadline.
+    ///
+    /// A blocking `read_line` has no timeout, so one unresponsive server would freeze the session.
+    fn from_child(mut child: Child, stdin: ChildStdin) -> Result<Self, McpError> {
+        let stdout = child.stdout.take().ok_or(McpError::Closed)?;
+        let (tx, responses) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                match line {
+                    Ok(line) => {
+                        if tx.send(line).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
         Ok(Self {
             child,
             stdin,
-            stdout,
+            responses,
             next_id: 1,
+            timeout: std::time::Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS),
         })
     }
 
@@ -97,13 +129,14 @@ impl McpClient {
         }
         let mut child = cmd.spawn()?;
         let stdin = child.stdin.take().ok_or(McpError::Closed)?;
-        let stdout = BufReader::new(child.stdout.take().ok_or(McpError::Closed)?);
-        Ok(Self {
-            child,
-            stdin,
-            stdout,
-            next_id: 1,
-        })
+        Self::from_child(child, stdin)
+    }
+
+    /// Override the per-request timeout (pi's `mcpServers[].timeout`, in seconds).
+    pub fn set_timeout_secs(&mut self, secs: u64) {
+        if secs > 0 {
+            self.timeout = std::time::Duration::from_secs(secs);
+        }
     }
 
     fn send_notification(&mut self, method: &str, params: Value) -> Result<(), McpError> {
@@ -124,23 +157,40 @@ impl McpClient {
         self.stdin.write_all(line.as_bytes())?;
         self.stdin.flush()?;
 
-        let mut resp_line = String::new();
-        let read = self.stdout.read_line(&mut resp_line)?;
-        if read == 0 {
-            return Err(McpError::Closed);
+        // Wait with a deadline; a server that never answers must not freeze the session. Lines that
+        // are not the reply we asked for (notifications, progress) are skipped, not misread.
+        let timeout_secs = self.timeout.as_secs();
+        loop {
+            let resp_line = self
+                .responses
+                .recv_timeout(self.timeout)
+                .map_err(|err| match err {
+                    std::sync::mpsc::RecvTimeoutError::Timeout => McpError::Timeout {
+                        seconds: timeout_secs,
+                    },
+                    std::sync::mpsc::RecvTimeoutError::Disconnected => McpError::Closed,
+                })?;
+            if resp_line.trim().is_empty() {
+                continue;
+            }
+            let Ok(resp) = serde_json::from_str::<Value>(&resp_line) else {
+                continue;
+            };
+            if resp.get("id").and_then(Value::as_u64) != Some(id) {
+                continue;
+            }
+            if let Some(err) = resp.get("error") {
+                return Err(McpError::Rpc {
+                    code: err.get("code").and_then(Value::as_i64).unwrap_or(-1),
+                    message: err
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown error")
+                        .to_string(),
+                });
+            }
+            return Ok(resp.get("result").cloned().unwrap_or(Value::Null));
         }
-        let resp: Value = serde_json::from_str(&resp_line)?;
-        if let Some(err) = resp.get("error") {
-            return Err(McpError::Rpc {
-                code: err.get("code").and_then(Value::as_i64).unwrap_or(-1),
-                message: err
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown error")
-                    .to_string(),
-            });
-        }
-        Ok(resp.get("result").cloned().unwrap_or(Value::Null))
     }
 
     pub fn initialize(&mut self) -> Result<Value, McpError> {
@@ -184,6 +234,9 @@ pub struct McpServerConfig {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Per-request timeout in seconds (pi's `mcpServers[].timeout`, default 60).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -227,7 +280,11 @@ impl McpManager {
         let mut manager = Self::default();
         for (name, cfg) in configs {
             match McpClient::spawn_with_env(&cfg) {
-                Ok(mut client) => match client.initialize().and_then(|_| client.list_tools()) {
+                Ok(mut client) => {
+                    if let Some(secs) = cfg.timeout {
+                        client.set_timeout_secs(secs);
+                    }
+                    match client.initialize().and_then(|_| client.list_tools()) {
                     Ok(tools) => {
                         manager.statuses.insert(
                             name.clone(),
@@ -235,10 +292,11 @@ impl McpManager {
                         );
                         manager.servers.insert(name, ConnectedServer { client, tools });
                     }
-                    Err(err) => {
-                        manager.statuses.insert(name, format!("error: {err}"));
+                        Err(err) => {
+                            manager.statuses.insert(name, format!("error: {err}"));
+                        }
                     }
-                },
+                }
                 Err(err) => {
                     manager.statuses.insert(name, format!("spawn error: {err}"));
                 }
@@ -281,16 +339,25 @@ impl McpManager {
             message: format!("mcp server not connected: {server_name}"),
         })?;
         let res = server.client.call_tool(tool_name, args)?;
-        if let Some(items) = res.get("content").and_then(Value::as_array) {
-            let texts: Vec<&str> = items
-                .iter()
-                .filter_map(|item| item.get("text").and_then(Value::as_str))
-                .collect();
-            if !texts.is_empty() {
-                return Ok(texts.join("\n"));
+        let text = match res.get("content").and_then(Value::as_array) {
+            Some(items) => {
+                let texts: Vec<&str> = items
+                    .iter()
+                    .filter_map(|item| item.get("text").and_then(Value::as_str))
+                    .collect();
+                if texts.is_empty() {
+                    serde_json::to_string_pretty(&res).unwrap_or_else(|_| res.to_string())
+                } else {
+                    texts.join("\n")
+                }
             }
+            None => serde_json::to_string_pretty(&res).unwrap_or_else(|_| res.to_string()),
+        };
+        // MCP reports tool-level failure in-band, so without this a broken server looks like success.
+        if res.get("isError").and_then(Value::as_bool) == Some(true) {
+            return Err(McpError::Tool(text));
         }
-        Ok(serde_json::to_string_pretty(&res).unwrap_or_else(|_| res.to_string()))
+        Ok(text)
     }
 
     pub fn status_summary(&self) -> Vec<(String, String)> {

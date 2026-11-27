@@ -161,6 +161,8 @@ impl McpClient {
         // are not the reply we asked for (notifications, progress) are skipped, not misread.
         let timeout_secs = self.timeout.as_secs();
         loop {
+            // Each received line (including a progress notification) restarts the deadline, which is
+            // pi's rule: progress proves the server is working, so a slow job is not a timeout.
             let resp_line = self
                 .responses
                 .recv_timeout(self.timeout)
@@ -237,6 +239,12 @@ pub struct McpServerConfig {
     /// Per-request timeout in seconds (pi's `mcpServers[].timeout`, default 60).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
+    /// Whether to connect at all (pi's `mcpServers[].enabled`, default true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Human-readable description shown in status listings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -279,6 +287,12 @@ impl McpManager {
     fn from_servers(configs: BTreeMap<String, McpServerConfig>) -> Self {
         let mut manager = Self::default();
         for (name, cfg) in configs {
+            if cfg.enabled == Some(false) {
+                manager
+                    .statuses
+                    .insert(name, "disabled (enabled: false)".to_string());
+                continue;
+            }
             match McpClient::spawn_with_env(&cfg) {
                 Ok(mut client) => {
                     if let Some(secs) = cfg.timeout {

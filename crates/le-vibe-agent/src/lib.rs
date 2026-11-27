@@ -21,7 +21,7 @@ use le_vibe_tools::codemode::run_codemode_script;
 use le_vibe_tools::hooks::HookRegistry;
 use le_vibe_tools::{
     TodoStore, ToolError, builtin_tool_definitions, execute_builtin_tool,
-    execute_builtin_tool_approved, execute_todo_tool,
+    execute_builtin_tool_approved_cancellable, execute_todo_tool,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -1181,7 +1181,7 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                             }
                             let started = Instant::now();
                             let (out, is_error) =
-                                match execute_builtin_tool_approved(&tc.name, &tc.arguments) {
+                                match execute_builtin_tool_approved_cancellable(&tc.name, &tc.arguments, cancel) {
                                     Ok(out) => (out, false),
                                     Err(err) => (format!("Tool error: {err}"), true),
                                 };
@@ -1614,7 +1614,7 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                         });
                         match choice {
                             ApprovalChoice::AllowOnce => {
-                                match execute_builtin_tool_approved(&tc.name, &tc.arguments) {
+                                match execute_builtin_tool_approved_cancellable(&tc.name, &tc.arguments, cancel) {
                                     Ok(out) => (out, false),
                                     Err(err) => (format!("Tool error: {err}"), true),
                                 }
@@ -1625,14 +1625,14 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                                     cmd.as_deref(),
                                     path.as_deref(),
                                 );
-                                match execute_builtin_tool_approved(&tc.name, &tc.arguments) {
+                                match execute_builtin_tool_approved_cancellable(&tc.name, &tc.arguments, cancel) {
                                     Ok(out) => (out, false),
                                     Err(err) => (format!("Tool error: {err}"), true),
                                 }
                             }
                             ApprovalChoice::AllowYolo => {
                                 let _ = bridge.set_yolo(true);
-                                match execute_builtin_tool_approved(&tc.name, &tc.arguments) {
+                                match execute_builtin_tool_approved_cancellable(&tc.name, &tc.arguments, cancel) {
                                     Ok(out) => (out, false),
                                     Err(err) => (format!("Tool error: {err}"), true),
                                 }

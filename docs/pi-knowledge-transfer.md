@@ -81,7 +81,7 @@ All context-lifecycle logic lives in `le-vibe-agent`; `main.rs`/`worker.rs` only
 | Fork | `/fork` and `/clone` both route to `fork_from`, writing a new session file and leaving the original alone. |
 | Legacy files | The three new fields are `Option` with `serde(default)`; pre-P0 JSONL loads unchanged and normal entries serialise without them. |
 
-## 8. Tools & MCP Parity (P0, complete)
+## 8. Tools & MCP Parity (P0–P1, complete)
 
 | Item | Rule |
 | --- | --- |
@@ -91,6 +91,12 @@ All context-lifecycle logic lives in `le-vibe-agent`; `main.rs`/`worker.rs` only
 | Shell timeout | Kills the whole **process tree** (`taskkill /T /F`, `kill -TERM -pid`), not just the shell. |
 | MCP timeout | Every request has a deadline — 60 s default, `mcpServers[].timeout` in seconds. A dedicated reader thread feeds a channel so a wedged server returns `mcp request timed out after Ns` instead of freezing the session. |
 | MCP tool errors | `result.isError: true` surfaces as `mcp tool error: …` rather than looking like normal output. |
+| Shell cancel | `Esc` sets the turn's `AtomicBool`, which `run_shell` polls every 50 ms: it kills the process tree and returns `Command aborted`. |
+| Edit input | `edits` is accepted as an array, a JSON **string**, a single object, or the legacy `oldText`/`newText` pair — and a mix of legacy + array merges. Real errors (missing / non-unique `oldText`) still fail. |
+| Mutation queue | `write` and `edit` share a per-canonical-path mutex, so two mutations to one file cannot interleave; different files stay parallel. |
+| Shell wall time | `wall_time_seconds=N` rides on its own trailing line (pi uses `structuredContent`); `exit_code=N` stays a standalone first line so `VerificationGate` keeps parsing it. |
+| MCP config | `enabled` (default true, disabled servers report `disabled (enabled: false)` and are never spawned) and `description` are honoured. |
+| MCP progress | Any notification received restarts the request deadline — a slow job that reports progress is not a timeout (pi: “Progress notifications reset it”). |
 
 ### Intentional deviations
 - **OSC 133 is dormant.** Pi renders inline, so its prompt zones sit in scrollback. `le-vibe` draws an

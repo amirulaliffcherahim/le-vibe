@@ -1,4 +1,5 @@
 pub mod codemode;
+pub mod truncate;
 pub mod hooks;
 pub mod memory;
 
@@ -28,6 +29,10 @@ pub enum ToolError {
     Io(#[from] std::io::Error),
     #[error("edit error: {0}")]
     Edit(String),
+    /// A tool-level failure whose text is meant for the model verbatim (e.g. `exit_code=3`, or an
+    /// out-of-range read offset). Rendered as an error card, not a normal result.
+    #[error("{0}")]
+    Tool(String),
     #[error("unknown tool: {0}")]
     UnknownTool(String),
 }
@@ -615,29 +620,67 @@ fn run_read(args: &Value) -> Result<String, ToolError> {
     let raw = fs::read_to_string(path)?;
     let all_lines: Vec<&str> = raw.lines().collect();
     let total = all_lines.len();
-    let offset = args
+    let start_line = args
         .get("offset")
         .and_then(Value::as_u64)
         .map(|v| v.saturating_sub(1) as usize)
         .unwrap_or(0);
+    // pi errors instead of returning an empty string, so the model learns the file is shorter than
+    // it assumed. An empty file with no offset is not an error.
+    if start_line >= total && start_line > 0 {
+        return Err(ToolError::Tool(format!(
+            "Offset {} is beyond end of file ({} lines total)",
+            start_line + 1,
+            total
+        )));
+    }
     let limit = args
         .get("limit")
         .and_then(Value::as_u64)
         .map(|v| v as usize)
-        .unwrap_or(MAX_LINES);
-    let numbered: Vec<String> = all_lines
-        .into_iter()
+        .unwrap_or(truncate::DEFAULT_MAX_LINES);
+
+    let selected: Vec<String> = all_lines
+        .iter()
         .enumerate()
-        .skip(offset)
+        .skip(start_line)
         .take(limit)
         .map(|(idx, line)| format!("{}: {line}", idx + 1))
         .collect();
-    let shown = numbered.len();
-    let mut out = truncate_output(&numbered.join("\n"));
-    if offset > 0 || offset + shown < total {
-        let start_line = if shown == 0 { 0 } else { offset + 1 };
-        let end_line = offset + shown;
-        out.push_str(&format!("\n[showing lines {start_line}..{end_line} of {total}]"));
+    let joined = selected.join("
+");
+    let cut = truncate::truncate_head(&joined, limit, truncate::DEFAULT_MAX_BYTES);
+
+    if cut.first_line_exceeds_limit {
+        let first_bytes = selected.first().map(String::len).unwrap_or(0);
+        return Ok(format!(
+            "[Line {line} is {size}, exceeds {limit} limit. Use bash: sed -n '{line}p' {path} | head -c {max}]",
+            line = start_line + 1,
+            size = truncate::format_size(first_bytes),
+            limit = truncate::format_size(truncate::DEFAULT_MAX_BYTES),
+            max = truncate::DEFAULT_MAX_BYTES,
+        ));
+    }
+
+    let shown = cut.output_lines;
+    let mut out = cut.content;
+    if start_line + shown < total {
+        let first = start_line + 1;
+        let last = start_line + shown;
+        let limit_note = if cut.truncated_by == Some(truncate::TruncatedBy::Bytes) {
+            format!(
+                " ({} limit)",
+                truncate::format_size(truncate::DEFAULT_MAX_BYTES)
+            )
+        } else {
+            String::new()
+        };
+        out.push_str(&format!(
+            "
+
+[Showing lines {first}-{last} of {total}{limit_note}. Use offset={} to continue.]",
+            last + 1
+        ));
     }
     Ok(out)
 }
@@ -936,6 +979,76 @@ fn decode_shell_output(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).replace(['\0', '\r'], "")
 }
 
+/// Kill a process **and its descendants**.
+///
+/// `Child::kill` only signals the shell itself; on Windows the grandchildren keep the pipes open and
+/// keep running, which is what pi fixed in #11613. Windows has no process groups here, so `taskkill
+/// /T /F` is the reliable tree kill; Unix gets the process group via `kill -TERM -pid`.
+fn kill_process_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .args(["-TERM", &format!("-{pid}")])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = pid;
+    }
+}
+
+/// Replace the trailing truncation marker with an actionable tail notice naming the spill file.
+fn tail_notice(output: &str, stdout_buf: &str, stderr_buf: &str) -> String {
+    let full = if stderr_buf.is_empty() {
+        stdout_buf.to_string()
+    } else if stdout_buf.is_empty() {
+        stderr_buf.to_string()
+    } else {
+        format!("{stdout_buf}
+{stderr_buf}")
+    };
+    let cut = truncate::truncate_tail(&full, truncate::DEFAULT_MAX_LINES, truncate::DEFAULT_MAX_BYTES);
+    if !cut.truncated {
+        return output.to_string();
+    }
+    let spill = truncate::spill_full_output(&full);
+    let first = cut.total_lines.saturating_sub(cut.output_lines) + 1;
+    let last = cut.total_lines;
+    let where_to = spill
+        .map(|p| format!(" Full output: {}", p.display()))
+        .unwrap_or_default();
+    let reason = if cut.last_line_partial {
+        format!(
+            "[Showing last {} of line {last}.{where_to}]",
+            truncate::format_size(cut.content.len())
+        )
+    } else if cut.truncated_by == Some(truncate::TruncatedBy::Bytes) {
+        format!(
+            "[Showing lines {first}-{last} of {} ({} limit).{where_to}]",
+            cut.total_lines,
+            truncate::format_size(truncate::DEFAULT_MAX_BYTES)
+        )
+    } else {
+        format!("[Showing lines {first}-{last} of {}.{where_to}]", cut.total_lines)
+    };
+    let mut body = cut.content;
+    body.push_str("
+
+");
+    body.push_str(&reason);
+    body
+}
+
 fn run_shell(shell: &str, args: &Value) -> Result<String, ToolError> {
     let cmd = args.get("command").and_then(Value::as_str).expect("validated");
     let timeout_secs = args
@@ -968,9 +1081,11 @@ fn run_shell(shell: &str, args: &Value) -> Result<String, ToolError> {
             break st;
         }
         if Instant::now() >= deadline {
+            // Kill the whole tree: the shell alone leaves background children writing to our pipes.
+            kill_process_tree(child.id());
             let _ = child.kill();
             let _ = child.wait();
-            return Err(ToolError::Edit(format!(
+            return Err(ToolError::Tool(format!(
                 "command timed out after {timeout_secs}s"
             )));
         }
@@ -1004,23 +1119,35 @@ fn run_shell(shell: &str, args: &Value) -> Result<String, ToolError> {
         None
     };
     let combined = if stderr_buf.is_empty() {
-        stdout_buf
+        stdout_buf.clone()
     } else if stdout_buf.is_empty() {
-        stderr_buf
+        stderr_buf.clone()
     } else {
         format!("{stdout_buf}\n{stderr_buf}")
     };
     if code != 0 {
+        // pi reports a non-zero exit as a tool **error** so the UI renders an error card instead of a
+        // normal result. The body still starts with the verbatim `exit_code=N` line: VerificationGate
+        // parses it (and only accepts `exit_code=0` as proof), and tooling relies on that shape.
         let header = match first_err {
             Some(line) => format!("exit_code={code} | stderr: {line}"),
             None => format!("exit_code={code}"),
         };
-        if combined.is_empty() {
-            return Ok(header);
-        }
-        return Ok(truncate_output(&format!("{header}\n{combined}")));
+        let body = if combined.is_empty() {
+            header
+        } else {
+            format!("{header}\n{combined}")
+        };
+        let body = tail_notice(&body, &stdout_buf, &stderr_buf);
+        return Err(ToolError::Tool(format!(
+            "{body}\n\nCommand exited with code {code}"
+        )));
     }
-    Ok(truncate_output(&format!("exit_code={code}\n{combined}")))
+    Ok(tail_notice(
+        &format!("exit_code={code}\n{combined}"),
+        &stdout_buf,
+        &stderr_buf,
+    ))
 }
 
 pub fn execute_builtin_tool(
@@ -1161,7 +1288,8 @@ mod tests {
             &json!({"path": file.to_string_lossy(), "offset": 2, "limit": 2}),
         )
         .unwrap();
-        assert_eq!(read_slice, "2: line2\n3: LINE_THREE\n[showing lines 2..3 of 3]");
+        // offset 2 / limit 2 on a 3-line file covers the rest of the file, so no continuation notice.
+        assert_eq!(read_slice, "2: line2\n3: LINE_THREE");
 
         let grep_hits = execute_builtin_tool(
             &mut policy,
@@ -1268,7 +1396,10 @@ mod tests {
         )
         .unwrap();
         assert!(read_out.contains("2: fn beta() {}"));
-        assert!(read_out.contains("[showing lines 2..2 of 3]"));
+        assert!(
+            read_out.contains("[Showing lines 2-2 of 3. Use offset=3 to continue.]"),
+            "{read_out}"
+        );
 
         let grep_out = execute_builtin_tool(
             &mut allow,
@@ -1298,15 +1429,17 @@ mod tests {
             "powershell",
             &json!({"command": "Start-Sleep -Seconds 5", "timeout_secs": 1}),
         );
-        assert!(matches!(timeout_res, Err(ToolError::Edit(msg)) if msg.contains("timed out")));
+        assert!(matches!(timeout_res, Err(ToolError::Tool(msg)) if msg.contains("timed out")));
 
-        let fail_out = execute_builtin_tool(
+        let fail_err = execute_builtin_tool(
             &mut allow,
             "powershell",
             &json!({"command": "[Console]::Error.WriteLine('boom-line-1'); exit 3"}),
         )
-        .unwrap();
-        assert!(fail_out.starts_with("exit_code=3 | stderr: boom-line-1"));
+        .expect_err("non-zero exit must be a tool error");
+        let fail_msg = fail_err.to_string();
+        assert!(fail_msg.starts_with("exit_code=3 | stderr: boom-line-1"), "{fail_msg}");
+        assert!(fail_msg.contains("Command exited with code 3"), "{fail_msg}");
 
         let _ = fs::remove_dir_all(&dir);
     }

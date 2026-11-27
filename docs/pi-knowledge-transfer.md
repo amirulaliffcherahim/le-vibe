@@ -81,6 +81,17 @@ All context-lifecycle logic lives in `le-vibe-agent`; `main.rs`/`worker.rs` only
 | Fork | `/fork` and `/clone` both route to `fork_from`, writing a new session file and leaving the original alone. |
 | Legacy files | The three new fields are `Option` with `serde(default)`; pre-P0 JSONL loads unchanged and normal entries serialise without them. |
 
+## 8. Tools & MCP Parity (P0, complete)
+
+| Item | Rule |
+| --- | --- |
+| Truncation | `le-vibe-tools::truncate` — 2000 lines / 50 KB, first limit hit wins, `TruncationResult { truncated_by, total_lines, output_lines, first_line_exceeds_limit, last_line_partial }`. `read` truncates the head (never a partial line); shells truncate the tail (may clip the final line) and spill the full output to a temp file named in the notice. |
+| `read` | Offset past EOF is an **error**, not an empty result. Truncation emits `[Showing lines A-B of T. Use offset=N to continue.]`; a single over-limit line points at `sed -n 'Np' <path>`. |
+| Shell exit codes | A non-zero exit is a **tool error** whose body still starts with the verbatim `exit_code=N` line, so the UI renders an error card while `VerificationGate` keeps parsing `exit_code=0` as the only success signal. |
+| Shell timeout | Kills the whole **process tree** (`taskkill /T /F`, `kill -TERM -pid`), not just the shell. |
+| MCP timeout | Every request has a deadline — 60 s default, `mcpServers[].timeout` in seconds. A dedicated reader thread feeds a channel so a wedged server returns `mcp request timed out after Ns` instead of freezing the session. |
+| MCP tool errors | `result.isError: true` surfaces as `mcp tool error: …` rather than looking like normal output. |
+
 ### Intentional deviations
 - **OSC 133 is dormant.** Pi renders inline, so its prompt zones sit in scrollback. `le-vibe` draws an
 alternate buffer, which has no scrollback, so the marks would be invisible. Writing escape bytes into

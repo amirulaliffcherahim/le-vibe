@@ -446,7 +446,9 @@ fn main() {
                         system_prompt: Some(sys),
                         thinking_level: opts.thinking.unwrap_or_else(|| "medium".to_string()),
                         max_turns: 40,
-                        max_retries: 2,
+                        max_retries: le_vibe_agent::DEFAULT_MAX_RETRIES,
+                        base_delay_ms: le_vibe_agent::DEFAULT_BASE_DELAY_MS,
+                        max_delay_ms: le_vibe_agent::DEFAULT_MAX_DELAY_MS,
                         allowed_tools,
                         mode_name: Some(agent_mode.name().to_string()),
                         codemode: load_layered_settings()

@@ -20,7 +20,7 @@ use serde_json::Value;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -42,8 +42,26 @@ pub enum AgentEvent {
     Status { text: String },
     ThinkingDelta { delta: String },
     TextDelta { delta: String },
-    ToolCallStart { id: String, name: String, #[serde(skip_serializing_if = "String::is_empty")] summary: String },
-    ToolCallEnd { id: String, name: String, is_error: bool, output: String },
+    ToolCallStart {
+        id: String,
+        name: String,
+        #[serde(skip_serializing_if = "String::is_empty")]
+        args_json: String,
+    },
+    ToolCallEnd {
+        id: String,
+        name: String,
+        is_error: bool,
+        output: String,
+        #[serde(default)]
+        duration_ms: u64,
+    },
+    /// Provider retry with a known delay; the UI renders the live countdown.
+    Retry {
+        attempt: usize,
+        max_attempts: usize,
+        delay_ms: u64,
+    },
     SteeringInjected { text: String },
     TurnUsage { input_tokens: u64, cache_read_tokens: u64 },
     TurnEnd { stop_reason: String },
@@ -63,53 +81,6 @@ pub enum ApprovalChoice {
     AllowSession,
     AllowYolo,
     Deny,
-}
-
-/// Concise 1-line human target summary for tool card headers (e.g. `Cargo.toml`, `$ git status`).
-fn summarize_tool_args(name: &str, args: &Value) -> String {
-    let pick = |keys: &[&str]| -> Option<String> {
-        for k in keys {
-            if let Some(s) = args.get(*k).and_then(Value::as_str) {
-                let line = s.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
-                if !line.is_empty() {
-                    return Some(line.chars().take(64).collect());
-                }
-            }
-        }
-        None
-    };
-    match name {
-        "read" | "edit" | "write" | "ls" => pick(&["path", "file", "file_path"]).unwrap_or_default(),
-        "grep" | "find" => pick(&["pattern", "query", "path"]).unwrap_or_default(),
-        "bash" | "powershell" => pick(&["command", "cmd"]).map(|c| format!("$ {c}")).unwrap_or_default(),
-        "web_search" => pick(&["query"]).unwrap_or_else(|| {
-            args.get("queries")
-                .and_then(Value::as_array)
-                .and_then(|a| a.first())
-                .and_then(Value::as_str)
-                .map(|s| s.chars().take(64).collect())
-                .unwrap_or_default()
-        }),
-        "fetch_content" => pick(&["url"]).unwrap_or_default(),
-        "codemode" => {
-            if let Some(code) = args.get("code").and_then(Value::as_str) {
-                let calls: Vec<&str> = code
-                    .split("tools.")
-                    .skip(1)
-                    .filter_map(|s| s.split('(').next())
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty() && s.len() <= 24)
-                    .take(3)
-                    .collect();
-                if !calls.is_empty() {
-                    return calls.join(" + ");
-                }
-            }
-            String::new()
-        }
-        "todo" => pick(&["action", "subject"]).unwrap_or_default(),
-        _ => pick(&["path", "query", "url", "command", "action"]).unwrap_or_default(),
-    }
 }
 
 pub struct AgentConfig {
@@ -680,11 +651,10 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                         2 => 2,
                         _ => 4,
                     };
-                    on_event(AgentEvent::Status {
-                        text: format!(
-                            "Empty response from model — retrying ({attempt}/{}) in {delay_secs}s...",
-                            config.max_retries
-                        ),
+                    on_event(AgentEvent::Retry {
+                        attempt,
+                        max_attempts: config.max_retries,
+                        delay_ms: delay_secs * 1000,
                     });
                     for _ in 0..(delay_secs * 20) {
                         if is_cancelled(cancel) {
@@ -730,12 +700,10 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                         _ => 6,
                     };
                     let delay_secs = parse_retry_after_secs(&err.to_string()).unwrap_or(default_delay);
-                    let short_err: String = err.to_string().chars().take(60).collect();
-                    on_event(AgentEvent::Status {
-                        text: format!(
-                            "Transient error ({short_err}) — retrying ({attempt}/{}) in {delay_secs}s...",
-                            config.max_retries
-                        ),
+                    on_event(AgentEvent::Retry {
+                        attempt,
+                        max_attempts: config.max_retries,
+                        delay_ms: delay_secs * 1000,
                     });
                     for _ in 0..(delay_secs * 20) {
                         if is_cancelled(cancel) {
@@ -820,6 +788,7 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                     name: tc.name.clone(),
                     is_error: true,
                     output: err_msg.clone(),
+                    duration_ms: 0,
                 });
                 messages.push(ChatMessage {
                     role: "tool".to_string(),
@@ -859,7 +828,7 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                 on_event(AgentEvent::ToolCallStart {
                     id: tc.id.clone(),
                     name: tc.name.clone(),
-                    summary: summarize_tool_args(&tc.name, &tc.arguments),
+                    args_json: tc.arguments.to_string(),
                 });
                 let args_json_str = tc.arguments.to_string();
                 let hook_res = bridge
@@ -915,31 +884,36 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                 prepared.push((tc, args_json_str, blocked));
             }
 
-            let results: Vec<(String, bool)> = std::thread::scope(|s| {
+            let results: Vec<(String, bool, u64)> = std::thread::scope(|s| {
                 let handles: Vec<_> = prepared
                     .iter()
                     .map(|(tc, _args_str, blocked)| {
                         s.spawn(move || {
                             if let Some(reason) = blocked {
-                                return (reason.clone(), true);
+                                return (reason.clone(), true, 0);
                             }
-                            match execute_builtin_tool_approved(&tc.name, &tc.arguments) {
-                                Ok(out) => (out, false),
-                                Err(err) => (format!("Tool error: {err}"), true),
-                            }
+                            let started = Instant::now();
+                            let (out, is_error) =
+                                match execute_builtin_tool_approved(&tc.name, &tc.arguments) {
+                                    Ok(out) => (out, false),
+                                    Err(err) => (format!("Tool error: {err}"), true),
+                                };
+                            (out, is_error, started.elapsed().as_millis() as u64)
                         })
                     })
                     .collect();
                 handles
                     .into_iter()
                     .map(|h| {
-                        h.join()
-                            .unwrap_or_else(|_| ("Tool error: worker panicked".to_string(), true))
+                        h.join().unwrap_or_else(|_| {
+                            ("Tool error: worker panicked".to_string(), true, 0)
+                        })
                     })
                     .collect()
             });
 
-            for ((tc, args_json_str, _), (mut output, is_error)) in prepared.into_iter().zip(results)
+            for ((tc, args_json_str, _), (mut output, is_error, duration_ms)) in
+                prepared.into_iter().zip(results)
             {
                 if !is_error
                     && let Some(post_note) = hooks.run_post_tool(&tc.name, &args_json_str)
@@ -969,6 +943,7 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                     name: tc.name.clone(),
                     is_error,
                     output,
+                    duration_ms,
                 });
                 messages.push(ChatMessage {
                     role: "tool".to_string(),
@@ -993,7 +968,7 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
             on_event(AgentEvent::ToolCallStart {
                 id: tc.id.clone(),
                 name: tc.name.clone(),
-                summary: summarize_tool_args(&tc.name, &tc.arguments),
+                args_json: tc.arguments.to_string(),
             });
             let args_json_str = tc.arguments.to_string();
             let hook_res = bridge
@@ -1016,6 +991,7 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
             let mut codemode_used_read = false;
             let mut codemode_used_exec = false;
             let mut codemode_used_retrieve = false;
+            let tool_started = Instant::now();
             let (mut output, is_error) = if let Some(reason) = blocked_reason {
                 (reason, true)
             } else if tc.name == "codemode" {
@@ -1424,6 +1400,7 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                 name: tc.name.clone(),
                 is_error,
                 output: output.clone(),
+                duration_ms: tool_started.elapsed().as_millis() as u64,
             });
             messages.push(ChatMessage {
                 role: "tool".to_string(),
@@ -1970,16 +1947,16 @@ mod tests {
         let mut session = SessionStore::in_memory();
         let telemetry = TelemetryRecorder::new();
         let cfg = AgentConfig::default();
-        let mut statuses = Vec::new();
+        let mut retries = Vec::new();
         let msg = run_turn_loop_streaming(&mut bridge, &mut session, &telemetry, &cfg, "hi", |ev| {
-            if let AgentEvent::Status { text } = ev {
-                statuses.push(text);
+            if let AgentEvent::Retry { attempt, .. } = ev {
+                retries.push(attempt);
             }
         })
         .unwrap();
         assert_eq!(msg.content, "Recovered!");
         assert_eq!(bridge.attempts, 2);
-        assert_eq!(statuses.len(), 1);
+        assert_eq!(retries, vec![1]);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 use std::io::{self, Read, Write};
 
 use le_vibe_tui::{
-    ActiveModal, AgentMode, QuestionItem, QuestionOption, QuestionSession, ThemeId,
+    ActiveModal, AgentMode, QuestionItem, QuestionOption, QuestionSession, ThemeId, ToolCard,
     TranscriptBlock, TuiAction, TuiState, apply_wheel_scroll, press, render_frame,
 };
 
@@ -555,11 +555,15 @@ fn seed_demo(state: &mut TuiState) {    state.blocks.push(TranscriptBlock::User(
     state.blocks.push(TranscriptBlock::Thinking(
         "Wrapping splits spans; a bullet prefix must only apply to the first row.".to_string(),
     ));
-    state.blocks.push(TranscriptBlock::Tool {
-        name: "read".to_string(),
-        status: "done".to_string(),
-        output: "crates/le-vibe-tui/src/transcript.rs:1-120".to_string(),
-    });
+    state.blocks.push(TranscriptBlock::Tool(
+        ToolCard::new(
+            "read",
+            r#"{"path":"crates/le-vibe-tui/src/transcript.rs","offset":1,"limit":120}"#,
+        )
+        .with_status("done")
+        .with_output("crates/le-vibe-tui/src/transcript.rs:1-120")
+        .with_duration(420),
+    ));
     state.blocks.push(TranscriptBlock::Assistant(
         "## Wrap changes\n\n- `wrap_lines_exact` measures each span with `UnicodeWidthStr`\n- cross-span tokens keep `(` attached to styled code such as `foo(bar)`\n\n```rust\nfn main() {\n    println!(\"hello\");\n}\n```\n\n1. first numbered item that is long enough to wrap across two rows in a narrow frame\n2. second item\n"
             .to_string(),

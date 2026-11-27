@@ -55,11 +55,7 @@ __pycache__/
 *.pyc
 *.egg-info/
 
-# reference/ — archived crusty port, read-only reference, never built here
-reference/pi-src/
-reference/.ref/
-reference/target/
-reference/legacy/
-reference/rust/
-reference/rusted-pi-git-archive/
-reference/*.xlsx
+# reference/ — read-only Pi oracle and archived crusty port; lives locally, never committed here
+reference/
+# ...except the note explaining what belongs there
+!reference/README.md

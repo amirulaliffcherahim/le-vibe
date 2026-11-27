@@ -14,15 +14,34 @@ Cycle with `Shift+Tab` or switch with `/mode <name>`:
 
 ## Sectioned System Prompt (`build_system_prompt`)
 
-`build_system_prompt` assembles XML-delimited sections:
-1. Mode first-line persona (`AgentMode::system_prompt`)
-2. `<environment>` (`os`, `active_shell`, `cwd`, active mode)
-3. `<modes>` (mode summary + `crates/le-vibe-tui/src/mode.rs` reference)
-4. `<rules>` (shell compatibility, parallel read-only tool batching, verification)
-5. `<self_repo>` (`le-vibe` repository layout & test commands)
-6. `<skills>` (discovered `SKILL.md` entries from `.le-vibe/skills` and `.pi/skills`)
-7. `<user_instructions>` (optional `~/.le-vibe/SYSTEM.md`, capped at 4KB)
-8. `<project_instructions>` (optional `<cwd>/AGENTS.md`, capped at 4KB)
+The prompt is a **short operating manual**, ordered so the cacheable prefix comes first and the
+most volatile block comes last. Rules sit at the top (`<operating_contract>`) and are restated at
+the bottom (`<non_negotiables>`) because attention decays across a long turn.
+
+| # | Section | Stability | Contents |
+|---|---|---|---|
+| 1 | `<operating_contract>` | static | Locate → act → minimal edit → prove → evidence. Positive phrasing only. |
+| 2 | `<tools>` | static | Only what a schema cannot say: shell must match `active_shell`, `retrieve_output` for compressed output, memory durability rule, web scope, output style. |
+| 3 | `<environment>` | per session | `os`, `active_shell`, `cwd`. |
+| 4 | `<mode>` | per mode | Method line (`AgentMode::system_prompt`) + pipeline steps (`mode_steps`) for plan/rea/cyber. Placed here so a mode switch only invalidates this block onward. |
+| 5 | `<self_repo>` | conditional | Self-debugging guidance, loaded **only when `cwd` is inside the le-vibe checkout**. |
+| 6 | `<user_instructions>` / `<append_system>` | per user | `~/.le-vibe/SYSTEM.md`, `APPEND_SYSTEM.md` (project file wins), capped 4KB. |
+| 7 | `<project_instructions>` | per repo | `AGENTS.override.md` → `AGENTS.md` → `CLAUDE.md`, root-to-cwd, capped 4KB. |
+| 8 | `<skills>` | per repo | Names only; bodies load through `load_skill`. |
+| 9 | `<memory_toc>` | most volatile | RAG index summary, capped 1.4KB. |
+| 10 | `<non_negotiables>` | static | Verify then report, minimal diff, ask once when blocked, never fabricate. |
+
+**Budget:** the static core (sections 1–4) is ~230 words (~1.6KB). A test enforces ≤ 420 words
+(`crates/le-vibe-tui/tests/prompt_contract.rs`), and `tests/prompt_size_probe.rs` prints the current
+sizes: `cargo test -p le-vibe-tui --test prompt_size_probe -- --nocapture`.
+
+**Measured effect** of the 2026-11 restructure: total prompt 8,738 → 4,935 chars (−43%), first-turn
+prompt tokens 6,532 → 5,420 (−17%; the remainder is unchanged tool schemas), and the
+`short_bugfix` benchmark passed 3/3 on both prompts with unchanged wall time and −20% session
+tokens.
+
+Most of the remaining first-turn budget is **tool schemas**, not prose: with 20 tools registered
+they dominate the count. Trimming the tool surface (`codemode` only) is the next lever.
 
 ## Mid-Session Mode Switching (`crates/le-vibe-agent/src/lib.rs`)
 

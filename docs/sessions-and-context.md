@@ -18,25 +18,34 @@ Each line is a `SessionEntry` with `id`, `parent_id`, `kind`, `role`, `content`,
 
 - **Tool-result cap**: `cap_tool_output` caps any single tool output pushed into the LLM message array at 24KB (16KB head + 6KB tail).
 - **`/compact [instructions]`**: calls the active model to summarize the active branch into a `compaction_summary` entry.
-- **Auto-compaction**: triggers automatically before a turn when `context_tokens >= 85%` of `context_window` (the percentage lives in the CLI; see below).
+- **Auto-compaction**: run by `le-vibe-agent` **before** a request when the last prompt used more
+  than `context_window - reserve_tokens` (default reserve `16_384`). There is no percentage knob: the
+  `auto_compact` setting just passes `context_window: 0` to disable it.
 - **`/context`**: displays estimated token breakdown (system + `AGENTS.md` + `<skills>`, active branch messages, and utilization %).
 
-### Context Lifecycle Policies (`le-vibe-agent`, P0 — tested, not yet wired)
+### Context Lifecycle (`le-vibe-agent`) — live
 
-`overflow.rs` and `compact.rs` hold the pi-equivalent decision functions. They are pure, so they
-are covered by `crates/le-vibe-agent/tests/context_lifecycle.rs` without a provider or session file.
-Wiring them into the turn loop is P1; until then the CLI's 85% rule remains the active trigger.
+All three triggers live in the agent loop; the CLI only forwards `context_window` and renders the
+`AgentEvent::Compaction` it receives. Covered by `crates/le-vibe-agent/tests/context_lifecycle.rs`
+(pure rules) and `tests/compaction_loop.rs` (loop behaviour, with a scripted provider).
 
-- `overflow::is_context_overflow(...)` — error-pattern overflow (case-insensitive, ~29 provider
-  wordings), silent overflow (`stop` with prompt tokens already over the window), and rate-limit /
-  throttling exclusions so a Bedrock `ThrottlingException: Too many tokens` is never mistaken for one.
-- `overflow::is_recoverable_length(...)` — `length` stop whose output came in under the requested cap
-  (input filled the window, leaving no room to generate).
-- `compact::should_compact(tokens, window, reserve)` — pi's rule is a **token reserve**, not a
-  percentage: `tokens > window - 16384`. A percentage is wrong at both ends (on a 32k window 85%
-  leaves 4.8k, less than one large tool result; on a 1M window it wastes 150k).
-- `compact::plan_cut(entry_tokens, keep_recent_tokens)` — keeps the newest ~20k tokens verbatim and
-  summarizes only the head, always retaining at least the newest entry.
+- **Threshold** (`compact::should_compact`) — pi's rule is a **token reserve**, not a percentage:
+  `tokens > window - 16384`. A percentage is wrong at both ends (on a 32k window 85% leaves 4.8k,
+  less than one large tool result; on a 1M window it wastes 150k). Capped at 2 compactions per
+  prompt so a still-oversized summary cannot loop.
+- **Overflow** (`overflow::is_context_overflow_text`) — provider error patterns (case-insensitive,
+  ~29 wordings) with rate-limit/throttling exclusions so a Bedrock `ThrottlingException: Too many
+  tokens` is never mistaken for overflow. Compact once, retry the turn once; a second overflow on
+  the same prompt hard-fails with pi's exact message.
+- **Silent overflow / recoverable length** — a *successful* reply whose prompt tokens already exceed
+  the window, or a `length` stop with **no output** (the input filled the window). These are checked
+  before the empty-response guard, since such a reply has no content.
+- **Retention** (`compact::plan_cut`) — keeps the newest ~20k tokens verbatim and summarizes only the
+  head, always retaining at least the newest entry. Because `SessionStore::active_branch` stops at the
+  newest `compaction_summary`, the kept tail is re-appended as fresh entries so the next request still
+  sees it; `KEEP_TAIL_MAX_BYTES` (200 KB) bounds how much duplication repeated compactions can add.
+- **Summarizer** (`compact::summarize`) — moved out of the CLI so it shares one retry policy with
+  normal turns; `/compact`, `/handover`, and bug-report generation all call it.
 
 ### Retry Policy (`le-vibe-agent`)
 

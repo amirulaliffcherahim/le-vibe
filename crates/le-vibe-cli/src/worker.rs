@@ -336,6 +336,8 @@ pub(crate) enum WorkerCmd {
         shell: String,
         max_turns: usize,
         retry_max: usize,
+        /// Model context window in tokens, so the agent can apply pi's reserve-based trigger.
+        context_window: u64,
         prompt: String,
     },
     ResolveModel {
@@ -480,59 +482,31 @@ pub(crate) enum WorkerMsg {
     Idle,
 }
 
-fn run_llm_summary(
+/// Summarize the whole active branch through the agent's summarizer (shared retry policy).
+///
+/// `keep_tail` keeps that many trailing tokens verbatim; manual commands pass `0` so the summary
+/// covers everything, exactly like the previous CLI-local implementation.
+fn llm_summary(
     bridge: &mut PythonBridge,
     session: &SessionStore,
     provider: &str,
     model: &str,
     instruction: &str,
-) -> Result<String, String> {
+    keep_tail: u64,
+) -> Result<le_vibe_agent::compact::SummaryPlan, String> {
     let branch = session.active_branch();
-    if branch.is_empty() {
-        return Err("Session is empty — nothing to summarize.".to_string());
-    }
-    let mut transcript = String::new();
-    for entry in &branch {
-        let line = match entry.kind {
-            EntryKind::Message | EntryKind::CompactionSummary | EntryKind::BranchSummary => {
-                format!("[{}]: {}\n", entry.role, entry.content)
-            }
-            EntryKind::ToolCall => format!(
-                "[tool_call {}]: {}\n",
-                entry.tool_name.as_deref().unwrap_or("tool"),
-                entry.content
-            ),
-            EntryKind::ToolResult => {
-                let preview: String = entry.content.chars().take(400).collect();
-                format!(
-                    "[tool_result {}]: {}\n",
-                    entry.tool_name.as_deref().unwrap_or("tool"),
-                    preview
-                )
-            }
-            EntryKind::ModelChange | EntryKind::ModeChange | EntryKind::SessionMeta => {
-                continue;
-            }
-        };
-        transcript.push_str(&line);
-    }
-    let req = CompletionRequest {
+    let mut options = le_vibe_agent::compact::SummarizeOptions {
         provider: provider.to_string(),
         model: model.to_string(),
-        messages: vec![ChatMessage {
-            role: "user".to_string(),
-            content: format!("{instruction}\n\n<transcript>\n{transcript}\n</transcript>"),
-            reasoning_content: None,
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            name: None,
-        }],
-        system_prompt: Some("You are a precise technical summarizer. Output concise Markdown.".to_string()),
-        tools: Vec::new(),
-        thinking_level: "low".to_string(),
+        instruction: instruction.to_string(),
+        keep_recent_tokens: if keep_tail == 0 { u64::MAX } else { keep_tail },
+        max_retries: le_vibe_agent::DEFAULT_MAX_RETRIES,
+        base_delay_ms: le_vibe_agent::DEFAULT_BASE_DELAY_MS,
+        max_delay_ms: le_vibe_agent::DEFAULT_MAX_DELAY_MS,
+        cancel: None,
+        on_retry: &mut |_, _, _| {},
     };
-    let reply = bridge.complete(req).map_err(|e| e.to_string())?;
-    Ok(reply.content)
+    le_vibe_agent::compact::summarize(bridge, &branch, &mut options)
 }
 
 fn extract_and_flush_memories(summary_raw: &str) -> (String, usize) {
@@ -1095,9 +1069,9 @@ End with a crisp **Verdict** (`APPROVE` / `REVISE`) and a numbered list of top c
                     let prompt = format!(
                         "Summarize the conversation into a concise technical handoff covering: (1) user goal, (2) files inspected/modified, (3) key decisions and constraints, (4) current state and remaining work. Keep under 600 words.{extra}\nIf (and ONLY if) the conversation revealed durable architectural decisions, non-obvious constraints, or bug root causes worth keeping across future sessions, append a JSON array block fenced as ```memory-flush\\n[{{\"title\":\"...\",\"key\":\"...\",\"keywords\":[...],\"content\":\"...\"}}]\\n``` (max 3 items; omit if nothing durable)."
                     );
-                    match run_llm_summary(&mut bridge, &session, &provider, &model, &prompt) {
-                        Ok(raw_summary) => {
-                            let (summary, flushed) = extract_and_flush_memories(&raw_summary);
+                    match llm_summary(&mut bridge, &session, &provider, &model, &prompt, 0) {
+                        Ok(plan) => {
+                            let (summary, flushed) = extract_and_flush_memories(&plan.summary);
                             let _ = session.append_compaction(&summary);
                             session_memory_toc =
                                 le_vibe_tools::memory::MemoryRagStore::open_default().build_toc(25);
@@ -1140,9 +1114,9 @@ End with a crisp **Verdict** (`APPROVE` / `REVISE`) and a numbered list of top c
                     let prompt = format!(
                         "Produce a structured session handover document covering: (1) Goal, (2) Files inspected/modified, (3) Decisions & constraints, (4) Open items / verification commands.{extra}{todo_ctx}\nIf (and ONLY if) the session revealed durable decisions, constraints, or bug root causes worth keeping across future sessions, append a JSON array block fenced as ```memory-flush\\n[{{\"title\":\"...\",\"key\":\"...\",\"keywords\":[...],\"content\":\"...\"}}]\\n``` (max 3 items; omit if nothing durable)."
                     );
-                    match run_llm_summary(&mut bridge, &session, &provider, &model, &prompt) {
-                        Ok(raw_summary) => {
-                            let (summary, flushed) = extract_and_flush_memories(&raw_summary);
+                    match llm_summary(&mut bridge, &session, &provider, &model, &prompt, 0) {
+                        Ok(plan) => {
+                            let (summary, flushed) = extract_and_flush_memories(&plan.summary);
                             let ts = SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
                                 .map(|d| d.as_secs())
@@ -1596,8 +1570,8 @@ End with a crisp **Verdict** (`APPROVE` / `REVISE`) and a numbered list of top c
                     repo,
                 } => {
                     let prompt = "Generate an industry-standard Software Defect & Fix Report in Markdown from the conversation transcript. Include these exact sections: # Title, ## Metadata (Severity, Priority, Environment, Component), ## Summary, ## Steps to Reproduce, ## Expected vs Actual Behavior, ## Root Cause Analysis, ## Fix Applied, ## Verification & Test Evidence, ## Follow-up Recommendations.";
-                    match run_llm_summary(&mut bridge, &session, &provider, &model, prompt) {
-                        Ok(md) => match export_bug_report_pdf(&repo, &format!("{provider}/{model}"), &md) {
+                    match llm_summary(&mut bridge, &session, &provider, &model, prompt, 0) {
+                        Ok(plan) => match export_bug_report_pdf(&repo, &format!("{provider}/{model}"), &plan.summary) {
                             Ok((path, true)) => {
                                 let _ = msg_tx.send(WorkerMsg::Notice(format!(
                                     "Generated bug report PDF: {}",
@@ -1754,6 +1728,7 @@ End with a crisp **Verdict** (`APPROVE` / `REVISE`) and a numbered list of top c
                     shell,
                     max_turns,
                     retry_max,
+                    context_window,
                     prompt,
                 } => {
                     cancel.store(false, Ordering::SeqCst);
@@ -1805,6 +1780,8 @@ End with a crisp **Verdict** (`APPROVE` / `REVISE`) and a numbered list of top c
                         max_retries: retry_max,
                         base_delay_ms: le_vibe_agent::DEFAULT_BASE_DELAY_MS,
                         max_delay_ms: le_vibe_agent::DEFAULT_MAX_DELAY_MS,
+                        context_window,
+                        reserve_tokens: le_vibe_agent::DEFAULT_RESERVE_TOKENS,
                         allowed_tools: mode.allowed_tools(),
                         mode_name: Some(mode.name().to_string()),
                         codemode: codemode_setting.clone(),

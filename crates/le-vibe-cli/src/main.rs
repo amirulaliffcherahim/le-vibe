@@ -449,6 +449,10 @@ fn main() {
                         max_retries: le_vibe_agent::DEFAULT_MAX_RETRIES,
                         base_delay_ms: le_vibe_agent::DEFAULT_BASE_DELAY_MS,
                         max_delay_ms: le_vibe_agent::DEFAULT_MAX_DELAY_MS,
+                        // `-p` has no model registry, so the threshold trigger stays off;
+                        // overflow recovery still works from provider error text.
+                        context_window: 0,
+                        reserve_tokens: le_vibe_agent::DEFAULT_RESERVE_TOKENS,
                         allowed_tools,
                         mode_name: Some(agent_mode.name().to_string()),
                         codemode: load_layered_settings()
@@ -537,12 +541,6 @@ fn run_interactive_tui(
     state.quiet_startup = parse_bool("quiet_startup", false);
     state.bell_on_done = parse_bool("bell_on_done", false);
     state.auto_compact = parse_bool("auto_compact", true);
-    if let Some(pct) = layered
-        .get("compact_threshold_pct")
-        .and_then(|s| s.trim_end_matches('%').parse::<u64>().ok())
-    {
-        state.compact_threshold_pct = pct.clamp(50, 95);
-    }
     if let Some(mt) = layered.get("max_turns").and_then(|s| s.parse::<usize>().ok()) {
         state.max_turns = mt.clamp(5, 200);
     }
@@ -752,6 +750,25 @@ fn run_interactive_tui(
                     } => {
                         state.set_retry(attempt, max_attempts, delay_ms);
                     }
+                    AgentEvent::TurnStart { .. } => state.clear_status_kind(),
+                    AgentEvent::Compaction {
+                        reason,
+                        summarized,
+                        kept,
+                        before_tokens,
+                    } => {
+                        // The agent owns the trigger; the UI only maps the reason it reported.
+                        let kind = match reason.as_str() {
+                            "overflow" => CompactionReason::Overflow,
+                            "threshold" => CompactionReason::Threshold,
+                            _ => CompactionReason::Manual,
+                        };
+                        state.set_compaction(kind);
+                        state.blocks.push(TranscriptBlock::System(format!(
+                            "Compacted {summarized} entries (kept {kept} recent) at {} tokens.",
+                            format_tokens(before_tokens)
+                        )));
+                    }
                     AgentEvent::ThinkingDelta { delta } => state.push_stream_delta(true, &delta),
                     AgentEvent::TextDelta { delta } => state.push_stream_delta(false, &delta),
                     AgentEvent::SteeringInjected { text } => {
@@ -956,6 +973,7 @@ fn run_interactive_tui(
                                 shell: state.shell.clone(),
                                 max_turns: state.max_turns,
                                 retry_max: state.retry_max,
+                                context_window: state.agent_context_window(),
                                 prompt: cont,
                             });
                         }
@@ -1088,6 +1106,7 @@ fn run_interactive_tui(
                                 shell: state.shell.clone(),
                                 max_turns: state.max_turns,
                                 retry_max: state.retry_max,
+                                context_window: state.agent_context_window(),
                                 prompt: next_prompt,
                             });
                         }
@@ -1125,6 +1144,7 @@ fn run_interactive_tui(
                 shell: state.shell.clone(),
                 max_turns: state.max_turns,
                 retry_max: state.retry_max,
+                context_window: state.agent_context_window(),
                 prompt: due_prompt,
             });
         }
@@ -1480,12 +1500,6 @@ fn run_interactive_tui(
                         state.auto_compact = !state.auto_compact;
                         Some(state.auto_compact.to_string())
                     }
-                    "compact_threshold_pct" => {
-                        let opts = [70u64, 80, 85, 90];
-                        let cur = opts.iter().position(|v| *v == state.compact_threshold_pct).unwrap_or(2);
-                        state.compact_threshold_pct = opts[(cur + 1) % opts.len()];
-                        Some(state.compact_threshold_pct.to_string())
-                    }
                     "max_turns" => {
                         let opts = [20usize, 40, 80];
                         let cur = opts.iter().position(|v| *v == state.max_turns).unwrap_or(1);
@@ -1686,6 +1700,7 @@ fn run_interactive_tui(
                         shell: state.shell.clone(),
                         max_turns: state.max_turns,
                         retry_max: state.retry_max,
+                        context_window: state.agent_context_window(),
                         prompt: goal_prompt,
                     });
                     continue;
@@ -1929,6 +1944,7 @@ fn run_interactive_tui(
                         shell: state.shell.clone(),
                         max_turns: state.max_turns,
                         retry_max: state.retry_max,
+                        context_window: state.agent_context_window(),
                         prompt,
                     });
                     continue;
@@ -2089,6 +2105,7 @@ fn run_interactive_tui(
                             shell: state.shell.clone(),
                             max_turns: state.max_turns,
                             retry_max: state.retry_max,
+                            context_window: state.agent_context_window(),
                             prompt: distill_prompt,
                         });
                     }
@@ -2353,6 +2370,7 @@ fn run_interactive_tui(
                             shell: state.shell.clone(),
                             max_turns: state.max_turns,
                             retry_max: state.retry_max,
+                            context_window: state.agent_context_window(),
                             prompt: expanded,
                         });
                     } else if state
@@ -2391,23 +2409,8 @@ fn run_interactive_tui(
                 }
                 let input = prompt_text;
 
-                if state.auto_compact
-                    && state.context_window > 0
-                    && state.context_tokens
-                        >= (state.context_window * state.compact_threshold_pct) / 100
-                {
-                    state.blocks.push(TranscriptBlock::System(format!(
-                        "Context >= {}% — running auto-compaction before turn...",
-                        state.compact_threshold_pct
-                    )));
-                    state.set_compaction(CompactionReason::Threshold);
-                    let _ = cmd_tx.send(WorkerCmd::Compact {
-                        provider: state.provider.clone(),
-                        model: state.model.clone(),
-                        instructions: None,
-                    });
-                }
-
+                // Threshold compaction is owned by `le-vibe-agent` (pi's reserve rule); the CLI
+                // only passes the window and lets the agent decide.
                 state.blocks.push(TranscriptBlock::User(input.clone()));
                 state.is_busy = true;
                 active_prompt = true;
@@ -2423,6 +2426,7 @@ fn run_interactive_tui(
                     shell: state.shell.clone(),
                     max_turns: state.max_turns,
                     retry_max: state.retry_max,
+                    context_window: state.agent_context_window(),
                     prompt: input,
                 });
             }

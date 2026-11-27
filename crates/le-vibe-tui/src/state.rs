@@ -373,7 +373,7 @@ pub struct TuiState {
     pub quiet_startup: bool,
     pub bell_on_done: bool,
     pub auto_compact: bool,
-    pub compact_threshold_pct: u64,
+
     pub max_turns: usize,
     pub retry_max: usize,
     pub confirm_on_exit: bool,
@@ -473,7 +473,7 @@ impl TuiState {
             quiet_startup: false,
             bell_on_done: false,
             auto_compact: true,
-            compact_threshold_pct: 85,
+
             max_turns: 40,
             retry_max: 3,
             confirm_on_exit: false,
@@ -524,6 +524,18 @@ impl TuiState {
             (false, Some(TranscriptBlock::Assistant(buf))) => buf.push_str(delta),
             (true, _) => self.blocks.push(TranscriptBlock::Thinking(delta.to_string())),
             (false, _) => self.blocks.push(TranscriptBlock::Assistant(delta.to_string())),
+        }
+    }
+
+    /// Context window handed to the agent for its reserve-based compaction trigger.
+    ///
+    /// `0` disables it, which is how the `auto_compact` setting is honoured without the CLI
+    /// computing a threshold of its own.
+    pub fn agent_context_window(&self) -> u64 {
+        if self.auto_compact {
+            self.context_window
+        } else {
+            0
         }
     }
 
@@ -633,7 +645,6 @@ impl TuiState {
             ("quiet_startup", "Quiet Header", on_off(self.quiet_startup).to_string(), "Compact 1-line header instead of full sleepy owl banner"),
             ("bell_on_done", "Bell on Done", on_off(self.bell_on_done).to_string(), "Ring terminal bell when turn completes or approval is needed"),
             ("auto_compact", "Auto-Compact", on_off(self.auto_compact).to_string(), "Automatically summarize context when threshold is reached"),
-            ("compact_threshold_pct", "Compact Threshold", format!("{}%", self.compact_threshold_pct), "Context % that triggers auto-compaction (70 / 80 / 85 / 90)"),
             ("max_turns", "Max Turns", self.max_turns.to_string(), "Max tool-loop turns per prompt (20 / 40 / 80)"),
             ("retry_max", "Transient Retries", self.retry_max.to_string(), "Auto-retries on 429/5xx/timeout (0 / 2 / 3)"),
             ("double_esc_rewind", "Double-Esc Rewind", on_off(self.double_esc_rewind).to_string(), "Press Esc twice on empty input to open /rewind"),

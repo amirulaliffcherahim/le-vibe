@@ -150,6 +150,10 @@ pub(crate) fn run_rpc_mode(
                     max_retries: le_vibe_agent::DEFAULT_MAX_RETRIES,
                     base_delay_ms: le_vibe_agent::DEFAULT_BASE_DELAY_MS,
                     max_delay_ms: le_vibe_agent::DEFAULT_MAX_DELAY_MS,
+                    // One-shot/RPC mode has no model registry here, so the reserve-based
+                    // threshold trigger stays off. Overflow recovery still works from error text.
+                    context_window: 0,
+                    reserve_tokens: le_vibe_agent::DEFAULT_RESERVE_TOKENS,
                     allowed_tools: None,
                     mode_name: Some("normal".to_string()),
                     codemode: "off".to_string(),

@@ -1,4 +1,4 @@
-pub mod compact;
+﻿pub mod compact;
 pub mod compress;
 pub mod overflow;
 
@@ -12,7 +12,7 @@ use le_vibe_pybridge::{
     AssistantMessage, BridgeError, ChatMessage, CompletionRequest, ExtensionPort, PolicyPort,
     ProviderPort, ToolCall,
 };
-use le_vibe_telemetry::TelemetryRecorder;
+pub use le_vibe_telemetry::TelemetryRecorder;
 use le_vibe_tools::codemode::run_codemode_script;
 use le_vibe_tools::hooks::HookRegistry;
 use le_vibe_tools::{
@@ -66,6 +66,14 @@ pub enum AgentEvent {
         max_attempts: usize,
         delay_ms: u64,
     },
+    /// The agent compacted the session. `reason` is `manual` | `threshold` | `overflow`, matching
+    /// pi's `compaction_start` event; the CLI maps it onto its own `CompactionReason`.
+    Compaction {
+        reason: String,
+        summarized: usize,
+        kept: usize,
+        before_tokens: u64,
+    },
     SteeringInjected { text: String },
     TurnUsage { input_tokens: u64, cache_read_tokens: u64 },
     TurnEnd { stop_reason: String },
@@ -103,7 +111,35 @@ pub struct AgentConfig {
     pub codemode: String,
     pub steering_queue: Option<Arc<Mutex<VecDeque<String>>>>,
     pub output_store: Option<Arc<Mutex<OutputStore>>>,
+    /// Model context window in tokens; `0` disables threshold compaction.
+    pub context_window: u64,
+    /// Headroom kept free below the window before compacting (pi's `reserveTokens`).
+    pub reserve_tokens: u64,
 }
+
+/// Classify a successful reply as an overflow, if it is one.
+///
+/// `length` is only treated as overflow when the model produced **no** output: without the model's
+/// configured output cap we cannot tell a truncated-but-recoverable answer from a genuine one, so
+/// only the unambiguous signature (input filled the window, nothing left to generate) counts.
+fn reply_overflow(reply: &AssistantMessage, config: &AgentConfig) -> Option<&'static str> {
+    if crate::overflow::is_silent_overflow(
+        &reply.stop_reason,
+        reply.usage.input_tokens.saturating_add(reply.usage.cache_read_tokens),
+        reply.usage.output_tokens,
+        config.context_window,
+    ) {
+        return Some("silent");
+    }
+    if crate::overflow::is_recoverable_length(&reply.stop_reason, reply.usage.output_tokens, 1) {
+        return Some("length");
+    }
+    None
+}
+
+/// pi's exact hard-fail text when a turn overflows twice in a row.
+const OVERFLOW_RECOVERY_FAILED: &str = "Context overflow recovery failed after one compact-and-retry \
+attempt. Try reducing context or switching to a larger-context model.";
 
 /// Retry budget, matching pi's `settings.retry.maxRetries`.
 pub const DEFAULT_MAX_RETRIES: usize = 3;
@@ -128,6 +164,8 @@ impl Default for AgentConfig {
             codemode: "off".to_string(),
             steering_queue: None,
             output_store: None,
+            context_window: 0,
+            reserve_tokens: crate::compact::DEFAULT_RESERVE_TOKENS,
         }
     }
 }
@@ -313,7 +351,7 @@ pub fn retry_delay_ms(base_ms: u64, max_ms: u64, attempt: usize) -> u64 {
 }
 
 /// Sleep for `delay_ms`, waking early (returning `true`) when the turn is cancelled.
-fn sleep_cancellable(cancel: Option<&AtomicBool>, delay_ms: u64) -> bool {
+pub(crate) fn sleep_cancellable(cancel: Option<&AtomicBool>, delay_ms: u64) -> bool {
     let slices = (delay_ms / 50).max(1);
     for _ in 0..slices {
         if is_cancelled(cancel) {
@@ -354,7 +392,7 @@ pub fn cap_tool_output(text: &str) -> String {
     )
 }
 
-fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
+pub(crate) fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
     cancel.is_some_and(|c| c.load(Ordering::SeqCst))
 }
 
@@ -473,33 +511,11 @@ pub fn run_turn_loop_cancellable<B: ProviderPort + PolicyPort + ExtensionPort>(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
-    bridge: &mut B,
-    session: &mut SessionStore,
-    telemetry: &TelemetryRecorder,
-    todos: &mut TodoStore,
-    mut mcp: Option<&mut McpManager>,
-    cancel: Option<&AtomicBool>,
-    config: &AgentConfig,
-    user_prompt: &str,
-    on_event: &mut dyn FnMut(AgentEvent),
-    on_approval: &mut dyn FnMut(ApprovalRequest) -> ApprovalChoice,
-    on_ask_user: &mut dyn FnMut(Value) -> String,
-) -> Result<AssistantMessage, AgentError> {
-    // Determine prior active mode from session before appending user turn
-    let prev_mode = session
-        .active_branch()
-        .into_iter()
-        .rev()
-        .find(|e| e.kind == EntryKind::ModeChange)
-        .map(|e| e.content);
-    let mode_reminder = config
-        .mode_name
-        .as_deref()
-        .and_then(|cur| mode_transition_reminder(prev_mode.as_deref(), cur));
-
-    session.append("user", user_prompt)?;
+/// Rebuild the provider message array from the session's active branch.
+///
+/// Called once per prompt and again after every compaction, so compaction cannot leave the request
+/// carrying the pre-compaction history.
+fn build_branch_messages(session: &SessionStore) -> Vec<ChatMessage> {
     let mut messages: Vec<ChatMessage> = Vec::new();
     for entry in session.active_branch() {
         match entry.kind {
@@ -516,10 +532,7 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
             EntryKind::CompactionSummary | EntryKind::BranchSummary => {
                 messages.push(ChatMessage {
                     role: "user".to_string(),
-                    content: format!(
-                        "<session_summary>\n{}\n</session_summary>",
-                        entry.content
-                    ),
+                    content: format!("<session_summary>\n{}\n</session_summary>", entry.content),
                     reasoning_content: None,
                     tool_calls: Vec::new(),
                     tool_call_id: None,
@@ -536,7 +549,8 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                 });
             }
             EntryKind::ToolCall => {
-                let args: Value = serde_json::from_str(&entry.content).unwrap_or_else(|_| Value::Object(Default::default()));
+                let args: Value = serde_json::from_str(&entry.content)
+                    .unwrap_or_else(|_| Value::Object(Default::default()));
                 let tc = ToolCall {
                     id: entry.tool_call_id.unwrap_or_default(),
                     name: entry.tool_name.unwrap_or_default(),
@@ -572,6 +586,92 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
             EntryKind::ModelChange | EntryKind::ModeChange | EntryKind::SessionMeta => {}
         }
     }
+    messages
+}
+
+/// Compact the session from inside the turn loop and rebuild the request messages.
+///
+/// Returns the plan so the caller can report what happened; `Err` means the request should keep
+/// its current (uncompacted) messages.
+fn compact_in_loop<B: ProviderPort>(
+    bridge: &mut B,
+    session: &mut SessionStore,
+    config: &AgentConfig,
+    cancel: Option<&AtomicBool>,
+    reason: &str,
+    before_tokens: u64,
+    on_event: &mut dyn FnMut(AgentEvent),
+) -> Option<Vec<ChatMessage>> {
+    let branch = session.active_branch();
+    let mut options = crate::compact::SummarizeOptions {
+        provider: config.provider.clone(),
+        model: config.model.clone(),
+        instruction: crate::compact::DEFAULT_INSTRUCTION.to_string(),
+        keep_recent_tokens: crate::compact::DEFAULT_KEEP_RECENT_TOKENS,
+        max_retries: config.max_retries,
+        base_delay_ms: config.base_delay_ms,
+        max_delay_ms: config.max_delay_ms,
+        cancel,
+        on_retry: &mut |attempt, max_attempts, delay_ms| {
+            on_event(AgentEvent::Retry {
+                attempt,
+                max_attempts,
+                delay_ms,
+            });
+        },
+    };
+    let plan = match crate::compact::summarize(bridge, &branch, &mut options) {
+        Ok(plan) => plan,
+        Err(err) => {
+            on_event(AgentEvent::Status {
+                text: format!("Compaction failed: {err}"),
+            });
+            return None;
+        }
+    };
+    if let Err(err) = crate::compact::apply_summary(session, &branch, &plan) {
+        on_event(AgentEvent::Status {
+            text: format!("Compaction could not be persisted: {err}"),
+        });
+        return None;
+    }
+    on_event(AgentEvent::Compaction {
+        reason: reason.to_string(),
+        summarized: plan.summarized,
+        kept: plan.kept,
+        before_tokens,
+    });
+    Some(build_branch_messages(session))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
+    bridge: &mut B,
+    session: &mut SessionStore,
+    telemetry: &TelemetryRecorder,
+    todos: &mut TodoStore,
+    mut mcp: Option<&mut McpManager>,
+    cancel: Option<&AtomicBool>,
+    config: &AgentConfig,
+    user_prompt: &str,
+    on_event: &mut dyn FnMut(AgentEvent),
+    on_approval: &mut dyn FnMut(ApprovalRequest) -> ApprovalChoice,
+    on_ask_user: &mut dyn FnMut(Value) -> String,
+) -> Result<AssistantMessage, AgentError> {
+    // Determine prior active mode from session before appending user turn
+    let prev_mode = session
+        .active_branch()
+        .into_iter()
+        .rev()
+        .find(|e| e.kind == EntryKind::ModeChange)
+        .map(|e| e.content);
+    let mode_reminder = config
+        .mode_name
+        .as_deref()
+        .and_then(|cur| mode_transition_reminder(prev_mode.as_deref(), cur));
+
+    session.append("user", user_prompt)?;
+    let mut messages = build_branch_messages(session);
     sanitize_messages_for_provider(&config.provider, &mut messages);
     if let Some(reminder) = mode_reminder {
         let insert_idx = messages.len().saturating_sub(1);
@@ -636,6 +736,9 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
         cache_write_tokens: 0,
         cost_usd: 0.0,
     };
+    let mut last_context_tokens: u64 = 0;
+    let mut overflow_recovery_attempted = false;
+    let mut threshold_compactions = 0usize;
     for turn in 0..config.max_turns {
         if is_cancelled(cancel) {
             let note = if last_partial_text.trim().is_empty() {
@@ -649,6 +752,30 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
         on_event(AgentEvent::TurnStart { turn });
         let span = telemetry.record_span("agent.turn");
         sanitize_messages_for_provider(&config.provider, &mut messages);
+
+        // pi's threshold rule: compact before the request when the last prompt already sits inside
+        // the reserve. Capped per prompt so a still-too-large summary cannot loop forever.
+        if threshold_compactions < 2
+            && crate::compact::should_compact(
+                last_context_tokens,
+                config.context_window,
+                config.reserve_tokens,
+            )
+            && let Some(rebuilt) = compact_in_loop(
+                bridge,
+                session,
+                config,
+                cancel,
+                "threshold",
+                last_context_tokens,
+                on_event,
+            )
+        {
+            messages = rebuilt;
+            last_context_tokens = 0;
+            threshold_compactions += 1;
+            sanitize_messages_for_provider(&config.provider, &mut messages);
+        }
 
         let mut attempt = 0usize;
         let reply = loop {
@@ -680,6 +807,49 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                     _ => {}
                 },
             ) {
+                // A successful reply can still be a context overflow: silent overflow (usage past
+                // the window) or a length stop with no output (the input filled the window). This
+                // must run *before* the empty-response guard, since that reply has no content.
+                Ok(r) if reply_overflow(&r, config).is_some() => {
+                    let kind = reply_overflow(&r, config).unwrap_or("overflow");
+                    if overflow_recovery_attempted {
+                        telemetry.finish_span(span);
+                        let message = if kind == "length" {
+                            "Truncated response recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.".to_string()
+                        } else {
+                            OVERFLOW_RECOVERY_FAILED.to_string()
+                        };
+                        let _ = session.append("assistant", &message);
+                        return Err(AgentError::Bridge(BridgeError::Remote {
+                            kind: "ContextOverflow".to_string(),
+                            message,
+                        }));
+                    }
+                    overflow_recovery_attempted = true;
+                    last_partial_text.clear();
+                    match compact_in_loop(
+                        bridge,
+                        session,
+                        config,
+                        cancel,
+                        "overflow",
+                        last_context_tokens,
+                        on_event,
+                    ) {
+                        Some(rebuilt) => {
+                            messages = rebuilt;
+                            last_context_tokens = 0;
+                            continue;
+                        }
+                        None => {
+                            telemetry.finish_span(span);
+                            return Err(AgentError::Bridge(BridgeError::Remote {
+                                kind: "ContextOverflow".to_string(),
+                                message: OVERFLOW_RECOVERY_FAILED.to_string(),
+                            }));
+                        }
+                    }
+                }
                 Ok(r)
                     if r.content.trim().is_empty()
                         && r.tool_calls.is_empty()
@@ -744,6 +914,51 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                         return Err(AgentError::Cancelled);
                     }
                 }
+                // Overflow is never retried as-is: resending the same prompt cannot fit. Compact
+                // once and retry the turn; a second overflow on the same prompt hard-fails.
+                Err(err)
+                    if !overflow_recovery_attempted
+                        && crate::overflow::is_context_overflow_text(
+                            &err.to_string(),
+                            config.context_window,
+                        ) =>
+                {
+                    overflow_recovery_attempted = true;
+                    last_partial_text.clear();
+                    let recovered = compact_in_loop(
+                        bridge,
+                        session,
+                        config,
+                        cancel,
+                        "overflow",
+                        last_context_tokens,
+                        on_event,
+                    );
+                    match recovered {
+                        Some(rebuilt) => {
+                            messages = rebuilt;
+                            last_context_tokens = 0;
+                            continue;
+                        }
+                        None => {
+                            telemetry.finish_span(span);
+                            return Err(AgentError::Bridge(err));
+                        }
+                    }
+                }
+                Err(err)
+                    if crate::overflow::is_context_overflow_text(
+                        &err.to_string(),
+                        config.context_window,
+                    ) =>
+                {
+                    telemetry.finish_span(span);
+                    let _ = session.append("assistant", OVERFLOW_RECOVERY_FAILED);
+                    return Err(AgentError::Bridge(BridgeError::Remote {
+                        kind: "ContextOverflow".to_string(),
+                        message: format!("{OVERFLOW_RECOVERY_FAILED} ({err})"),
+                    }));
+                }
                 Err(err) => {
                     telemetry.finish_span(span);
                     let note = if last_partial_text.trim().is_empty() {
@@ -757,6 +972,14 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
             }
         };
         telemetry.finish_span(span);
+
+        // Track the prompt size of this turn for the threshold rule and overflow detection.
+        if reply.usage.input_tokens > 0 {
+            last_context_tokens = reply
+                .usage
+                .input_tokens
+                .saturating_add(reply.usage.cache_read_tokens);
+        }
 
         cumulative_usage.input_tokens = cumulative_usage
             .input_tokens
@@ -1151,6 +1374,8 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                         codemode: "off".to_string(),
                         steering_queue: None,
                         output_store: config.output_store.clone(),
+                        context_window: config.context_window,
+                        reserve_tokens: config.reserve_tokens,
                     };
                     let mut noop_ev = |_: AgentEvent| {};
                     let mut deny_all = |_: ApprovalRequest| ApprovalChoice::Deny;

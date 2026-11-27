@@ -1,10 +1,12 @@
 pub mod compact;
 pub mod compress;
 pub mod overflow;
+pub mod workflows;
 
 pub use compact::{CutPlan, DEFAULT_KEEP_RECENT_TOKENS, DEFAULT_RESERVE_TOKENS};
 pub use compress::{CompressionStats, OutputStore, compress_tool_output};
 pub use overflow::{estimate_tokens, is_context_overflow, is_context_overflow_text};
+pub use workflows::{ProofOutcome, ProofState, evaluate_proof_reply};
 
 use le_vibe_durable::{EntryKind, SessionStore};
 use le_vibe_mcp::McpManager;

@@ -33,9 +33,24 @@
 | `le-vibe-schema` | JSON Schema validation for tool arguments |
 | `le-vibe-telemetry` | In-memory span & timing recorder |
 | `le-vibe-pybridge` | Stdio NDJSON/JSON-RPC bridge (`PythonBridge`, `ProviderPort`, `PolicyPort`, `ExtensionPort`) |
-| `le-vibe-durable` | Append-only JSONL session DAG (`SessionStore`, branching, compaction, fork/clone) |
+| `le-vibe-durable` | Append-only JSONL session DAG (`SessionStore`, branching, compaction boundary, fork/clone, tree & label projection, rewind checkpoints) |
 | `le-vibe-tools` | Native coding tools (`read`, `write`, `edit`, `grep`, `find`, `ls`, `bash`, `powershell`, `todo`, `ask_user_question`) |
 | `le-vibe-mcp` | Stdio JSON-RPC 2.0 MCP client & `McpManager` (`mcp__<server>__<tool>`) |
-| `le-vibe-agent` | Event-driven turn loop (`run_turn_loop_cancellable`), retry, cross-provider/mode sanitization |
+| `le-vibe-agent` | Event-driven turn loop (`run_turn_loop_cancellable`), retry, context lifecycle (`overflow`, `compact`), and slash-command builders (`workflows`: Proof Loop, Goldfish reviewer, skill distillation, compaction instructions) |
 | `le-vibe-tui` | Modular `ratatui` UI (`theme`, `mode`, `commands`, `state`, `editor`, `markdown`, `transcript`, `modal`, `input`, `export`) |
 | `le-vibe-cli` | Binary entry point (`cli`, `settings`, `worker`, `rpc`, `main`) |
+
+### Where logic belongs (Thin-CLI rule)
+
+The binary crates dispatch and render; they do not own policy, prompts, or graph walks.
+
+| Concern | Owner |
+| --- | --- |
+| Prompt text the model sees (Proof Loop, Goldfish, distillation, compaction/handover handoff) | `le-vibe-agent::workflows` |
+| Reply evaluation (`PROOF_VERIFIED` / `PROOF_BLOCKED` / attempt cap) | `le-vibe-agent::workflows::evaluate_proof_reply` |
+| When to compact, what to keep, overflow recovery | `le-vibe-agent::{compact, overflow}` |
+| Session DAG: branches, compaction boundary, fork, tree rows, labels, rewind checkpoints | `le-vibe-durable` |
+| Strings, layout, colours, key hints | `le-vibe-tui` |
+
+Thin-CLI Sweep P0 moved those out of `main.rs` / `worker.rs`. P1 adds `VerificationGate`
+(the `did_mutate && !did_verify` post-edit check) to `le-vibe-agent`.

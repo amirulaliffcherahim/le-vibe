@@ -782,22 +782,17 @@ pub(crate) fn spawn_tui_worker(
                         continue;
                     };
 
-                    let goldfish_sys = "\
-You are a FRESH-CONTEXT GOLDFISH REVIEWER (Elephant-Goldfish Model). You have ZERO prior conversation history — only the artifact below.
-Critique it ruthlessly and constructively across the 5 EGM lenses:
-1. **Comprehension**: ambiguous requirements, undefined terms, unstated assumptions.
-2. **Structural**: missing failure modes, state transitions, concurrency/rollback edge cases.
-3. **Codebase Fit**: claims or interfaces that need concrete verification against real files/symbols.
-4. **Design Critic**: simpler alternatives, hidden coupling, over-engineering.
-5. **Implementation Readiness**: missing binary acceptance criteria or deterministic verification commands.
-End with a crisp **Verdict** (`APPROVE` / `REVISE`) and a numbered list of top concrete fixes.";
+                    let goldfish_sys = le_vibe_agent::workflows::GOLDFISH_SYSTEM_PROMPT;
                     let req = CompletionRequest {
                         provider: provider.clone(),
                         model: model.clone(),
                         system_prompt: Some(goldfish_sys.to_string()),
                         messages: vec![ChatMessage {
                             role: "user".to_string(),
-                            content: format!("Review artifact (`{source_label}`):\n\n{content}"),
+                            content: le_vibe_agent::workflows::goldfish_review_content(
+                                &source_label,
+                                &content,
+                            ),
                             reasoning_content: None,
                             name: None,
                             tool_call_id: None,
@@ -808,9 +803,8 @@ End with a crisp **Verdict** (`APPROVE` / `REVISE`) and a numbered list of top c
                     };
                     match bridge.complete(req) {
                         Ok(reply) => {
-                            let header = format!(
-                                "## Goldfish Review (Fresh Context · `{source_label}`)\n\n"
-                            );
+                            let header =
+                                le_vibe_agent::workflows::goldfish_review_header(&source_label);
                             let _ = msg_tx.send(WorkerMsg::Agent(AgentEvent::TextDelta {
                                 delta: format!("{header}{}", reply.content.trim()),
                             }));
@@ -1091,7 +1085,8 @@ End with a crisp **Verdict** (`APPROVE` / `REVISE`) and a numbered list of top c
                         .map(|i| format!(" Focus especially on: {i}."))
                         .unwrap_or_default();
                     let prompt = format!(
-                        "Summarize the conversation into a concise technical handoff covering: (1) user goal, (2) files inspected/modified, (3) key decisions and constraints, (4) current state and remaining work. Keep under 600 words.{extra}\nIf (and ONLY if) the conversation revealed durable architectural decisions, non-obvious constraints, or bug root causes worth keeping across future sessions, append a JSON array block fenced as ```memory-flush\\n[{{\"title\":\"...\",\"key\":\"...\",\"keywords\":[...],\"content\":\"...\"}}]\\n``` (max 3 items; omit if nothing durable)."
+                        "{}{extra}",
+                        le_vibe_agent::workflows::MANUAL_COMPACT_INSTRUCTION
                     );
                     match llm_summary(&mut bridge, &session, &provider, &model, &prompt, 0) {
                         Ok(plan) => {
@@ -1136,7 +1131,8 @@ End with a crisp **Verdict** (`APPROVE` / `REVISE`) and a numbered list of top c
                         format!("\nOpen todos to carry over:\n{}", open_todos.join("\n"))
                     };
                     let prompt = format!(
-                        "Produce a structured session handover document covering: (1) Goal, (2) Files inspected/modified, (3) Decisions & constraints, (4) Open items / verification commands.{extra}{todo_ctx}\nIf (and ONLY if) the session revealed durable decisions, constraints, or bug root causes worth keeping across future sessions, append a JSON array block fenced as ```memory-flush\\n[{{\"title\":\"...\",\"key\":\"...\",\"keywords\":[...],\"content\":\"...\"}}]\\n``` (max 3 items; omit if nothing durable)."
+                        "{}{extra}{todo_ctx}",
+                        le_vibe_agent::workflows::HANDOVER_INSTRUCTION
                     );
                     match llm_summary(&mut bridge, &session, &provider, &model, &prompt, 0) {
                         Ok(plan) => {

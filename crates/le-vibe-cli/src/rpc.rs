@@ -154,6 +154,7 @@ pub(crate) fn run_rpc_mode(
                     // threshold trigger stays off. Overflow recovery still works from error text.
                     context_window: 0,
                     reserve_tokens: le_vibe_agent::DEFAULT_RESERVE_TOKENS,
+                    verify_edits: true,
                     allowed_tools: None,
                     mode_name: Some("normal".to_string()),
                     codemode: "off".to_string(),

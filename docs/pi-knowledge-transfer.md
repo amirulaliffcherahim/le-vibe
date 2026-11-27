@@ -68,6 +68,7 @@ All context-lifecycle logic lives in `le-vibe-agent`; `main.rs`/`worker.rs` only
 | Failed-attempt handling | The partial stream of a failed attempt is cleared before the retry, so it cannot be replayed twice (pi durably omits the attempt). |
 | Summarizer | `compact::summarize` (in `le-vibe-agent`) with the same retry policy; used by the loop, `/compact`, `/handover`, and bug reports. |
 | Events | `AgentEvent::Compaction { reason, summarized, kept, before_tokens }` → CLI maps `reason` onto `CompactionReason`; `TurnStart` clears the status strip. |
+| Verification gate | `le-vibe-agent::verification::VerificationGate` refuses a stop after an unverified edit (one nudge per prompt, then latches). pi has no equivalent — it relies on the Proof Loop prompt text. `settings.json` → `verify_edits` (default on) disables it. |
 
 ## 7. Sessions Parity (P0–P1, complete)
 
@@ -102,6 +103,10 @@ answer keeps the existing truncated-tool-call guidance instead.
 - **Tree flattening lives in `le-vibe-durable`, not the UI.** Pi's `tree-selector.ts` builds the
   connector rows in the component; `le-vibe` has no session-aware UI crate, so `tree_rows()` owns the
   projection and the CLI only decorates it. It keeps ~86 lines of graph walking out of `worker.rs`.
+- **The verification gate is le-vibe-only.** pi enforces "prove it works" through prose in the Proof
+  Loop prompt; a long turn erodes that, so `le-vibe` checks it in Rust. It nudges once and then gives
+  up rather than looping, and it reads the shell `exit_code=` because a failing command is still a
+  successful tool call.
 - **Label clearing is an empty label entry.** Pi stores `label: undefined` in JSON; `le-vibe` stores
   an empty `content` string, because `SessionEntry.content` is non-optional. Same last-write-wins
   resolution.

@@ -1,11 +1,13 @@
 pub mod compact;
 pub mod compress;
 pub mod overflow;
+pub mod verification;
 pub mod workflows;
 
 pub use compact::{CutPlan, DEFAULT_KEEP_RECENT_TOKENS, DEFAULT_RESERVE_TOKENS};
 pub use compress::{CompressionStats, OutputStore, compress_tool_output};
 pub use overflow::{estimate_tokens, is_context_overflow, is_context_overflow_text};
+pub use verification::{NUDGE_MESSAGE, VerificationGate};
 pub use workflows::{ProofOutcome, ProofState, evaluate_proof_reply};
 
 use le_vibe_durable::{EntryKind, SessionStore};
@@ -117,6 +119,8 @@ pub struct AgentConfig {
     pub context_window: u64,
     /// Headroom kept free below the window before compacting (pi's `reserveTokens`).
     pub reserve_tokens: u64,
+    /// Refuse a stop that follows an unverified edit (default on; settings opt-out).
+    pub verify_edits: bool,
 }
 
 /// Classify a successful reply as an overflow, if it is one.
@@ -168,6 +172,7 @@ impl Default for AgentConfig {
             output_store: None,
             context_window: 0,
             reserve_tokens: crate::compact::DEFAULT_RESERVE_TOKENS,
+            verify_edits: true,
         }
     }
 }
@@ -744,6 +749,10 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
     let mut last_context_tokens: u64 = 0;
     let mut overflow_recovery_attempted = false;
     let mut threshold_compactions = 0usize;
+    // Read-only modes cannot mutate, so the gate is off there by construction.
+    let mut gate = crate::verification::VerificationGate::new(
+        config.verify_edits && !crate::verification::mode_is_read_only(config.mode_name.as_deref()),
+    );
     for turn in 0..config.max_turns {
         if is_cancelled(cancel) {
             let note = if last_partial_text.trim().is_empty() {
@@ -1011,6 +1020,31 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
         }
 
         if reply.tool_calls.is_empty() {
+            // VerificationGate: an edit followed by no command is not "done". One nudge per prompt,
+            // then the gate gives up so a forgetful model cannot loop forever here.
+            if gate.should_nudge() {
+                session.append("assistant", &reply.content)?;
+                messages.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content: reply.content.clone(),
+                    reasoning_content: reply.reasoning_content.clone(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    name: None,
+                });
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: crate::verification::NUDGE_MESSAGE.to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    name: None,
+                });
+                on_event(AgentEvent::Status {
+                    text: "Verification gate: edits are unverified, asking for evidence…".to_string(),
+                });
+                continue;
+            }
             let mut final_reply = reply;
             final_reply.usage = cumulative_usage;
             session.append("assistant", &final_reply.content)?;
@@ -1177,6 +1211,8 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                     output.push_str("[PostToolUse hook]\n");
                     output.push_str(&post_note);
                 }
+                // Observe before compression: the gate needs the raw `exit_code=N` line.
+                gate.observe_tool_result(&tc.name, is_error, &output);
                 let capped_output = match &config.output_store {
                     Some(arc) => {
                         if let Ok(mut guard) = arc.lock() {
@@ -1381,6 +1417,7 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                         output_store: config.output_store.clone(),
                         context_window: config.context_window,
                         reserve_tokens: config.reserve_tokens,
+                        verify_edits: config.verify_edits,
                     };
                     let mut noop_ev = |_: AgentEvent| {};
                     let mut deny_all = |_: ApprovalRequest| ApprovalChoice::Deny;
@@ -1638,6 +1675,7 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
             } else {
                 tc.name.as_str()
             };
+            gate.observe_tool_result(&tc.name, is_error, &output);
             let capped_output = match &config.output_store {
                 Some(arc) => {
                     if let Ok(mut guard) = arc.lock() {

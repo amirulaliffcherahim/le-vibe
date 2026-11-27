@@ -151,6 +151,7 @@ fn config() -> AgentConfig {
         output_store: None,
         context_window: 200_000,
         reserve_tokens: compact::DEFAULT_RESERVE_TOKENS,
+        verify_edits: false,
     }
 }
 

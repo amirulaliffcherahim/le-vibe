@@ -48,9 +48,29 @@ The binary crates dispatch and render; they do not own policy, prompts, or graph
 | --- | --- |
 | Prompt text the model sees (Proof Loop, Goldfish, distillation, compaction/handover handoff) | `le-vibe-agent::workflows` |
 | Reply evaluation (`PROOF_VERIFIED` / `PROOF_BLOCKED` / attempt cap) | `le-vibe-agent::workflows::evaluate_proof_reply` |
+| Refusing an unverified stop | `le-vibe-agent::verification::VerificationGate` |
 | When to compact, what to keep, overflow recovery | `le-vibe-agent::{compact, overflow}` |
 | Session DAG: branches, compaction boundary, fork, tree rows, labels, rewind checkpoints | `le-vibe-durable` |
 | Strings, layout, colours, key hints | `le-vibe-tui` |
 
-Thin-CLI Sweep P0 moved those out of `main.rs` / `worker.rs`. P1 adds `VerificationGate`
-(the `did_mutate && !did_verify` post-edit check) to `le-vibe-agent`.
+Thin-CLI Sweep P0 moved those out of `main.rs` / `worker.rs`; P1 added `VerificationGate`.
+
+### VerificationGate
+
+`le-vibe-agent::verification` tracks two facts per prompt:
+
+- `did_mutate` — a successful `edit` / `write` / `multiedit` / `apply_patch` changed the tree.
+- `did_verify` — a `bash` / `powershell` / `shell` / `exec` call **after** that mutation reported
+  `exit_code=0`. A later mutation clears it again.
+
+When the model tries to stop with `did_mutate && !did_verify`, the harness appends
+`NUDGE_MESSAGE` and continues the turn instead of accepting the answer. It nudges **once** per
+prompt and then gives up — a gate that can block forever turns a forgetful model into an infinite
+loop, which is worse than an unverified answer.
+
+Notes:
+- The success signal is the shell `exit_code=`, **not** the tool's `is_error` flag: `run_shell`
+  returns `Ok` with `exit_code=N` in the body, so a red test run is a "successful" tool call.
+- Read-only modes (`plan`, `ask`) never arm the gate.
+- `settings.json` → `verify_edits` (default `true`) disables it; the config modal exposes the same
+  toggle as **Verify Edits**.

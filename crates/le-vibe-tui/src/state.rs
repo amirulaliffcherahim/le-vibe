@@ -397,6 +397,8 @@ pub struct TuiState {
     pub quiet_startup: bool,
     pub bell_on_done: bool,
     pub auto_compact: bool,
+    /// Refuse a stop after an unverified edit (settings.json `verify_edits`).
+    pub verify_edits: bool,
 
     pub max_turns: usize,
     pub retry_max: usize,
@@ -499,6 +501,7 @@ impl TuiState {
             quiet_startup: false,
             bell_on_done: false,
             auto_compact: true,
+            verify_edits: true,
 
             max_turns: 40,
             retry_max: 3,
@@ -671,6 +674,7 @@ impl TuiState {
             ("quiet_startup", "Quiet Header", on_off(self.quiet_startup).to_string(), "Compact 1-line header instead of full sleepy owl banner"),
             ("bell_on_done", "Bell on Done", on_off(self.bell_on_done).to_string(), "Ring terminal bell when turn completes or approval is needed"),
             ("auto_compact", "Auto-Compact", on_off(self.auto_compact).to_string(), "Automatically summarize context when threshold is reached"),
+            ("verify_edits", "Verify Edits", on_off(self.verify_edits).to_string(), "Refuse a final answer when files changed but no command was run since"),
             ("max_turns", "Max Turns", self.max_turns.to_string(), "Max tool-loop turns per prompt (20 / 40 / 80)"),
             ("retry_max", "Transient Retries", self.retry_max.to_string(), "Auto-retries on 429/5xx/timeout (0 / 2 / 3)"),
             ("double_esc_rewind", "Double-Esc Rewind", on_off(self.double_esc_rewind).to_string(), "Press Esc twice on empty input to open /rewind"),

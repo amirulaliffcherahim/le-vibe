@@ -338,6 +338,8 @@ pub(crate) enum WorkerCmd {
         retry_max: usize,
         /// Model context window in tokens, so the agent can apply pi's reserve-based trigger.
         context_window: u64,
+        /// Refuse a stop after an unverified edit (`settings.json` `verify_edits`).
+        verify_edits: bool,
         prompt: String,
     },
     ResolveModel {
@@ -1713,6 +1715,7 @@ pub(crate) fn spawn_tui_worker(
                     max_turns,
                     retry_max,
                     context_window,
+                    verify_edits,
                     prompt,
                 } => {
                     cancel.store(false, Ordering::SeqCst);
@@ -1766,6 +1769,7 @@ pub(crate) fn spawn_tui_worker(
                         max_delay_ms: le_vibe_agent::DEFAULT_MAX_DELAY_MS,
                         context_window,
                         reserve_tokens: le_vibe_agent::DEFAULT_RESERVE_TOKENS,
+                        verify_edits,
                         allowed_tools: mode.allowed_tools(),
                         mode_name: Some(mode.name().to_string()),
                         codemode: codemode_setting.clone(),

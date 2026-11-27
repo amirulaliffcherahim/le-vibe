@@ -84,10 +84,10 @@ encodes that rule so a future inline renderer inherits it for free.
 model's `maxTokens`; `le-vibe` has no per-model output cap in the agent, so only the unambiguous
 signature (a `length` stop with **zero** output) triggers overflow recovery. A genuinely truncated
 answer keeps the existing truncated-tool-call guidance instead.
-- **Kept tail is re-appended, not pointed at.** Pi records `firstKeptEntryId` in the compaction entry.
-`le-vibe` re-appends the tail as fresh entries because `active_branch()` stops at the newest
-`compaction_summary`; the trade-off is bounded duplication in the raw JSONL history
-(`KEEP_TAIL_MAX_BYTES`).
+- **`active_branch()` still short-circuits at compaction.** Pi has one walk; `le-vibe` keeps two so
+  existing UI listings and resume previews don't suddenly grow. `context_entries()` is the pi-exact
+  compaction-aware walk and is what the agent sends to the model. Sessions P0 removed the earlier
+  re-append workaround — the boundary now lives on the compaction entry as `first_kept_entry_id`.
 - **`/compact`, `/handover`, bug reports summarize everything.** They pass `keep_recent_tokens = 0`,
 so manual compaction keeps the previous whole-branch behaviour; only the automatic triggers retain a
 verbatim tail.

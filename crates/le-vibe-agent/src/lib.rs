@@ -1,4 +1,4 @@
-﻿pub mod compact;
+pub mod compact;
 pub mod compress;
 pub mod overflow;
 
@@ -511,13 +511,14 @@ pub fn run_turn_loop_cancellable<B: ProviderPort + PolicyPort + ExtensionPort>(
     )
 }
 
-/// Rebuild the provider message array from the session's active branch.
+/// Rebuild the provider message array from the session's compaction-aware context.
 ///
-/// Called once per prompt and again after every compaction, so compaction cannot leave the request
-/// carrying the pre-compaction history.
+/// Uses `context_entries()` (pi's `buildContextEntries`) rather than `active_branch()` so the tail
+/// a compaction summary keeps verbatim is restored in place. Called once per prompt and again after
+/// every compaction, so a compaction cannot leave the request carrying the pre-compaction history.
 fn build_branch_messages(session: &SessionStore) -> Vec<ChatMessage> {
     let mut messages: Vec<ChatMessage> = Vec::new();
-    for entry in session.active_branch() {
+    for entry in session.context_entries() {
         match entry.kind {
             EntryKind::Message => {
                 messages.push(ChatMessage {
@@ -602,7 +603,9 @@ fn compact_in_loop<B: ProviderPort>(
     before_tokens: u64,
     on_event: &mut dyn FnMut(AgentEvent),
 ) -> Option<Vec<ChatMessage>> {
-    let branch = session.active_branch();
+    // Summarize the compaction-aware context, so a previous compaction's kept tail is included
+    // rather than silently dropped.
+    let branch = session.context_entries();
     let mut options = crate::compact::SummarizeOptions {
         provider: config.provider.clone(),
         model: config.model.clone(),

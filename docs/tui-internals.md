@@ -13,6 +13,9 @@ the agent loop.
 | Preview budget | `render_block_wrapped` | 10 lines (40 expanded); shell tools keep the **last** 5 and say `... (N earlier lines, ctrl+o to expand)`, other tools keep the **first** and say `... (N more lines, ...)` |
 | Status strip | `state::StatusKind` | `Working` / `Retrying (a/max) in Ns... (esc to cancel)` with a live countdown / `Compacting context...` / `Auto-compacting...` / `Context overflow detected, Auto-compacting...` / `Summarizing branch...`; only retries use the warning colour |
 | Footer counters | `draw_footer` | `↑ ↓ R<cacheRead> W<cacheWrite> ↺hit% ⚡t/s $cost ◔ctx`; every zero-valued counter is omitted, and `◔ ?/1.0M (auto)` holds until the next turn reports a prompt size |
+| User turns | `push_user_surface` | Rendered through `markdown.rs` inside the `userMessageBg` surface; ordered markers and backslash escapes stay literal |
+| Generic tool args | `tool_call_header` | Collapsed `name key=JSON ...` cut to 100 chars; expanded puts each `key: value` on its own two-space-indented header row. Deviation: `serde_json` sorts keys, so pairs are alphabetical rather than in the model's argument order |
+| Edit preview | `diff::word_diff` + `edit_diff_rows` | Pre-execution two-row (`-` then `+`) word diff with changed spans reversed; common indentation is excluded from the comparison so a leading insertion cannot swallow it |
 
 `le-vibe-agent` emits `ToolCallStart { args_json }`, `ToolCallEnd { duration_ms }` and
 `Retry { attempt, max_attempts, delay_ms }`; nothing in the agent layer formats them. The status

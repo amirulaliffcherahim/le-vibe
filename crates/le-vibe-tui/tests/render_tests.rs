@@ -333,6 +333,116 @@ fn idle_status_reserves_height() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// P1 parity (markdown user messages / generic arg previews / edit word-diff)
+// ---------------------------------------------------------------------------
+
+/// User turns are rendered as Markdown: ordered markers survive and escaped markup stays literal.
+#[test]
+fn user_message_renders_markdown_with_escapes() {
+    let mut state = base_state();
+    state.blocks.push(TranscriptBlock::User(
+        "1. first ordered item\n2. second ordered item\n\nUse `code` and \\*literal asterisks\\* here".into(),
+    ));
+    let text = render_text(&state, 120, 30).join("\n");
+    assert!(text.contains("1. first ordered item"), "ordered marker lost:\n{text}");
+    assert!(text.contains("2. second ordered item"), "second marker lost:\n{text}");
+    assert!(text.contains("code"), "inline code text lost:\n{text}");
+    assert!(
+        text.contains("*literal asterisks*"),
+        "backslash escapes must stay literal:\n{text}"
+    );
+    assert!(
+        !text.contains("\\*"),
+        "escaping backslashes must be consumed:\n{text}"
+    );
+}
+
+/// Unknown/MCP tools fall back to pi's `name key=json ...` preview, and expand with a hanging indent.
+#[test]
+fn generic_tool_args_preview_and_expanded_indent() {
+    let mut state = base_state();
+    state.blocks.push(TranscriptBlock::Tool(
+        le_vibe_tui::ToolCard::new(
+            "mcp__kofi__post",
+            r#"{"title":"Thanks!","amount":5,"private":true}"#,
+        )
+        .with_status("done")
+        .with_output("ok"),
+    ));
+    let text = render_text(&state, 160, 30).join("\n");
+    // Deviation from pi: `serde_json` sorts object keys, so pairs are alphabetical rather than in
+    // the model's argument order. Still deterministic and single-line, which is what matters here.
+    assert!(
+        text.contains(r#"mcp__kofi__post amount=5 private=true title="Thanks!""#),
+        "generic collapsed arg preview wrong:\n{text}"
+    );
+
+    let mut expanded = base_state();
+    expanded.expand_tools = true;
+    expanded.blocks.push(TranscriptBlock::Tool(
+        le_vibe_tui::ToolCard::new(
+            "mcp__kofi__post",
+            r#"{"title":"Thanks!","amount":5}"#,
+        )
+        .with_status("done")
+        .with_output("ok"),
+    ));
+    let rows = render_text(&expanded, 160, 30);
+    let text = rows.join("\n");
+    assert!(text.contains("title: Thanks!"), "expanded key/value line missing:\n{text}");
+    assert!(text.contains("amount: 5"), "expanded numeric arg missing:\n{text}");
+    // Expanded form puts each arg on its own line, indented two columns under the name.
+    let title_row = rows
+        .iter()
+        .find(|l| l.contains("title: Thanks!"))
+        .expect("title row");
+    assert!(
+        title_row.trim_start().starts_with("title:"),
+        "expanded arg row must be indented under the header: {title_row:?}"
+    );
+}
+
+/// `edit` cards preview the word-level diff before execution, marking only changed words.
+#[test]
+fn edit_card_previews_word_level_diff() {
+    let mut state = base_state();
+    state.blocks.push(TranscriptBlock::Tool(
+        le_vibe_tui::ToolCard::new(
+            "edit",
+            r#"{"path":"src/lib.rs","oldText":"let count = items.len();","newText":"let count = items.iter().count();"}"#,
+        )
+        .with_status("running..."),
+    ));
+    let rows = render_text(&state, 160, 30);
+    let text = rows.join("\n");
+    assert!(text.contains("- let count = items.len();"), "removed line missing:\n{text}");
+    assert!(
+        text.contains("+ let count = items.iter().count();"),
+        "added line missing:\n{text}"
+    );
+
+    // The word diff must isolate `len()` → `iter().count()` rather than reprinting whole lines.
+    let segs = le_vibe_tui::word_diff("let count = items.len();", "let count = items.iter().count();");
+    let removed: String = segs
+        .iter()
+        .filter(|s| s.kind == le_vibe_tui::DiffKind::Removed)
+        .map(|s| s.text.as_str())
+        .collect();
+    let added: String = segs
+        .iter()
+        .filter(|s| s.kind == le_vibe_tui::DiffKind::Added)
+        .map(|s| s.text.as_str())
+        .collect();
+    assert_eq!(removed.trim(), "len()");
+    assert_eq!(added.trim(), "iter().count()");
+    // Unchanged words stay untouched so the changed span is visible against them.
+    assert!(
+        segs.iter().any(|s| s.kind == le_vibe_tui::DiffKind::Equal && s.text.contains("count")),
+        "unchanged words must be preserved: {segs:?}"
+    );
+}
+
 /// pi's `formatToolDuration`: seconds below a minute, then `Xm Ys`, then `Xh Ym Zs`.
 #[test]
 fn tool_duration_format_matches_pi() {

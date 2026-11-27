@@ -1,6 +1,7 @@
 pub mod commands;
 pub mod copy;
 pub mod diagram;
+pub mod diff;
 pub mod editor;
 pub mod export;
 pub mod input;
@@ -18,6 +19,7 @@ pub use commands::{
     filter_slash_commands_with_dynamic,
 };
 pub use copy::{extract_last_code_block, format_chat_html, format_chat_plain};
+pub use diff::{DiffKind, DiffSegment, word_diff};
 pub use diagram::{extract_latest_xml_block, project_xml_diagram};
 pub use editor::wrap_editor_lines;
 pub use export::{export_session_html, export_session_markdown};

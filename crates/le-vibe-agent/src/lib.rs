@@ -1,6 +1,10 @@
+pub mod compact;
 pub mod compress;
+pub mod overflow;
 
+pub use compact::{CutPlan, DEFAULT_KEEP_RECENT_TOKENS, DEFAULT_RESERVE_TOKENS};
 pub use compress::{CompressionStats, OutputStore, compress_tool_output};
+pub use overflow::{estimate_tokens, is_context_overflow, is_context_overflow_text};
 
 use le_vibe_durable::{EntryKind, SessionStore};
 use le_vibe_mcp::McpManager;
@@ -90,12 +94,23 @@ pub struct AgentConfig {
     pub thinking_level: String,
     pub max_turns: usize,
     pub max_retries: usize,
+    /// First retry delay; each later attempt doubles it (pi's `settings.retry.baseDelayMs`).
+    pub base_delay_ms: u64,
+    /// Upper bound for a single retry delay (pi's `settings.retry.maxAgentDelayMs`).
+    pub max_delay_ms: u64,
     pub allowed_tools: Option<Vec<String>>,
     pub mode_name: Option<String>,
     pub codemode: String,
     pub steering_queue: Option<Arc<Mutex<VecDeque<String>>>>,
     pub output_store: Option<Arc<Mutex<OutputStore>>>,
 }
+
+/// Retry budget, matching pi's `settings.retry.maxRetries`.
+pub const DEFAULT_MAX_RETRIES: usize = 3;
+/// First retry delay, matching pi's `settings.retry.baseDelayMs`.
+pub const DEFAULT_BASE_DELAY_MS: u64 = 2_000;
+/// Per-attempt delay ceiling, matching pi's `settings.retry.maxAgentDelayMs`.
+pub const DEFAULT_MAX_DELAY_MS: u64 = 60_000;
 
 impl Default for AgentConfig {
     fn default() -> Self {
@@ -105,7 +120,9 @@ impl Default for AgentConfig {
             system_prompt: None,
             thinking_level: "medium".to_string(),
             max_turns: 40,
-            max_retries: 2,
+            max_retries: DEFAULT_MAX_RETRIES,
+            base_delay_ms: DEFAULT_BASE_DELAY_MS,
+            max_delay_ms: DEFAULT_MAX_DELAY_MS,
             allowed_tools: None,
             mode_name: None,
             codemode: "off".to_string(),
@@ -281,6 +298,30 @@ fn extract_web_queries(args: &Value) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(|s| vec![s.to_string()])
         .unwrap_or_default()
+}
+
+/// Exponential backoff delay for a 1-indexed retry attempt: `min(base * 2^(attempt-1), max)`.
+///
+/// Saturating so a very large attempt can never overflow or panic.
+pub fn retry_delay_ms(base_ms: u64, max_ms: u64, attempt: usize) -> u64 {
+    let shift = attempt.saturating_sub(1).min(32) as u32;
+    let delay = base_ms.saturating_mul(1u64.checked_shl(shift).unwrap_or(u64::MAX));
+    if max_ms == 0 {
+        return delay;
+    }
+    delay.min(max_ms)
+}
+
+/// Sleep for `delay_ms`, waking early (returning `true`) when the turn is cancelled.
+fn sleep_cancellable(cancel: Option<&AtomicBool>, delay_ms: u64) -> bool {
+    let slices = (delay_ms / 50).max(1);
+    for _ in 0..slices {
+        if is_cancelled(cancel) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    is_cancelled(cancel)
 }
 
 fn parse_retry_after_secs(err_text: &str) -> Option<u64> {
@@ -646,28 +687,18 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                         && !is_cancelled(cancel) =>
                 {
                     attempt += 1;
-                    let delay_secs = match attempt {
-                        1 => 1,
-                        2 => 2,
-                        _ => 4,
-                    };
+                    let delay_ms = retry_delay_ms(config.base_delay_ms, config.max_delay_ms, attempt);
                     on_event(AgentEvent::Retry {
                         attempt,
                         max_attempts: config.max_retries,
-                        delay_ms: delay_secs * 1000,
+                        delay_ms,
                     });
-                    for _ in 0..(delay_secs * 20) {
-                        if is_cancelled(cancel) {
-                            telemetry.finish_span(span);
-                            let note = if last_partial_text.trim().is_empty() {
-                                "[Interrupted by user]".to_string()
-                            } else {
-                                format!("{last_partial_text}\n\n[Interrupted by user]")
-                            };
-                            let _ = session.append("assistant", &note);
-                            return Err(AgentError::Cancelled);
-                        }
-                        std::thread::sleep(Duration::from_millis(50));
+                    // A retried attempt must not replay the partial stream it replaces.
+                    last_partial_text.clear();
+                    if sleep_cancellable(cancel, delay_ms) {
+                        telemetry.finish_span(span);
+                        let _ = session.append("assistant", "[Interrupted by user]");
+                        return Err(AgentError::Cancelled);
                     }
                 }
                 Ok(r) if r.content.trim().is_empty() && r.tool_calls.is_empty() => {
@@ -694,29 +725,23 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                         && !is_cancelled(cancel) =>
                 {
                     attempt += 1;
-                    let default_delay = match attempt {
-                        1 => 1,
-                        2 => 3,
-                        _ => 6,
-                    };
-                    let delay_secs = parse_retry_after_secs(&err.to_string()).unwrap_or(default_delay);
+                    // A provider `Retry-After` wins over the exponential schedule.
+                    let delay_ms = parse_retry_after_secs(&err.to_string())
+                        .map(|secs| secs.saturating_mul(1000))
+                        .unwrap_or_else(|| {
+                            retry_delay_ms(config.base_delay_ms, config.max_delay_ms, attempt)
+                        });
                     on_event(AgentEvent::Retry {
                         attempt,
                         max_attempts: config.max_retries,
-                        delay_ms: delay_secs * 1000,
+                        delay_ms,
                     });
-                    for _ in 0..(delay_secs * 20) {
-                        if is_cancelled(cancel) {
-                            telemetry.finish_span(span);
-                            let note = if last_partial_text.trim().is_empty() {
-                                "[Interrupted by user]".to_string()
-                            } else {
-                                format!("{last_partial_text}\n\n[Interrupted by user]")
-                            };
-                            let _ = session.append("assistant", &note);
-                            return Err(AgentError::Cancelled);
-                        }
-                        std::thread::sleep(Duration::from_millis(50));
+                    // The failed attempt is dropped from the projection, as pi durably omits it.
+                    last_partial_text.clear();
+                    if sleep_cancellable(cancel, delay_ms) {
+                        telemetry.finish_span(span);
+                        let _ = session.append("assistant", "[Interrupted by user]");
+                        return Err(AgentError::Cancelled);
                     }
                 }
                 Err(err) => {
@@ -1114,6 +1139,8 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                         thinking_level: config.thinking_level.clone(),
                         max_turns: 12,
                         max_retries: config.max_retries,
+                        base_delay_ms: config.base_delay_ms,
+                        max_delay_ms: config.max_delay_ms,
                         allowed_tools: Some(vec![
                             "read".to_string(),
                             "grep".to_string(),

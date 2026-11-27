@@ -475,7 +475,7 @@ impl TuiState {
             auto_compact: true,
             compact_threshold_pct: 85,
             max_turns: 40,
-            retry_max: 2,
+            retry_max: 3,
             confirm_on_exit: false,
             double_esc_rewind: true,
             config_origins: BTreeMap::new(),

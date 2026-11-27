@@ -1803,6 +1803,8 @@ End with a crisp **Verdict** (`APPROVE` / `REVISE`) and a numbered list of top c
                         thinking_level,
                         max_turns,
                         max_retries: retry_max,
+                        base_delay_ms: le_vibe_agent::DEFAULT_BASE_DELAY_MS,
+                        max_delay_ms: le_vibe_agent::DEFAULT_MAX_DELAY_MS,
                         allowed_tools: mode.allowed_tools(),
                         mode_name: Some(mode.name().to_string()),
                         codemode: codemode_setting.clone(),

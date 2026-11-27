@@ -4,20 +4,65 @@ use ratatui::text::{Line, Span};
 use crate::diagram::project_xml_diagram;
 use crate::theme::ThemePalette;
 
+/// Index of `pat` that is not escaped by a preceding backslash (`\`` stays literal text).
+fn find_unescaped(hay: &str, pat: &str) -> Option<usize> {
+    let mut escaped = false;
+    let mut search_from = 0usize;
+    for (idx, ch) in hay.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if idx < search_from {
+            continue;
+        }
+        if hay[idx..].starts_with(pat) {
+            return Some(idx);
+        }
+        search_from = idx;
+    }
+    None
+}
+
+/// Drop escaping backslashes before Markdown punctuation (`\*` -> `*`).
+fn strip_escapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some(next) if "`*_\\[]()#-.!|>{}+".contains(next) => out.push(next),
+                Some(next) => {
+                    out.push('\\');
+                    out.push(next);
+                }
+                None => out.push('\\'),
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 fn parse_inline_spans(line: &str, base: Style, code_style: Style) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut rest = line;
     while !rest.is_empty() {
-        if let Some(tick) = rest.find('`') {
+        if let Some(tick) = find_unescaped(rest, "`") {
             if tick > 0 {
                 spans.extend(parse_bold_italic(&rest[..tick], base));
             }
             let after = &rest[tick + 1..];
-            if let Some(end_tick) = after.find('`') {
+            if let Some(end_tick) = find_unescaped(after, "`") {
                 spans.push(Span::styled(after[..end_tick].to_string(), code_style));
                 rest = &after[end_tick + 1..];
             } else {
-                spans.push(Span::styled(rest[tick..].to_string(), base));
+                spans.push(Span::styled(strip_escapes(&rest[tick..]), base));
                 break;
             }
         } else {
@@ -35,23 +80,23 @@ fn parse_bold_italic(text: &str, base: Style) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut rest = text;
     while !rest.is_empty() {
-        if let Some(start) = rest.find("**") {
+        if let Some(start) = find_unescaped(rest, "**") {
             if start > 0 {
-                spans.push(Span::styled(rest[..start].to_string(), base));
+                spans.push(Span::styled(strip_escapes(&rest[..start]), base));
             }
             let after = &rest[start + 2..];
-            if let Some(end) = after.find("**") {
+            if let Some(end) = find_unescaped(after, "**") {
                 spans.push(Span::styled(
-                    after[..end].to_string(),
+                    strip_escapes(&after[..end]),
                     base.add_modifier(Modifier::BOLD),
                 ));
                 rest = &after[end + 2..];
             } else {
-                spans.push(Span::styled(rest[start..].to_string(), base));
+                spans.push(Span::styled(strip_escapes(&rest[start..]), base));
                 break;
             }
         } else {
-            spans.push(Span::styled(rest.to_string(), base));
+            spans.push(Span::styled(strip_escapes(rest), base));
             break;
         }
     }

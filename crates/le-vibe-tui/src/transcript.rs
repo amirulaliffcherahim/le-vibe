@@ -13,6 +13,7 @@ use crate::markdown::render_markdown_lines;
 use crate::modal::{draw_at_file_popup, draw_modal, draw_slash_popup};
 use crate::mode::AgentMode;
 use crate::state::{ActiveModal, StatusKind, TranscriptBlock, TuiState, format_tokens};
+use crate::theme::ThemePalette;
 
 pub fn draw_frame(frame: &mut Frame<'_>, state: &TuiState) {
     let area = frame.area();
@@ -346,6 +347,87 @@ fn sanitize_display_line(raw: &str) -> String {
     out
 }
 
+/// Push one wrapped, full-width-padded surface row, keeping per-span styling.
+fn surface_push_row(
+    lines: &mut Vec<Line<'static>>,
+    total_w: usize,
+    inner_w: usize,
+    bg_style: Style,
+    spans: Vec<Span<'static>>,
+) {
+    if spans.iter().all(|s| s.content.is_empty()) {
+        lines.push(Line::from(Span::styled(" ".repeat(total_w), bg_style)).style(bg_style));
+        return;
+    }
+    let plain: String = spans.iter().map(|s| s.content.as_ref()).collect();
+    let clean = sanitize_display_line(&plain);
+    if clean.is_empty() {
+        lines.push(Line::from(Span::styled(" ".repeat(total_w), bg_style)).style(bg_style));
+        return;
+    }
+    // Fast path: single unstyled chunk.
+    if spans.len() == 1 {
+        let mut remaining = clean.as_str();
+        while !remaining.is_empty() {
+            let (chunk, rest) = split_at_width(remaining, inner_w);
+            let pad = total_w.saturating_sub(1 + Span::raw(chunk).width());
+            lines.push(
+                Line::from(vec![
+                    Span::styled(" ", bg_style),
+                    Span::styled(chunk.to_string(), spans[0].style.bg(bg_style.bg.unwrap_or_default())),
+                    Span::styled(" ".repeat(pad), bg_style),
+                ])
+                .style(bg_style),
+            );
+            remaining = rest;
+        }
+        return;
+    }
+    if Span::raw(plain.clone()).width() <= inner_w {
+        let pad = total_w.saturating_sub(1 + Span::raw(clean.clone()).width());
+        let mut row: Vec<Span<'static>> = Vec::with_capacity(spans.len() + 2);
+        row.push(Span::styled(" ", bg_style));
+        row.extend(spans);
+        row.push(Span::styled(" ".repeat(pad), bg_style));
+        lines.push(Line::from(row).style(bg_style));
+        return;
+    }
+    // Overflowing styled row: split by display width, preserving span order.
+    let mut row: Vec<Span<'static>> = vec![Span::styled(" ", bg_style)];
+    let mut used = 0usize;
+    for span in spans {
+        let mut rest = span.content.to_string();
+        while !rest.is_empty() {
+            let avail = inner_w.saturating_sub(used).max(1);
+            let (chunk, tail) = {
+                let (c, t) = split_at_width(&rest, avail);
+                (c.to_string(), t.to_string())
+            };
+            if chunk.is_empty() {
+                break;
+            }
+            used += Span::raw(chunk.clone()).width();
+            row.push(Span::styled(chunk, span.style));
+            rest = tail;
+            if used >= inner_w {
+                let pad = total_w.saturating_sub(1 + used);
+                row.push(Span::styled(" ".repeat(pad), bg_style));
+                lines.push(Line::from(std::mem::replace(
+                    &mut row,
+                    vec![Span::styled(" ", bg_style)],
+                ))
+                .style(bg_style));
+                used = 0;
+            }
+        }
+    }
+    if row.len() > 1 {
+        let pad = total_w.saturating_sub(1 + used);
+        row.push(Span::styled(" ".repeat(pad), bg_style));
+        lines.push(Line::from(row).style(bg_style));
+    }
+}
+
 /// Pi-style full-width borderless tinted surface (zero `▎` noise, zero jagged right edges).
 fn push_pi_surface(
     lines: &mut Vec<Line<'static>>,
@@ -354,6 +436,128 @@ fn push_pi_surface(
     body: &str,
     hidden_count: usize,
     hidden_is_earlier: bool,
+    style: SurfaceStyle,
+) {
+    let body_lines = text_body_rows(body, &style);
+    push_pi_surface_lines(
+        lines,
+        area_width,
+        title,
+        SurfaceBody {
+            header_rows: &[],
+            rows: &body_lines,
+            hidden_count,
+            hidden_is_earlier,
+        },
+        style,
+    );
+}
+
+/// Body content for a tool surface: optional expanded-arg header rows, styled body rows and the
+/// collapsed-line counter used for the `ctrl+o to expand` hint.
+struct SurfaceBody<'a> {
+    header_rows: &'a [String],
+    rows: &'a [Line<'static>],
+    hidden_count: usize,
+    hidden_is_earlier: bool,
+}
+
+/// Colour `+`/`-` prefixed output lines the way pi colours a diff body.
+fn text_body_rows(body: &str, style: &SurfaceStyle) -> Vec<Line<'static>> {
+    body.lines()
+        .map(|raw_line| {
+            let clean = sanitize_display_line(raw_line);
+            let line_style = if clean.starts_with('+') && !clean.starts_with("+++") {
+                Style::default().fg(style.diff_ok).bg(style.bg)
+            } else if clean.starts_with('-') && !clean.starts_with("---") {
+                Style::default().fg(style.diff_err).bg(style.bg)
+            } else {
+                style.body.bg(style.bg)
+            };
+            Line::from(Span::styled(clean, line_style))
+        })
+        .collect()
+}
+
+fn is_edit_tool(name: &str) -> bool {
+    matches!(name, "edit" | "write" | "multiedit" | "apply_patch")
+}
+
+/// Build pi's two-row (`-` then `+`) word-diff preview for an `edit`/`write` tool call.
+fn edit_diff_rows(name: &str, args_json: &str, style: &SurfaceStyle) -> Vec<Line<'static>> {
+    if !is_edit_tool(name) {
+        return Vec::new();
+    }
+    let Ok(args) = serde_json::from_str::<serde_json::Value>(args_json) else {
+        return Vec::new();
+    };
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    if let (Some(old), Some(new)) = (
+        args.get("oldText").and_then(serde_json::Value::as_str),
+        args.get("newText").and_then(serde_json::Value::as_str),
+    ) {
+        pairs.push((old.to_string(), new.to_string()));
+    }
+    if let Some(edits) = args.get("edits").and_then(serde_json::Value::as_array) {
+        for e in edits {
+            if let (Some(old), Some(new)) = (
+                e.get("oldText").and_then(serde_json::Value::as_str),
+                e.get("newText").and_then(serde_json::Value::as_str),
+            ) {
+                pairs.push((old.to_string(), new.to_string()));
+            }
+        }
+    }
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    for (old, new) in pairs.iter().take(4) {
+        let segments = crate::diff::word_diff(old, new);
+        for kind in [crate::diff::DiffKind::Removed, crate::diff::DiffKind::Added] {
+            let mut spans: Vec<Span<'static>> = vec![Span::styled(
+                if kind == crate::diff::DiffKind::Removed {
+                    "- "
+                } else {
+                    "+ "
+                },
+                Style::default().fg(if kind == crate::diff::DiffKind::Removed {
+                    style.diff_err
+                } else {
+                    style.diff_ok
+                }),
+            )];
+            let mut changed = false;
+            for seg in &segments {
+                let highlight = seg.kind == kind;
+                let visible = seg.kind == kind || seg.kind == crate::diff::DiffKind::Equal;
+                if !visible {
+                    continue;
+                }
+                if highlight {
+                    changed = true;
+                }
+                let mut s = Style::default().fg(style.body.fg.unwrap_or(style.title));
+                if highlight {
+                    s = s.add_modifier(Modifier::REVERSED | Modifier::BOLD);
+                }
+                spans.push(Span::styled(seg.text.clone(), s));
+            }
+            if changed {
+                rows.push(Line::from(spans));
+            }
+        }
+    }
+    rows
+}
+
+/// Same surface, but with pre-styled body rows and optional extra header rows (e.g. expanded args).
+fn push_pi_surface_lines(
+    lines: &mut Vec<Line<'static>>,
+    area_width: u16,
+    title: &str,
+    body: SurfaceBody<'_>,
     style: SurfaceStyle,
 ) {
     // Pad to the wrap width (callers reserve 2 columns for the scrollbar) so a surface line never
@@ -384,10 +588,29 @@ fn push_pi_surface(
         .style(bg_style),
     );
 
-    if hidden_count > 0 {
+    // Extra header rows (expanded generic args): two-space hanging indent, muted.
+    for row in body.header_rows {
+        surface_push_row(
+            lines,
+            total_w,
+            inner_w,
+            bg_style,
+            vec![Span::styled(
+                format!("  {row}"),
+                Style::default().fg(style.body.fg.unwrap_or(style.title)).bg(style.bg),
+            )],
+        );
+    }
+
+    if body.hidden_count > 0 {
         let hint = format!(
-            "... ({hidden_count} {} lines, ctrl+o to expand)",
-            if hidden_is_earlier { "earlier" } else { "more" }
+            "... ({} {} lines, ctrl+o to expand)",
+            body.hidden_count,
+            if body.hidden_is_earlier {
+                "earlier"
+            } else {
+                "more"
+            }
         );
         let (hint_fit, _) = split_at_width(&hint, inner_w);
         let pad = total_w.saturating_sub(1 + Span::raw(hint_fit).width());
@@ -401,35 +624,19 @@ fn push_pi_surface(
         );
     }
 
-    if !body.is_empty() {
+    if !body.rows.is_empty() {
         lines.push(Line::from(Span::styled(" ".repeat(total_w), bg_style)).style(bg_style));
-        for raw_line in body.lines() {
-            let clean = sanitize_display_line(raw_line);
-            let line_style = if clean.starts_with('+') && !clean.starts_with("+++") {
-                Style::default().fg(style.diff_ok).bg(style.bg)
-            } else if clean.starts_with('-') && !clean.starts_with("---") {
-                Style::default().fg(style.diff_err).bg(style.bg)
-            } else {
-                style.body.bg(style.bg)
-            };
-            if clean.is_empty() {
-                lines.push(Line::from(Span::styled(" ".repeat(total_w), bg_style)).style(bg_style));
-                continue;
-            }
-            let mut remaining = clean.as_str();
-            while !remaining.is_empty() {
-                let (chunk, rest) = split_at_width(remaining, inner_w);
-                let pad = total_w.saturating_sub(1 + Span::raw(chunk).width());
-                lines.push(
-                    Line::from(vec![
-                        Span::styled(" ", bg_style),
-                        Span::styled(chunk.to_string(), line_style),
-                        Span::styled(" ".repeat(pad), bg_style),
-                    ])
-                    .style(bg_style),
-                );
-                remaining = rest;
-            }
+        for row in body.rows {
+            surface_push_row(
+                lines,
+                total_w,
+                inner_w,
+                bg_style,
+                row.spans
+                    .iter()
+                    .map(|s| Span::styled(s.content.to_string(), s.style.bg(style.bg)))
+                    .collect(),
+            );
         }
     }
 
@@ -443,34 +650,31 @@ fn push_user_surface(
     area_width: u16,
     text: &str,
     bg: Color,
-    fg: Color,
+    pal: &ThemePalette,
 ) {
     let total_w = (area_width as usize).saturating_sub(2).max(20);
     let inner_w = total_w.saturating_sub(2).max(8);
     let bg_style = Style::default().bg(bg);
-    let body_style = Style::default().fg(fg).bg(bg);
 
     lines.push(Line::from(Span::styled(" ".repeat(total_w), bg_style)).style(bg_style));
-    for raw in text.lines() {
-        let clean = sanitize_display_line(raw);
-        if clean.is_empty() {
+    // pi renders user turns as Markdown (ordered markers and backslash escapes preserved), then
+    // tints the whole block with `userMessageBg`.
+    let markdown = render_markdown_lines(text, pal, inner_w as u16, false);
+    for row in wrap_lines_exact(markdown, inner_w) {
+        if row.spans.iter().all(|s| s.content.trim().is_empty()) {
             lines.push(Line::from(Span::styled(" ".repeat(total_w), bg_style)).style(bg_style));
             continue;
         }
-        let mut remaining = clean.as_str();
-        while !remaining.is_empty() {
-            let (chunk, rest) = split_at_width(remaining, inner_w);
-            let pad = total_w.saturating_sub(1 + Span::raw(chunk).width());
-            lines.push(
-                Line::from(vec![
-                    Span::styled(" ", bg_style),
-                    Span::styled(chunk.to_string(), body_style),
-                    Span::styled(" ".repeat(pad), bg_style),
-                ])
-                .style(bg_style),
-            );
-            remaining = rest;
-        }
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(row.spans.len() + 2);
+        spans.push(Span::styled(" ", bg_style));
+        spans.extend(
+            row.spans
+                .into_iter()
+                .map(|s| Span::styled(s.content.to_string(), s.style.bg(bg))),
+        );
+        let used: usize = spans.iter().map(|s| Span::raw(s.content.to_string()).width()).sum();
+        spans.push(Span::styled(" ".repeat(total_w.saturating_sub(used)), bg_style));
+        lines.push(Line::from(spans).style(bg_style));
     }
     lines.push(Line::from(Span::styled(" ".repeat(total_w), bg_style)).style(bg_style));
 }
@@ -551,7 +755,7 @@ fn render_block_wrapped(
                 area_width,
                 text,
                 state.theme.user_surface(),
-                pal.fg,
+                &pal,
             );
         }
         TranscriptBlock::Thinking(text) => {
@@ -635,26 +839,47 @@ fn render_block_wrapped(
                 (slice, hidden)
             };
             let tail_slice = is_shell_tool(&card.name);
-            push_pi_surface(
+            let style = SurfaceStyle {
+                title: if is_err { pal.error } else { pal.fg },
+                bg: if is_err {
+                    pal.card_err_bg
+                } else if is_running {
+                    pal.card_quiet_bg
+                } else {
+                    pal.card_ok_bg
+                },
+                body: Style::default().fg(pal.muted),
+                diff_ok: pal.success,
+                diff_err: pal.error,
+            };
+            // pi previews edits before they run: word-level diff with the changed spans inverted.
+            let diff_rows = edit_diff_rows(&card.name, &card.args_json, &style);
+            let has_diff = !diff_rows.is_empty();
+            let mut body = if diff_rows.is_empty() {
+                text_body_rows(&preview, &style)
+            } else {
+                diff_rows
+            };
+            if has_diff && state.expand_tools && !preview.is_empty() {
+                body.push(Line::from(""));
+                for raw in preview.lines() {
+                    body.push(Line::from(Span::styled(
+                        sanitize_display_line(raw),
+                        style.body.bg(style.bg),
+                    )));
+                }
+            }
+            push_pi_surface_lines(
                 &mut lines,
                 area_width,
                 &title,
-                &preview,
-                hidden,
-                tail_slice,
-                SurfaceStyle {
-                    title: if is_err { pal.error } else { pal.fg },
-                    bg: if is_err {
-                        pal.card_err_bg
-                    } else if is_running {
-                        pal.card_quiet_bg
-                    } else {
-                        pal.card_ok_bg
-                    },
-                    body: Style::default().fg(pal.muted),
-                    diff_ok: pal.success,
-                    diff_err: pal.error,
+                SurfaceBody {
+                    header_rows: &header.args_lines,
+                    rows: &body,
+                    hidden_count: hidden,
+                    hidden_is_earlier: tail_slice,
                 },
+                style,
             );
         }
         TranscriptBlock::Script {
@@ -1017,9 +1242,14 @@ fn is_shell_tool(name: &str) -> bool {
     matches!(name, "bash" | "powershell" | "shell" | "exec")
 }
 
+/// pi's `COLLAPSED_ARGS_CHARS`: how much of the `key=json` preview fits on the title line.
+const COLLAPSED_ARGS_CHARS: usize = 100;
+
 /// A rendered tool header plus whether its body should stay collapsed.
 pub struct ToolHeader {
     pub title: String,
+    /// Extra header rows (pi's expanded `key: value` arg list).
+    pub args_lines: Vec<String>,
     /// pi collapses `SKILL.md` / resource reads to a single header line.
     pub suppress_body: bool,
 }
@@ -1068,6 +1298,7 @@ pub fn format_read_line_range(offset: Option<u64>, limit: Option<u64>) -> String
 pub fn tool_call_header(name: &str, args_json: &str, expanded: bool) -> ToolHeader {
     let plain = |title: String| ToolHeader {
         title,
+        args_lines: Vec::new(),
         suppress_body: false,
     };
     let args: serde_json::Value =
@@ -1088,6 +1319,7 @@ pub fn tool_call_header(name: &str, args_json: &str, expanded: bool) -> ToolHead
                 if base.eq_ignore_ascii_case("SKILL.md") {
                     return ToolHeader {
                         title: format!("[skill] {}{range}{hint}", file_parent(path)),
+                        args_lines: Vec::new(),
                         suppress_body: true,
                     };
                 }
@@ -1097,6 +1329,7 @@ pub fn tool_call_header(name: &str, args_json: &str, expanded: bool) -> ToolHead
                 ) {
                     return ToolHeader {
                         title: format!("read resource {path}{range}{hint}"),
+                        args_lines: Vec::new(),
                         suppress_body: true,
                     };
                 }
@@ -1163,26 +1396,34 @@ pub fn tool_call_header(name: &str, args_json: &str, expanded: bool) -> ToolHead
                 return plain(name.to_string());
             }
             if expanded {
-                let mut title = name.to_string();
-                for (k, v) in obj {
-                    let text = match v {
-                        serde_json::Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    };
-                    title.push_str(&format!("\n  {k}: {}", text.replace('\n', "\n    ")));
-                }
+                // pi: expanded shows one `key: value` row per argument, strings unquoted.
+                let args_lines: Vec<String> = obj
+                    .iter()
+                    .map(|(k, v)| {
+                        let text = match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        format!("{k}: {}", text.replace('\n', "\n    "))
+                    })
+                    .collect();
                 ToolHeader {
-                    title,
+                    title: name.to_string(),
+                    args_lines,
                     suppress_body: false,
                 }
             } else {
+                // pi: collapsed is `title key=JSON key=JSON`, cut to COLLAPSED_ARGS_CHARS.
                 let pairs: String = obj
                     .iter()
-                    .map(|(k, v)| format!("{k}={v}"))
+                    .map(|(k, v)| {
+                        let json = serde_json::to_string(v).unwrap_or_else(|_| v.to_string());
+                        format!("{k}={json}")
+                    })
                     .collect::<Vec<_>>()
                     .join(" ");
-                let shown: String = if pairs.chars().count() > 60 {
-                    let mut s: String = pairs.chars().take(57).collect();
+                let shown: String = if pairs.chars().count() > COLLAPSED_ARGS_CHARS {
+                    let mut s: String = pairs.chars().take(COLLAPSED_ARGS_CHARS - 3).collect();
                     s.push_str("...");
                     s
                 } else {

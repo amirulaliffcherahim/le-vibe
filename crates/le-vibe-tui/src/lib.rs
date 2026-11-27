@@ -36,7 +36,7 @@ pub use probe::{ProbeFrame, key_from_spec, press, render_frame, render_frame_tex
 pub use state::{
     ActiveModal, CompactionReason, FrameBuffer, ProviderUsageStats, QuestionItem, QuestionOption,
     QuestionSession, SPINNER_FRAMES, StatusKind, TerminalGuard, ToolCard, TranscriptBlock,
-    TuiAction, TuiState, format_tokens, render_status_bar,
+    TreeAction, TuiAction, TuiState, format_tokens, render_status_bar,
 };
 pub use theme::{ALL_THEMES, ThemeId, ThemePalette};
 pub use transcript::{

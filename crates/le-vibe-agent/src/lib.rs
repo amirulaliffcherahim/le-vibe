@@ -584,7 +584,7 @@ fn build_branch_messages(session: &SessionStore) -> Vec<ChatMessage> {
                     name: entry.tool_name,
                 });
             }
-            EntryKind::ModelChange | EntryKind::ModeChange | EntryKind::SessionMeta => {}
+            EntryKind::ModelChange | EntryKind::ModeChange | EntryKind::SessionMeta | EntryKind::Label => {}
         }
     }
     messages

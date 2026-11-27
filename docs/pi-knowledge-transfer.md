@@ -69,6 +69,17 @@ All context-lifecycle logic lives in `le-vibe-agent`; `main.rs`/`worker.rs` only
 | Summarizer | `compact::summarize` (in `le-vibe-agent`) with the same retry policy; used by the loop, `/compact`, `/handover`, and bug reports. |
 | Events | `AgentEvent::Compaction { reason, summarized, kept, before_tokens }` → CLI maps `reason` onto `CompactionReason`; `TurnStart` clears the status strip. |
 
+## 7. Sessions Parity (P0–P1, complete)
+
+| Item | Rule |
+| --- | --- |
+| Compaction boundary | `first_kept_entry_id` + `tokens_before` on the compaction entry; `context_entries()` = pi's `buildContextEntries` (summary once, then the kept window, then everything after). |
+| Branch summaries | `branch_with_summary(from_id, summary)` stores pi's `fromId` (the abandoned leaf); rewind summarizes the abandoned path, tree navigation does not. |
+| Labels | `EntryKind::Label` with `target_id`; last write wins, empty content clears. Labels never move the active leaf. |
+| Tree | `tree_nodes()` (nested, active flags, state-only entries re-parented) and `tree_rows()` (connectors + labels) live in `le-vibe-durable`; the CLI renders. |
+| Fork | `/fork` and `/clone` both route to `fork_from`, writing a new session file and leaving the original alone. |
+| Legacy files | The three new fields are `Option` with `serde(default)`; pre-P0 JSONL loads unchanged and normal entries serialise without them. |
+
 ### Intentional deviations
 - **OSC 133 is dormant.** Pi renders inline, so its prompt zones sit in scrollback. `le-vibe` draws an
 alternate buffer, which has no scrollback, so the marks would be invisible. Writing escape bytes into
@@ -88,6 +99,12 @@ answer keeps the existing truncated-tool-call guidance instead.
   existing UI listings and resume previews don't suddenly grow. `context_entries()` is the pi-exact
   compaction-aware walk and is what the agent sends to the model. Sessions P0 removed the earlier
   re-append workaround — the boundary now lives on the compaction entry as `first_kept_entry_id`.
+- **Tree flattening lives in `le-vibe-durable`, not the UI.** Pi's `tree-selector.ts` builds the
+  connector rows in the component; `le-vibe` has no session-aware UI crate, so `tree_rows()` owns the
+  projection and the CLI only decorates it. It keeps ~86 lines of graph walking out of `worker.rs`.
+- **Label clearing is an empty label entry.** Pi stores `label: undefined` in JSON; `le-vibe` stores
+  an empty `content` string, because `SessionEntry.content` is non-optional. Same last-write-wins
+  resolution.
 - **`/compact`, `/handover`, bug reports summarize everything.** They pass `keep_recent_tokens = 0`,
 so manual compaction keeps the previous whole-branch behaviour; only the automatic triggers retain a
 verbatim tail.

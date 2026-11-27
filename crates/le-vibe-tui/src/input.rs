@@ -182,6 +182,7 @@ fn modal_len(state: &TuiState) -> usize {
         ActiveModal::ThemePicker => ALL_THEMES.len(),
         ActiveModal::ExportPicker => 2,
         ActiveModal::RewindPicker => state.rewind_rows.len().max(1),
+        ActiveModal::TreePicker => state.tree_rows.len().max(1),
         ActiveModal::SessionPicker => state.filtered_session_rows().len().max(1),
         ActiveModal::ApprovalModal => 4,
         ActiveModal::TrustModal => 2,
@@ -758,6 +759,14 @@ pub fn handle_key_event(state: &mut TuiState, key: crossterm::event::KeyEvent) -
                     ActiveModal::RewindPicker => {
                         if let Some((id, _, _)) = state.rewind_rows.get(idx) {
                             return Ok(TuiAction::Submit(format!("/rewind {id}")));
+                        }
+                    }
+                    ActiveModal::TreePicker => {
+                        if let Some((id, _, _)) = state.tree_rows.get(idx) {
+                            return Ok(TuiAction::Submit(format!(
+                                "{} {id}",
+                                state.tree_action.command()
+                            )));
                         }
                     }
                     ActiveModal::SessionPicker => {

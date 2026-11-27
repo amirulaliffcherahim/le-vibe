@@ -471,3 +471,85 @@ fn recoverable_length_stop_triggers_overflow_recovery() {
         "length-stop recovery must report an overflow compaction, got {events:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 4. Branch summarization (rewind keeps the abandoned path's context)
+// ---------------------------------------------------------------------------
+
+/// Regression: `keep_recent_tokens = u64::MAX` means "summarize everything". It previously
+/// produced an empty head, so `/compact`, `/handover` and branch summaries sent no transcript.
+#[test]
+fn summarize_all_sends_the_whole_branch() {
+    let mut session = SessionStore::in_memory();
+    seed_history(&mut session, 3, 200);
+    let branch = session.context_entries();
+
+    let mut bridge = ScriptedBridge::new(vec![Step::Reply {
+        text: "ALL".into(),
+        input_tokens: 10,
+    }]);
+    let mut options = compact::SummarizeOptions {
+        provider: "vibe".into(),
+        model: "test-model".into(),
+        instruction: "summarize".into(),
+        keep_recent_tokens: compact::SUMMARIZE_ALL,
+        max_retries: 1,
+        base_delay_ms: 1,
+        max_delay_ms: 2,
+        cancel: None,
+        on_retry: &mut |_, _, _| {},
+    };
+    let plan = compact::summarize(&mut bridge, &branch, &mut options).expect("summarize");
+
+    assert_eq!(plan.kept, 0, "everything is summarized");
+    assert_eq!(plan.summarized, branch.len());
+    let sent = &bridge.requests[0].messages[0].content;
+    assert!(sent.contains("entry0"), "oldest head missing:
+{sent}");
+    assert!(
+        sent.contains("reply2"),
+        "newest entry missing from a whole-branch summary:
+{sent}"
+    );
+}
+
+
+#[test]
+fn summarize_and_branch_records_the_abandoned_path() {
+    let mut session = SessionStore::in_memory();
+    let root = session.append("user", "root goal").unwrap();
+    session.append("assistant", "abandoned work").unwrap();
+
+    let mut bridge = ScriptedBridge::new(vec![Step::Reply {
+        text: "BRANCH_SUMMARY".into(),
+        input_tokens: 10,
+    }]);
+
+    let mut options = compact::SummarizeOptions {
+        provider: "vibe".into(),
+        model: "test-model".into(),
+        instruction: "summarize".into(),
+        keep_recent_tokens: 0,
+        max_retries: 1,
+        base_delay_ms: 1,
+        max_delay_ms: 2,
+        cancel: None,
+        on_retry: &mut |_, _, _| {},
+    };
+    let entry = compact::summarize_and_branch(&mut bridge, &mut session, Some(root.id.as_str()), &mut options)
+        .expect("branch summarization");
+
+    assert_eq!(entry.kind, EntryKind::BranchSummary);
+    assert_eq!(entry.content, "BRANCH_SUMMARY");
+    assert_eq!(entry.parent_id.as_deref(), Some(root.id.as_str()));
+    assert_eq!(entry.from_id.as_deref(), Some("msg_2"), "abandoned leaf recorded");
+
+    // Context continues from the summary, and the summarizer saw the abandoned path.
+    let ctx = session.context_entries();
+    assert_eq!(ctx.last().unwrap().content, "BRANCH_SUMMARY");
+    let sent = &bridge.requests[0].messages[0].content;
+    assert!(
+        sent.contains("abandoned work"),
+        "summarizer must see the abandoned path:\n{sent}"
+    );
+}

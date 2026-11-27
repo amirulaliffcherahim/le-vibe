@@ -11,7 +11,7 @@
 //! Summarization also lives here instead of in the CLI: the summarizer call retries with the same
 //! backoff as a normal turn, and keeping both in one crate means a single retry policy.
 
-use le_vibe_durable::{EntryKind, SessionError, SessionEntry, SessionStore};
+use le_vibe_durable::{EntryKind, SessionEntry, SessionError, SessionStore};
 use le_vibe_pybridge::{BridgeError, ChatMessage, CompletionRequest, ProviderPort};
 use std::sync::atomic::AtomicBool;
 
@@ -29,6 +29,12 @@ pub const DEFAULT_RESERVE_TOKENS: u64 = 16_384;
 
 /// Approximate number of newest tokens that survive summarization verbatim.
 pub const DEFAULT_KEEP_RECENT_TOKENS: u64 = 20_000;
+
+/// `keep_recent_tokens` value meaning "summarize the whole branch".
+///
+/// Used by manual `/compact`, `/handover`, and branch summaries. It is *not* the same as a branch
+/// that simply fits its budget (which keeps everything and summarizes nothing).
+pub const SUMMARIZE_ALL: u64 = u64::MAX;
 
 /// Whether the context is close enough to the window to compact.
 ///
@@ -146,7 +152,7 @@ pub fn serialize_branch(entries: &[SessionEntry]) -> String {
                     preview
                 ));
             }
-            EntryKind::ModelChange | EntryKind::ModeChange | EntryKind::SessionMeta => {}
+            EntryKind::ModelChange | EntryKind::ModeChange | EntryKind::SessionMeta | EntryKind::Label => {}
         }
     }
     out
@@ -169,7 +175,18 @@ pub fn summarize<B: ProviderPort>(
         .map(|e| estimate_tokens(&e.content) + 8)
         .collect();
     let before_tokens: u64 = entry_tokens.iter().sum();
-    let cut = plan_cut(&entry_tokens, opts.keep_recent_tokens);
+    // `SUMMARIZE_ALL` is *not* `plan_cut`'s "everything fits, so keep it all" — conflating them
+    // sent an empty transcript to the summarizer.
+    let cut = if opts.keep_recent_tokens == SUMMARIZE_ALL {
+        CutPlan {
+            keep_from: branch.len(),
+            summarized: branch.len(),
+            kept: 0,
+            kept_tokens: 0,
+        }
+    } else {
+        plan_cut(&entry_tokens, opts.keep_recent_tokens)
+    };
     let transcript = serialize_branch(&branch[..cut.keep_from]);
 
     let request = CompletionRequest {
@@ -247,6 +264,88 @@ fn is_retryable(err: &BridgeError) -> bool {
     ]
     .iter()
     .any(|needle| text.contains(needle))
+}
+
+/// Summarize the whole branch with the workspace defaults (pi's retry budget).
+///
+/// Keeps `SummarizeOptions` boilerplate out of the CLI: every manual summary path (`/compact`,
+/// `/handover`, bug reports, branch summaries) means "summarize everything".
+pub fn summarize_all<B: ProviderPort>(
+    bridge: &mut B,
+    branch: &[SessionEntry],
+    provider: &str,
+    model: &str,
+    instruction: &str,
+    cancel: Option<&AtomicBool>,
+    on_retry: &mut dyn FnMut(usize, usize, u64),
+) -> Result<SummaryPlan, String> {
+    let mut options = SummarizeOptions {
+        provider: provider.to_string(),
+        model: model.to_string(),
+        instruction: instruction.to_string(),
+        keep_recent_tokens: SUMMARIZE_ALL,
+        max_retries: crate::DEFAULT_MAX_RETRIES,
+        base_delay_ms: crate::DEFAULT_BASE_DELAY_MS,
+        max_delay_ms: crate::DEFAULT_MAX_DELAY_MS,
+        cancel,
+        on_retry,
+    };
+    summarize(bridge, branch, &mut options)
+}
+
+/// Rewind-style branch summary with the workspace defaults.
+pub fn branch_summary<B: ProviderPort>(
+    bridge: &mut B,
+    session: &mut SessionStore,
+    target: Option<&str>,
+    provider: &str,
+    model: &str,
+    cancel: Option<&AtomicBool>,
+    on_retry: &mut dyn FnMut(usize, usize, u64),
+) -> Result<SessionEntry, String> {
+    let mut options = SummarizeOptions {
+        provider: provider.to_string(),
+        model: model.to_string(),
+        instruction: DEFAULT_INSTRUCTION.to_string(),
+        keep_recent_tokens: SUMMARIZE_ALL,
+        max_retries: crate::DEFAULT_MAX_RETRIES,
+        base_delay_ms: crate::DEFAULT_BASE_DELAY_MS,
+        max_delay_ms: crate::DEFAULT_MAX_DELAY_MS,
+        cancel,
+        on_retry,
+    };
+    summarize_and_branch(bridge, session, target, &mut options)
+}
+
+/// Summarize the path being abandoned, then branch to `target` recording that summary.
+///
+/// This is pi's `branchWithSummary`: the abandoned conversation survives only as a
+/// `branch_summary` entry, so switching direction keeps the context that led there without
+/// replaying it turn by turn. Used by rewind (never by `/tree` navigation, which must be instant).
+pub fn summarize_and_branch<B: ProviderPort>(
+    bridge: &mut B,
+    session: &mut SessionStore,
+    target: Option<&str>,
+    opts: &mut SummarizeOptions<'_>,
+) -> Result<SessionEntry, String> {
+    let abandoned = session.context_entries();
+    if abandoned.is_empty() {
+        // Nothing to summarize: just move the pointer, matching pi's `branch()`.
+        match target {
+            Some(id) => session.branch_from(id).map_err(|e| e.to_string())?,
+            None => session.reset_leaf(),
+        }
+        return session
+            .append_branch_summary("(empty branch)")
+            .map_err(|e| e.to_string());
+    }
+    // A branch summary must cover the whole abandoned path: `keep_recent` only makes sense for
+    // compaction, where the kept tail stays in context anyway.
+    opts.keep_recent_tokens = SUMMARIZE_ALL;
+    let plan = summarize(bridge, &abandoned, opts)?;
+    session
+        .branch_with_summary(target, plan.summary)
+        .map_err(|e| e.to_string())
 }
 
 /// Persist a summary with pi's `firstKeptEntryId` boundary.

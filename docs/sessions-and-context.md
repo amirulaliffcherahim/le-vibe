@@ -52,8 +52,29 @@ All three triggers live in the agent loop; the CLI only forwards `context_window
 | `active_branch()` | Leaf→root, stops at the newest `compaction_summary`. Kept for compatibility (UI listings, resume previews). |
 | `context_entries()` | pi's `buildContextEntries`: emits the newest compaction once, then the entries from `first_kept_entry_id` onward (pre-boundary `role == "system"` messages dropped), then everything after it. This is what the agent sends to the model. |
 
-Branch summaries are written with `SessionStore::branch_with_summary(from_id, summary)`, which stores
-pi's `fromId` — the leaf that was abandoned when branching.
+### Session tree, labels, and branching (Sessions P0–P1)
+
+All DAG/tree/label logic lives in `le-vibe-durable`; the CLI only renders rows.
+
+| API | Behaviour |
+| --- | --- |
+| `tree_nodes()` | Nested `SessionTreeNode { entry, children, label, active }`. State-only entries (`tool_call`, `tool_result`, `model_change`, `label`, …) are skipped and their children re-parented to the nearest visible ancestor, so a tool round-trip never creates a dangling branch. `active` marks the leaf's ancestry. |
+| `tree_rows()` | The DAG→list projection: `├─`/`└─` connectors, `*` for the active path, resolved labels (`· label`), 64-char preview. `worker.rs::ListTreeNodes` is now a 13-line call to it (was ~99 lines of graph walking). |
+| `set_label(id, Some("x"))` | Appends an `EntryKind::Label` entry with `target_id`; **does not move the leaf**. `set_label(id, None)` appends an empty label, which clears it (pi's `LabelEntry { label: undefined }`). `label_for(id)` resolves last-write-wins. |
+| `branch_with_summary(from_id, summary)` | Branch to `from_id` (`None` = fresh root) and record the abandoned leaf in `from_id`. |
+| `fork_from(id, dest)` | New session file containing only root→id. |
+
+#### Dynamic vs static navigation
+
+| Command | Cost | Behaviour |
+| --- | --- | --- |
+| `/tree` → select | instant | `SwitchBranch`: moves the leaf, **no summarizer call**. |
+| `/rewind` → select | one summarizer call | `compact::branch_summary` summarizes the abandoned path into a `branch_summary` entry, using the same retry policy as a turn; on failure it falls back to a plain switch and says so. |
+| `/fork` or `/clone` → select | file copy | `fork_from` writes a new session file; the original is untouched. |
+
+`compact::SUMMARIZE_ALL` is the explicit "summarize the whole branch" sentinel. It is **not** the
+same as a branch that fits its budget (`plan_cut` keeps everything and summarizes nothing) —
+conflating the two sent an empty transcript to the summarizer.
 - **Summarizer** (`compact::summarize`) — moved out of the CLI so it shares one retry policy with
   normal turns; `/compact`, `/handover`, and bug-report generation all call it.
 

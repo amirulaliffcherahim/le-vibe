@@ -74,6 +74,10 @@ fn renders_all_modals_at_minimum_and_desktop_sizes() {
         vec![("A".into(), "First".into()), ("B".into(), "Second".into())],
     ));
     state.rewind_rows = vec![("msg_1".into(), "#1 user".into(), "hello".into())];
+    state.tree_rows = vec![
+        ("msg_1".into(), "  user".into(), "hello".into()),
+        ("msg_2".into(), "└─ * assistant".into(), "world".into()),
+    ];
     state.session_rows = vec![("session-1.jsonl".into(), "1 entry".into(), "hello".into())];
     state.changelog_lines = vec!["# Changelog".into(), "- v0.1.0".into()];
 
@@ -91,6 +95,7 @@ fn renders_all_modals_at_minimum_and_desktop_sizes() {
         ActiveModal::QuestionModal,
         ActiveModal::ExportPicker,
         ActiveModal::RewindPicker,
+        ActiveModal::TreePicker,
         ActiveModal::SessionPicker,
         ActiveModal::HelpModal,
         ActiveModal::ChangelogModal,

@@ -1018,6 +1018,12 @@ fn run_interactive_tui(
                     state.modal_idx = state.rewind_rows.len().saturating_sub(1);
                     state.modal = ActiveModal::RewindPicker;
                 }
+                WorkerMsg::TreeLoaded { rows, action } => {
+                    state.tree_rows = rows;
+                    state.tree_action = action;
+                    state.modal_idx = 0;
+                    state.modal = ActiveModal::TreePicker;
+                }
                 WorkerMsg::SessionsLoaded(rows) => {
                     state.session_rows = rows;
                     state.modal_filter.clear();
@@ -1822,7 +1828,27 @@ fn run_interactive_tui(
                     continue;
                 }
                 if input == "/tree" {
-                    let _ = cmd_tx.send(WorkerCmd::ListTreeNodes);
+                    let _ = cmd_tx.send(WorkerCmd::ListTreeNodes {
+                        action: le_vibe_tui::TreeAction::Switch,
+                    });
+                    continue;
+                }
+                if input == "/fork" || input == "/clone" {
+                    let _ = cmd_tx.send(WorkerCmd::ListTreeNodes {
+                        action: le_vibe_tui::TreeAction::Fork,
+                    });
+                    continue;
+                }
+                if let Some(arg) = input.strip_prefix("/fork ") {
+                    let target = arg.trim();
+                    if !target.is_empty() {
+                        let _ = cmd_tx.send(WorkerCmd::ForkTo(target.to_string()));
+                    }
+                    continue;
+                }
+                if let Some(arg) = input.strip_prefix("/tree-switch ") {
+                    // Tree navigation is instant: move the branch, no summarizer call.
+                    let _ = cmd_tx.send(WorkerCmd::SwitchBranch(arg.trim().to_string()));
                     continue;
                 }
                 if input == "/rewind" {
@@ -1832,7 +1858,11 @@ fn run_interactive_tui(
                 if let Some(arg) = input.strip_prefix("/rewind ") {
                     let id = arg.trim();
                     if id != "(empty)" && !id.is_empty() {
-                        let _ = cmd_tx.send(WorkerCmd::RewindTo(id.to_string()));
+                        let _ = cmd_tx.send(WorkerCmd::RewindTo {
+                            id: id.to_string(),
+                            provider: state.provider.clone(),
+                            model: state.model.clone(),
+                        });
                     }
                     continue;
                 }
@@ -1875,10 +1905,6 @@ fn run_interactive_tui(
                         context_window: state.context_window,
                         last_input_tokens: state.input_tokens,
                     });
-                    continue;
-                }
-                if input == "/clone" {
-                    let _ = cmd_tx.send(WorkerCmd::CloneSession);
                     continue;
                 }
                 if input == "/handover" {

@@ -286,3 +286,110 @@ fn convenient_open_helper_keeps_path_semantics() {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = Path::new("");
 }
+
+// ---------------------------------------------------------------------------
+// 5. P1: tree projection + labels
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tree_nodes_build_nested_children_and_mark_the_active_path() {
+    let mut store = SessionStore::in_memory();
+    let root = store.append("user", "root").unwrap();
+    let left = store.append("assistant", "left").unwrap();
+    store.branch_from(&root.id).unwrap();
+    let right = store.append("assistant", "right").unwrap();
+
+    let tree = store.tree_nodes();
+    assert_eq!(tree.len(), 1, "one root");
+    assert_eq!(tree[0].entry.id, root.id);
+    let kids: Vec<&str> = tree[0].children.iter().map(|c| c.entry.content.as_str()).collect();
+    assert_eq!(kids, vec!["left", "right"], "both branches are children");
+
+    // Only the active leaf's ancestry is marked.
+    assert!(tree[0].active, "root is on the active path");
+    assert!(
+        !tree[0].children[0].active,
+        "abandoned branch is not active"
+    );
+    assert!(tree[0].children[1].active, "right is the active leaf");
+    let _ = (left, right);
+}
+
+#[test]
+fn tree_rows_flatten_with_connectors_and_resolved_labels() {
+    let mut store = SessionStore::in_memory();
+    let root = store.append("user", "root").unwrap();
+    store.append("assistant", "only-child").unwrap();
+    store.branch_from(&root.id).unwrap();
+    store.append("assistant", "second-branch").unwrap();
+    store.set_label(&root.id, Some("start")).unwrap();
+
+    let rows = store.tree_rows();
+    let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
+    assert!(labels[0].contains("start"), "root label resolved: {labels:?}");
+    assert!(
+        rows.iter().any(|r| r.label.contains("├─") || r.label.contains("└─")),
+        "branch connectors expected: {labels:?}"
+    );
+    // Deterministic order: a single root walks every descendant exactly once.
+    assert_eq!(rows.len(), 3, "rows: {labels:?}");
+    assert_eq!(rows.iter().filter(|r| r.active).count(), 2, "active chain is root+second-branch");
+}
+
+#[test]
+fn labels_resolve_to_the_latest_entry_and_can_be_cleared() {
+    let mut store = SessionStore::in_memory();
+    let node = store.append("user", "hello").unwrap();
+
+    assert_eq!(store.label_for(&node.id), None);
+    store.set_label(&node.id, Some("first")).unwrap();
+    assert_eq!(store.label_for(&node.id).as_deref(), Some("first"));
+    store.set_label(&node.id, Some("second")).unwrap();
+    assert_eq!(store.label_for(&node.id).as_deref(), Some("second"));
+    // pi stores a label entry with no label to clear it.
+    store.set_label(&node.id, None).unwrap();
+    assert_eq!(store.label_for(&node.id), None);
+
+    // Label entries never appear as tree nodes themselves.
+    assert_eq!(store.tree_nodes()[0].children.len(), 0);
+}
+
+#[test]
+fn labels_and_tree_survive_a_disk_reload() {
+    let dir = temp_dir("labels_reload");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("s.jsonl");
+    let root_id = {
+        let mut store = SessionStore::open(&path).unwrap();
+        let root = store.append("user", "root").unwrap();
+        store.append("assistant", "child").unwrap();
+        store.set_label(&root.id, Some("kickoff")).unwrap();
+        root.id
+    };
+
+    let reloaded = SessionStore::open(&path).unwrap();
+    assert_eq!(reloaded.label_for(&root_id).as_deref(), Some("kickoff"));
+    let tree = reloaded.tree_nodes();
+    assert_eq!(tree[0].label.as_deref(), Some("kickoff"));
+    assert_eq!(tree[0].children.len(), 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn tree_nodes_skips_state_only_entries_but_keeps_their_children() {
+    let mut store = SessionStore::in_memory();
+    let root = store.append("user", "root").unwrap();
+    store.append_tool_call("tc_1", "read", r#"{"path":"a.rs"}"#).unwrap();
+    store.append_tool_result("tc_1", "read", "1: fn main()").unwrap();
+    let reply = store.append("assistant", "done").unwrap();
+
+    let tree = store.tree_nodes();
+    // The tool call/result sit between root and reply but must not become tree nodes.
+    assert_eq!(tree[0].entry.id, root.id);
+    assert_eq!(tree[0].children.len(), 1);
+    assert_eq!(tree[0].children[0].entry.id, reply.id);
+
+    // ...and the tool result entry is still reachable through the DAG.
+    assert!(store.entries().iter().any(|e| e.kind == EntryKind::ToolResult));
+}

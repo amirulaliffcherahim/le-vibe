@@ -27,6 +27,8 @@ pub enum EntryKind {
     ToolResult,
     BranchSummary,
     SessionMeta,
+    /// pi's `label` entry: `target_id` + `content` (empty content clears the label).
+    Label,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -53,6 +55,30 @@ pub struct SessionEntry {
     /// pi's `fromId` on a branch summary: the leaf that was abandoned when branching.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_id: Option<String>,
+    /// pi's `targetId` on a label entry: the entry the label belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<String>,
+}
+
+/// One node of the session tree (pi's `SessionTreeNode`), plus whether it is on the active path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionTreeNode {
+    pub entry: SessionEntry,
+    pub children: Vec<SessionTreeNode>,
+    /// Last label written for this entry, if any.
+    pub label: Option<String>,
+    /// True when this node is on the active leaf's ancestry.
+    pub active: bool,
+}
+
+/// A flattened tree row ready for a picker: stable id, decorated label, preview.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeRow {
+    pub id: String,
+    /// Connector + indentation + role + resolved label, e.g. `├─ assistant · kickoff`.
+    pub label: String,
+    pub preview: String,
+    pub active: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +105,7 @@ struct EntryMetadata {
     first_kept_entry_id: Option<String>,
     tokens_before: Option<u64>,
     from_id: Option<String>,
+    target_id: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -154,6 +181,7 @@ impl SessionStore {
             first_kept_entry_id: None,
             tokens_before: None,
             from_id: None,
+            target_id: None,
         })
     }
 
@@ -177,6 +205,7 @@ impl SessionStore {
             first_kept_entry_id: meta.first_kept_entry_id,
             tokens_before: meta.tokens_before,
             from_id: meta.from_id,
+            target_id: meta.target_id,
         };
         if let Some(path) = &self.path {
             if let Some(parent) = path.parent() {
@@ -224,6 +253,7 @@ impl SessionStore {
             first_kept_entry_id,
             tokens_before,
             from_id: None,
+            target_id: None,
         })
     }
 
@@ -258,6 +288,7 @@ impl SessionStore {
             first_kept_entry_id: None,
             tokens_before: None,
             from_id: abandoned,
+            target_id: None,
         })
     }
 
@@ -484,6 +515,214 @@ impl SessionStore {
 
     pub fn entries(&self) -> &[SessionEntry] {
         &self.entries
+    }
+
+    // -----------------------------------------------------------------------
+    // Labels (pi's `label` entries)
+    // -----------------------------------------------------------------------
+
+    /// Append a label entry for `entry_id`. `None` clears the label, exactly like pi's
+    /// `LabelEntry { label: undefined }`.
+    pub fn set_label(
+        &mut self,
+        entry_id: &str,
+        label: Option<&str>,
+    ) -> Result<SessionEntry, SessionError> {
+        if !self.entries.iter().any(|e| e.id == entry_id) {
+            return Err(SessionError::UnknownEntry(entry_id.to_string()));
+        }
+        let text = label.unwrap_or("").to_string();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .ok();
+        let previous_leaf = self.leaf_id.clone();
+        let entry = self.append_entry_with_metadata(EntryMetadata {
+            kind: EntryKind::Label,
+            role: "system".to_string(),
+            content: text,
+            timestamp: ts,
+            tool_call_id: None,
+            tool_name: None,
+            first_kept_entry_id: None,
+            tokens_before: None,
+            from_id: None,
+            target_id: Some(entry_id.to_string()),
+        })?;
+        // A label annotates the tree; it must not move the active leaf.
+        self.leaf_id = previous_leaf;
+        Ok(entry)
+    }
+
+    /// Resolved label for one entry: the last label entry wins, empty content clears it.
+    pub fn label_for(&self, entry_id: &str) -> Option<String> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|e| e.kind == EntryKind::Label && e.target_id.as_deref() == Some(entry_id))
+            .filter(|e| !e.content.trim().is_empty())
+            .map(|e| e.content.clone())
+    }
+
+    /// Every resolved label, keyed by target entry id.
+    fn labels(&self) -> HashMap<String, String> {
+        let mut out: HashMap<String, String> = HashMap::new();
+        for entry in &self.entries {
+            if entry.kind != EntryKind::Label {
+                continue;
+            }
+            let Some(target) = entry.target_id.clone() else {
+                continue;
+            };
+            if entry.content.trim().is_empty() {
+                out.remove(&target);
+            } else {
+                out.insert(target, entry.content.clone());
+            }
+        }
+        out
+    }
+
+    // -----------------------------------------------------------------------
+    // Tree projection (pi's `getTree`)
+    // -----------------------------------------------------------------------
+
+    /// Whether an entry is a tree node at all.
+    ///
+    /// pi's tree shows conversational entries; state-only rows (`tool_call`, `tool_result`,
+    /// `model_change`, `label`, …) are skipped but their children are re-parented to the nearest
+    /// visible ancestor, so a tool round-trip never creates a dangling branch.
+    fn is_tree_node(entry: &SessionEntry) -> bool {
+        matches!(entry.kind, EntryKind::Message | EntryKind::CompactionSummary | EntryKind::BranchSummary)
+    }
+
+    /// Nested view of the whole session DAG, with resolved labels and active-path flags.
+    pub fn tree_nodes(&self) -> Vec<SessionTreeNode> {
+        let labels = self.labels();
+        let active: std::collections::HashSet<&str> = {
+            let mut set = std::collections::HashSet::new();
+            let by_id: HashMap<&str, &SessionEntry> =
+                self.entries.iter().map(|e| (e.id.as_str(), e)).collect();
+            let mut cursor = self.leaf_id.as_deref();
+            while let Some(id) = cursor {
+                let Some(entry) = by_id.get(id).copied() else {
+                    break;
+                };
+                if Self::is_tree_node(entry) {
+                    set.insert(entry.id.as_str());
+                }
+                cursor = entry.parent_id.as_deref();
+            }
+            set
+        };
+
+        // Build a child index over visible nodes only, re-parenting through hidden ones.
+        let mut node_ids: Vec<&str> = Vec::new();
+        let mut parent_of: HashMap<&str, Option<&str>> = HashMap::new();
+        let by_id: HashMap<&str, &SessionEntry> =
+            self.entries.iter().map(|e| (e.id.as_str(), e)).collect();
+        for entry in &self.entries {
+            if !Self::is_tree_node(entry) {
+                continue;
+            }
+            node_ids.push(entry.id.as_str());
+            let mut cursor = entry.parent_id.as_deref();
+            let mut visible_parent = None;
+            while let Some(pid) = cursor {
+                let Some(parent) = by_id.get(pid).copied() else {
+                    break;
+                };
+                if Self::is_tree_node(parent) {
+                    visible_parent = Some(parent.id.as_str());
+                    break;
+                }
+                cursor = parent.parent_id.as_deref();
+            }
+            parent_of.insert(entry.id.as_str(), visible_parent);
+        }
+
+        fn build(
+            id: &str,
+            entries: &[SessionEntry],
+            parent_of: &HashMap<&str, Option<&str>>,
+            labels: &HashMap<String, String>,
+            active: &std::collections::HashSet<&str>,
+        ) -> SessionTreeNode {
+            let entry = entries
+                .iter()
+                .find(|e| e.id == id)
+                .expect("tree node id came from entries")
+                .clone();
+            let children = entries
+                .iter()
+                .filter(|e| parent_of.get(e.id.as_str()).copied().flatten() == Some(id))
+                .map(|child| build(&child.id, entries, parent_of, labels, active))
+                .collect();
+            SessionTreeNode {
+                label: labels.get(id).cloned(),
+                active: active.contains(id),
+                entry,
+                children,
+            }
+        }
+
+        self.entries
+            .iter()
+            .filter(|e| Self::is_tree_node(e) && parent_of.get(e.id.as_str()).copied().flatten().is_none())
+            .map(|root| build(&root.id, &self.entries, &parent_of, &labels, &active))
+            .collect()
+    }
+
+    /// Flatten [`SessionStore::tree_nodes`] into picker rows with `├─`/`└─` connectors.
+    ///
+    /// This is the DAG→list projection: no session logic lives in the CLI.
+    pub fn tree_rows(&self) -> Vec<TreeRow> {
+        fn walk(
+            node: &SessionTreeNode,
+            depth: usize,
+            is_last: bool,
+            prefix: &mut Vec<bool>,
+            out: &mut Vec<TreeRow>,
+        ) {
+            let mut connector = String::new();
+            for ancestor_last in prefix.iter() {
+                connector.push_str(if *ancestor_last { "   " } else { "│  " });
+            }
+            if depth > 0 {
+                connector.push_str(if is_last { "└─ " } else { "├─ " });
+            }
+            let role = match node.entry.kind {
+                EntryKind::CompactionSummary => "summary",
+                EntryKind::BranchSummary => "branch",
+                _ => node.entry.role.as_str(),
+            };
+            let star = if node.active { "*" } else { " " };
+            let label_suffix = node
+                .label
+                .as_deref()
+                .map(|l| format!(" · {l}"))
+                .unwrap_or_default();
+            let preview: String = node.entry.content.replace(['\n', '\r'], " ").chars().take(64).collect();
+            out.push(TreeRow {
+                id: node.entry.id.clone(),
+                label: format!("{connector}{star} {role}{label_suffix}"),
+                preview,
+                active: node.active,
+            });
+            let count = node.children.len();
+            prefix.push(is_last || depth == 0);
+            for (idx, child) in node.children.iter().enumerate() {
+                walk(child, depth + 1, idx + 1 == count, prefix, out);
+            }
+            prefix.pop();
+        }
+
+        let mut out = Vec::new();
+        let mut prefix = Vec::new();
+        for root in self.tree_nodes() {
+            walk(&root, 0, true, &mut prefix, &mut out);
+        }
+        out
     }
 }
 

@@ -147,6 +147,8 @@ pub enum ActiveModal {
     QuestionModal,
     ExportPicker,
     RewindPicker,
+    /// Session tree browser (`/tree` to jump, `/fork` to branch into a new file).
+    TreePicker,
     SessionPicker,
     HelpModal,
     ChangelogModal,
@@ -158,6 +160,24 @@ pub enum ActiveModal {
 pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Why the harness started compacting (pi shows a different sentence per reason).
+/// What selecting a node in the session tree does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeAction {
+    /// Move the active branch to the node (instant, no summarization).
+    Switch,
+    /// Write a new session file containing the path to the node.
+    Fork,
+}
+
+impl TreeAction {
+    pub fn command(self) -> &'static str {
+        match self {
+            TreeAction::Switch => "/tree-switch",
+            TreeAction::Fork => "/fork",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactionReason {
     /// User ran `/compact`.
@@ -351,6 +371,10 @@ pub struct TuiState {
     pub trust_prompt_resources: Vec<String>,
     pub loaded_resources: Vec<String>,
     pub rewind_rows: Vec<(String, String, String)>,
+    /// Session-tree rows (`id`, decorated label, preview) filled by `WorkerCmd::ListTreeNodes`.
+    pub tree_rows: Vec<(String, String, String)>,
+    /// What Enter does in the tree picker: jump the branch or fork into a new session file.
+    pub tree_action: TreeAction,
     pub session_rows: Vec<(String, String, String)>,
     pub plugin_commands: Vec<(String, String)>,
     pub active_loops: usize,
@@ -451,6 +475,8 @@ impl TuiState {
             trust_prompt_resources: Vec::new(),
             loaded_resources: Vec::new(),
             rewind_rows: Vec::new(),
+            tree_rows: Vec::new(),
+            tree_action: TreeAction::Switch,
             session_rows: Vec::new(),
             plugin_commands: Vec::new(),
             active_loops: 0,

@@ -373,13 +373,22 @@ pub(crate) enum WorkerCmd {
         goal: Option<String>,
     },
     ListRewindCheckpoints,
-    ListTreeNodes,
-    RewindTo(String),
+    ListTreeNodes {
+        action: le_vibe_tui::TreeAction,
+    },
+    /// Move the active branch instantly (tree navigation — never summarizes).
+    SwitchBranch(String),
+    /// Write a new session file containing the path to this node.
+    ForkTo(String),
+    RewindTo {
+        id: String,
+        provider: String,
+        model: String,
+    },
     ListSessions,
     ResumeSession(String),
     NewSession,
     SetSessionName(Option<String>),
-    CloneSession,
     SessionInfo,
     ContextInfo {
         mode: AgentMode,
@@ -469,6 +478,10 @@ pub(crate) enum WorkerMsg {
         lines: Vec<String>,
     },
     RewindLoaded(Vec<(String, String, String)>),
+    TreeLoaded {
+        rows: Vec<(String, String, String)>,
+        action: le_vibe_tui::TreeAction,
+    },
     SessionsLoaded(Vec<(String, String, String)>),
     WorkspaceFilesLoaded(Vec<String>),
     PluginCommandsLoaded(Vec<(String, String)>),
@@ -494,12 +507,23 @@ fn llm_summary(
     instruction: &str,
     keep_tail: u64,
 ) -> Result<le_vibe_agent::compact::SummaryPlan, String> {
-    let branch = session.active_branch();
+    let branch = session.context_entries();
+    if keep_tail == 0 {
+        return le_vibe_agent::compact::summarize_all(
+            bridge,
+            &branch,
+            provider,
+            model,
+            instruction,
+            None,
+            &mut |_, _, _| {},
+        );
+    }
     let mut options = le_vibe_agent::compact::SummarizeOptions {
         provider: provider.to_string(),
         model: model.to_string(),
         instruction: instruction.to_string(),
-        keep_recent_tokens: if keep_tail == 0 { u64::MAX } else { keep_tail },
+        keep_recent_tokens: keep_tail,
         max_retries: le_vibe_agent::DEFAULT_MAX_RETRIES,
         base_delay_ms: le_vibe_agent::DEFAULT_BASE_DELAY_MS,
         max_delay_ms: le_vibe_agent::DEFAULT_MAX_DELAY_MS,
@@ -1168,106 +1192,71 @@ End with a crisp **Verdict** (`APPROVE` / `REVISE`) and a numbered list of top c
                     let _ = msg_tx.send(WorkerMsg::RewindLoaded(rows));
                     let _ = msg_tx.send(WorkerMsg::Idle);
                 }
-                WorkerCmd::ListTreeNodes => {
-                    let entries = session.entries();
-                    let active_leaf = session.leaf_id().map(str::to_string);
-                    let mut children: std::collections::HashMap<Option<String>, Vec<usize>> =
-                        std::collections::HashMap::new();
-                    for (idx, e) in entries.iter().enumerate() {
-                        if matches!(e.kind, EntryKind::Message | EntryKind::CompactionSummary)
-                            && matches!(e.role.as_str(), "user" | "assistant" | "system")
-                        {
-                            children.entry(e.parent_id.clone()).or_default().push(idx);
-                        }
-                    }
-                    // Also include roots whose parent_id wasn't a message (e.g. tool_result or session_meta)
-                    let entry_by_id: std::collections::HashMap<&str, usize> = entries
-                        .iter()
-                        .enumerate()
-                        .map(|(i, e)| (e.id.as_str(), i))
+                WorkerCmd::ListTreeNodes { action } => {
+                    // All DAG/label/connector logic lives in `le-vibe-durable::tree_rows`.
+                    let rows = session
+                        .tree_rows()
+                        .into_iter()
+                        .map(|row| {
+                            let marker = if row.active { "*" } else { " " };
+                            (row.id, format!("{marker} {}", row.label), row.preview)
+                        })
                         .collect();
-                    let mut rows: Vec<(String, String, String)> = Vec::new();
-                    let mut visited = std::collections::HashSet::new();
-                    let mut stack: Vec<(usize, usize)> = Vec::new();
-                    for (idx, e) in entries.iter().enumerate() {
-                        if !matches!(e.kind, EntryKind::Message | EntryKind::CompactionSummary)
-                            || !matches!(e.role.as_str(), "user" | "assistant" | "system")
-                        {
-                            continue;
-                        }
-                        let parent_is_msg = e
-                            .parent_id
-                            .as_deref()
-                            .and_then(|pid| entry_by_id.get(pid))
-                            .is_some_and(|&pi| {
-                                matches!(
-                                    entries[pi].kind,
-                                    EntryKind::Message | EntryKind::CompactionSummary
-                                ) && matches!(
-                                    entries[pi].role.as_str(),
-                                    "user" | "assistant" | "system"
-                                )
-                            });
-                        if !parent_is_msg {
-                            stack.push((idx, 0));
-                        }
-                    }
-                    stack.reverse();
-                    while let Some((idx, depth)) = stack.pop() {
-                        if !visited.insert(idx) {
-                            continue;
-                        }
-                        let e = &entries[idx];
-                        let is_leaf = active_leaf.as_deref() == Some(e.id.as_str());
-                        let indent = "  ".repeat(depth.min(6));
-                        let branch_glyph = if depth == 0 { "" } else { "└─ " };
-                        let star = if is_leaf { "★ " } else { "" };
-                        let role_tag = if e.kind == EntryKind::CompactionSummary {
-                            "summary"
-                        } else {
-                            e.role.as_str()
-                        };
-                        let preview: String = e
-                            .content
-                            .replace('\n', " ")
-                            .chars()
-                            .take(64)
-                            .collect();
-                        rows.push((
-                            e.id.clone(),
-                            format!("{indent}{branch_glyph}{star}{role_tag}"),
-                            preview,
-                        ));
-                        // Walk through any intermediate tool_result children to find descendant messages
-                        let mut next_children: Vec<usize> = Vec::new();
-                        let mut frontier = vec![e.id.clone()];
-                        while let Some(pid) = frontier.pop() {
-                            for (ci, ce) in entries.iter().enumerate() {
-                                if ce.parent_id.as_deref() == Some(pid.as_str()) {
-                                    if matches!(
-                                        ce.kind,
-                                        EntryKind::Message | EntryKind::CompactionSummary
-                                    ) && matches!(
-                                        ce.role.as_str(),
-                                        "user" | "assistant" | "system"
-                                    ) {
-                                        next_children.push(ci);
-                                    } else {
-                                        frontier.push(ce.id.clone());
-                                    }
-                                }
-                            }
-                        }
-                        let next_depth = if next_children.len() > 1 { depth + 1 } else { depth };
-                        for ci in next_children.into_iter().rev() {
-                            stack.push((ci, next_depth));
-                        }
-                    }
-                    let _ = children; // silence unused if empty
-                    let _ = msg_tx.send(WorkerMsg::RewindLoaded(rows));
+                    let _ = msg_tx.send(WorkerMsg::TreeLoaded { rows, action });
                     let _ = msg_tx.send(WorkerMsg::Idle);
                 }
-                WorkerCmd::RewindTo(id) => {
+                WorkerCmd::SwitchBranch(id) => {
+                    match session.branch_from(&id) {
+                        Ok(()) => {
+                            let _ = msg_tx.send(WorkerMsg::SessionReplaced {
+                                blocks: session_blocks(&session),
+                                notice: format!("Switched active branch to {id}."),
+                                prefill_input: None,
+                                reset_usage: false,
+                            });
+                        }
+                        Err(err) => {
+                            let _ = msg_tx.send(WorkerMsg::Notice(format!(
+                                "Cannot switch branch: {err}"
+                            )));
+                        }
+                    }
+                    let _ = msg_tx.send(WorkerMsg::Idle);
+                }
+                WorkerCmd::ForkTo(id) => {
+                    // `/clone` is `ForkTo` at the current leaf, so there is one fork path only.
+                    let ts = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let path = project_sessions_dir().join(format!("session-fork-{ts}.jsonl"));
+                    match session.fork_from(&id, &path) {
+                        Ok(forked) => {
+                            session = forked;
+                            session_memory_toc =
+                                le_vibe_tools::memory::MemoryRagStore::open_default().build_toc(25);
+                            session_model_note = None;
+                            let _ = msg_tx.send(WorkerMsg::SessionReplaced {
+                                blocks: session_blocks(&session),
+                                notice: format!(
+                                    "Forked at {id} -> new session {} (branch copied, original untouched)",
+                                    path.display()
+                                ),
+                                prefill_input: None,
+                                reset_usage: true,
+                            });
+                        }
+                        Err(err) => {
+                            let _ = msg_tx.send(WorkerMsg::Notice(format!("Fork failed: {err}")));
+                        }
+                    }
+                    let _ = msg_tx.send(WorkerMsg::Idle);
+                }
+                WorkerCmd::RewindTo {
+                    id,
+                    provider,
+                    model,
+                } => {
                     let target = session.entries().iter().find(|e| e.id == id).cloned();
                     match target {
                         Some(entry) => {
@@ -1277,15 +1266,36 @@ End with a crisp **Verdict** (`APPROVE` / `REVISE`) and a numbered list of top c
                             } else {
                                 None
                             };
-                            let branch_res = if is_user {
-                                if let Some(parent_id) = entry.parent_id.as_deref() {
-                                    session.branch_from(parent_id)
-                                } else {
-                                    session.reset_leaf();
-                                    Ok(())
-                                }
+                            // Rewind keeps the abandoned path's context: summarize it into a
+                            // branch_summary entry (pi's branchWithSummary). Tree navigation uses
+                            // `SwitchBranch`, which never pays for a summarizer call.
+                            let target = if is_user {
+                                entry.parent_id.clone()
                             } else {
-                                session.branch_from(&entry.id)
+                                Some(entry.id.clone())
+                            };
+                            let branch_res = match le_vibe_agent::compact::branch_summary(
+                                &mut bridge,
+                                &mut session,
+                                target.as_deref(),
+                                &provider,
+                                &model,
+                                Some(&cancel),
+                                &mut |_, _, _| {},
+                            ) {
+                                Ok(_) => Ok(()),
+                                Err(err) => {
+                                    let _ = msg_tx.send(WorkerMsg::Notice(format!(
+                                        "Branch summary failed ({err}); switching without one."
+                                    )));
+                                    match target.as_deref() {
+                                        Some(id) => session.branch_from(id),
+                                        None => {
+                                            session.reset_leaf();
+                                            Ok(())
+                                        }
+                                    }
+                                }
                             };
                             match branch_res {
                                 Ok(()) => {
@@ -1380,28 +1390,6 @@ End with a crisp **Verdict** (`APPROVE` / `REVISE`) and a numbered list of top c
                     } else {
                         let cur = session.name().unwrap_or("(unnamed)");
                         let _ = msg_tx.send(WorkerMsg::Notice(format!("Session name: {cur}")));
-                    }
-                    let _ = msg_tx.send(WorkerMsg::Idle);
-                }
-                WorkerCmd::CloneSession => {
-                    let ts = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    let path = project_sessions_dir().join(format!("session-{ts}.jsonl"));
-                    match session.clone_branch(&path) {
-                        Ok(cloned) => {
-                            session = cloned;
-                            let _ = msg_tx.send(WorkerMsg::SessionReplaced {
-                                blocks: session_blocks(&session),
-                                notice: format!("Cloned active branch -> {}", path.display()),
-                                prefill_input: None,
-                                reset_usage: false,
-                            });
-                        }
-                        Err(err) => {
-                            let _ = msg_tx.send(WorkerMsg::Notice(format!("Clone failed: {err}")));
-                        }
                     }
                     let _ = msg_tx.send(WorkerMsg::Idle);
                 }

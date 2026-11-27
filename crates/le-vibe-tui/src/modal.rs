@@ -338,6 +338,24 @@ pub(crate) fn draw_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                 state.rewind_rows.clone()
             },
         ),
+        ActiveModal::TreePicker => {
+            let verb = match state.tree_action {
+                crate::state::TreeAction::Switch => "Switch branch",
+                crate::state::TreeAction::Fork => "Fork into new session",
+            };
+            (
+                format!(" Session Tree — {verb} (↑/↓ Enter Esc · * = active branch) "),
+                if state.tree_rows.is_empty() {
+                    vec![(
+                        "(empty)".into(),
+                        String::new(),
+                        "No session entries yet.".into(),
+                    )]
+                } else {
+                    state.tree_rows.clone()
+                },
+            )
+        }
         ActiveModal::SessionPicker => {
             let title = if state.modal_filter.is_empty() {
                 " Saved Sessions — Enter to resume · Type to filter · Esc ".to_string()

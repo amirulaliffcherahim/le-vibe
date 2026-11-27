@@ -604,13 +604,14 @@ fn push_pi_surface_lines(
 
     if body.hidden_count > 0 {
         let hint = format!(
-            "... ({} {} lines, ctrl+o to expand)",
+            "... ({} {} lines, {} to expand)",
             body.hidden_count,
             if body.hidden_is_earlier {
                 "earlier"
             } else {
                 "more"
-            }
+            },
+            crate::keyhint::key_text(crate::keyhint::KeyAction::ExpandTools)
         );
         let (hint_fit, _) = split_at_width(&hint, inner_w);
         let pad = total_w.saturating_sub(1 + Span::raw(hint_fit).width());
@@ -698,6 +699,24 @@ fn split_at_width(text: &str, max_width: usize) -> (&str, &str) {
     (text, "")
 }
 
+/// Sentinel neighbour kind for the first block.
+pub(crate) const PREV_NONE: u8 = u8::MAX;
+const KIND_THINKING: u8 = 1;
+const KIND_ASSISTANT: u8 = 2;
+
+/// Coarse block identity, used to decide spacer placement between blocks.
+fn block_kind(block: &TranscriptBlock) -> u8 {
+    match block {
+        TranscriptBlock::User(_) => 0,
+        TranscriptBlock::Thinking(_) => KIND_THINKING,
+        TranscriptBlock::Assistant(_) => KIND_ASSISTANT,
+        TranscriptBlock::Tool(_) => 3,
+        TranscriptBlock::Script { .. } => 4,
+        TranscriptBlock::System(_) => 5,
+        TranscriptBlock::Report(_) => 6,
+    }
+}
+
 fn hash_block(block: &TranscriptBlock) -> u64 {    let mut h = DefaultHasher::new();
     match block {
         TranscriptBlock::User(t) => {
@@ -743,10 +762,15 @@ fn render_block_wrapped(
     area_width: u16,
     wrap_width: usize,
     state: &TuiState,
+    prev_kind: Option<u8>,
 ) -> Vec<Line<'static>> {
     let pal = state.theme.palette();
     let accent = pal.accent;
     let mut lines: Vec<Line<'static>> = Vec::new();
+    // pi adds spacers lazily, right before the next *visible group*: an interleaved
+    // thinking → text → thinking run reads as one block, so no blank line inside it.
+    let after_thinking = prev_kind == Some(KIND_THINKING);
+    let after_text = prev_kind == Some(KIND_ASSISTANT);
     match block {
         TranscriptBlock::User(text) => {
             lines.push(Line::from(""));
@@ -760,7 +784,9 @@ fn render_block_wrapped(
         }
         TranscriptBlock::Thinking(text) => {
             if !text.is_empty() {
-                lines.push(Line::from(""));
+                if !after_text && !after_thinking {
+                    lines.push(Line::from(""));
+                }
                 let line_count = text.lines().count().max(1);
                 if state.show_thinking {
                     let think_style = Style::default()
@@ -773,10 +799,11 @@ fn render_block_wrapped(
                     lines.extend(wrap_lines_exact(raw_lines, wrap_width));
                 } else {
                     let unit = if line_count == 1 { "line" } else { "lines" };
+                    let hint = crate::keyhint::key_text(crate::keyhint::KeyAction::ToggleThinking);
                     let label = if state.is_busy {
-                        format!(" Thinking… ({line_count} {unit} · ctrl+t)")
+                        format!(" Thinking… ({line_count} {unit} · {hint})")
                     } else {
-                        format!(" Thought ({line_count} {unit} · ctrl+t)")
+                        format!(" Thought ({line_count} {unit} · {hint})")
                     };
                     lines.push(Line::from(Span::styled(
                         label,
@@ -789,7 +816,9 @@ fn render_block_wrapped(
         }
         TranscriptBlock::Assistant(text) => {
             if !text.is_empty() {
-                lines.push(Line::from(""));
+                if !after_thinking {
+                    lines.push(Line::from(""));
+                }
                 // Align assistant prose to the same 1-column left rhythm as user & tool cards.
                 let pad_w = area_width.saturating_sub(1).max(20);
                 let md_lines = render_markdown_lines(text, &pal, pad_w, state.expand_tools);
@@ -973,10 +1002,18 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         cache.entries.truncate(state.blocks.len());
     }
     for (idx, block) in state.blocks.iter().enumerate() {
-        let h = hash_block(block);
+        // Spacer placement depends on the previous block (interleaved thinking/text runs are one
+        // visual group), so the neighbour kind is part of the cache key.
+        let prev_kind = if idx == 0 {
+            PREV_NONE
+        } else {
+            block_kind(&state.blocks[idx - 1])
+        };
+        let h = hash_block(block) ^ (u64::from(prev_kind) << 56);
         let hit = cache.entries.get(idx).is_some_and(|(ch, _)| *ch == h);
         if !hit {
-            let rendered = render_block_wrapped(block, area.width, wrap_width, state);
+            let rendered =
+                render_block_wrapped(block, area.width, wrap_width, state, Some(prev_kind));
             if idx < cache.entries.len() {
                 cache.entries[idx] = (h, rendered);
             } else {
@@ -1140,7 +1177,17 @@ fn draw_status_strip(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                 push_clamped(
                     &mut spans,
                     &mut used,
-                    "  Esc interrupt · Alt+Enter queue".to_string(),
+                    format!(
+                        "  {} · {}",
+                        crate::keyhint::key_hint(
+                            crate::keyhint::KeyAction::Interrupt,
+                            "interrupt"
+                        ),
+                        crate::keyhint::key_hint(
+                            crate::keyhint::KeyAction::QueueFollowUp,
+                            "queue"
+                        )
+                    ),
                     Style::default().fg(Color::DarkGray),
                 );
             }
@@ -1314,7 +1361,11 @@ pub fn tool_call_header(name: &str, args_json: &str, expanded: bool) -> ToolHead
             };
             let range = format_read_line_range(arg_u64(&args, "offset"), arg_u64(&args, "limit"));
             let base = file_basename(path);
-            let hint = " (ctrl+o to expand)";
+            let hint = format!(
+                " ({} to expand)",
+                crate::keyhint::key_text(crate::keyhint::KeyAction::ExpandTools)
+            );
+            let hint = hint.as_str();
             if !expanded {
                 if base.eq_ignore_ascii_case("SKILL.md") {
                     return ToolHeader {

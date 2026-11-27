@@ -90,10 +90,7 @@ pub(crate) fn draw_editor(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         let pal = state.theme.palette();
         vec![Line::from(vec![
             Span::styled(" ", Style::default()),
-            Span::styled(
-                "Ask anything…  / commands · @ files · Shift+Tab mode · Alt+W workflows",
-                Style::default().fg(pal.muted),
-            ),
+            Span::styled(crate::keyhint::placeholder(), Style::default().fg(pal.muted)),
         ])]
     } else {
         wrapped[start_row..end_row]

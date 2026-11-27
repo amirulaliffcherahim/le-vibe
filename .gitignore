@@ -54,3 +54,12 @@ python/.pytest_cache/
 __pycache__/
 *.pyc
 *.egg-info/
+
+# reference/ — archived crusty port, read-only reference, never built here
+reference/pi-src/
+reference/.ref/
+reference/target/
+reference/legacy/
+reference/rust/
+reference/rusted-pi-git-archive/
+reference/*.xlsx

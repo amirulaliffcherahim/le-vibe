@@ -553,3 +553,40 @@ fn summarize_and_branch_records_the_abandoned_path() {
         "summarizer must see the abandoned path:\n{sent}"
     );
 }
+
+/// Regression guard for the `/compact` path: manual compaction passes the CLI's instruction with
+/// `SUMMARIZE_ALL`, so the summarizer must receive the **whole** branch, not an empty head.
+#[test]
+fn manual_compact_sends_the_full_branch_to_the_summarizer() {
+    let mut session = SessionStore::in_memory();
+    seed_history(&mut session, 3, 200);
+    let branch = session.context_entries();
+    let first = branch.first().unwrap().content.clone();
+    let last = branch.last().unwrap().content.clone();
+
+    let mut bridge = ScriptedBridge::new(vec![Step::Reply {
+        text: "HANDOFF".into(),
+        input_tokens: 10,
+    }]);
+    let plan = compact::summarize_all(
+        &mut bridge,
+        &branch,
+        "vibe",
+        "test-model",
+        le_vibe_agent::workflows::MANUAL_COMPACT_INSTRUCTION,
+        None,
+        &mut |_, _, _| {},
+    )
+    .expect("manual compaction");
+
+    assert_eq!(plan.kept, 0);
+    assert_eq!(plan.summarized, branch.len());
+    let sent = &bridge.requests[0].messages[0].content;
+    assert!(
+        sent.contains(le_vibe_agent::workflows::MANUAL_COMPACT_INSTRUCTION),
+        "the CLI instruction must reach the summarizer"
+    );
+    assert!(sent.contains(&first), "oldest entry missing");
+    assert!(sent.contains(&last), "newest entry missing");
+    assert!(sent.contains("memory-flush"), "durable-memory contract missing");
+}

@@ -393,3 +393,38 @@ fn tree_nodes_skips_state_only_entries_but_keeps_their_children() {
     // ...and the tool result entry is still reachable through the DAG.
     assert!(store.entries().iter().any(|e| e.kind == EntryKind::ToolResult));
 }
+
+// ---------------------------------------------------------------------------
+// 6. Rewind checkpoints (DAG filtering stays in durable)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rewind_checkpoints_list_only_user_messages_in_order() {
+    let mut store = SessionStore::in_memory();
+    store.append("user", "first question").unwrap();
+    store.append("assistant", "answer").unwrap();
+    store.append_tool_call("tc_1", "read", r#"{"path":"a.rs"}"#).unwrap();
+    store.append_tool_result("tc_1", "read", "body").unwrap();
+    store.append("user", "second\nquestion").unwrap();
+    store.append_model_change("vibe/x").unwrap();
+
+    let rows = store.rewind_checkpoints();
+    assert_eq!(rows.len(), 2, "only user messages: {rows:?}");
+    assert_eq!(rows[0].label, "#1 user");
+    assert_eq!(rows[1].label, "#2 user");
+    assert_eq!(rows[0].preview, "first question");
+    assert_eq!(rows[1].preview, "second question", "newlines flattened");
+    assert!(rows.iter().all(|r| !r.id.is_empty()));
+}
+
+#[test]
+fn rewind_checkpoints_ignore_compaction_summaries() {
+    let mut store = SessionStore::in_memory();
+    store.append("user", "q1").unwrap();
+    store.append("assistant", "a1").unwrap();
+    store.append_compaction("SUMMARY").unwrap();
+    store.append("user", "q2").unwrap();
+
+    let rows = store.rewind_checkpoints();
+    assert_eq!(rows.len(), 2, "summary is system, not a checkpoint");
+}

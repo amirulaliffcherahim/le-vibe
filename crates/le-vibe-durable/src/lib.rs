@@ -81,6 +81,15 @@ pub struct TreeRow {
     pub active: bool,
 }
 
+/// One `/rewind` checkpoint: a user message you can rewind to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RewindCheckpoint {
+    pub id: String,
+    /// `#1 user`, `#2 user`, … in transcript order.
+    pub label: String,
+    pub preview: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionMetaInfo {
     pub path: PathBuf,
@@ -670,6 +679,22 @@ impl SessionStore {
             .iter()
             .filter(|e| Self::is_tree_node(e) && parent_of.get(e.id.as_str()).copied().flatten().is_none())
             .map(|root| build(&root.id, &self.entries, &parent_of, &labels, &active))
+            .collect()
+    }
+
+    /// Rewind checkpoints: every user message in transcript order.
+    ///
+    /// The DAG filtering lives here so the CLI only maps rows into its picker.
+    pub fn rewind_checkpoints(&self) -> Vec<RewindCheckpoint> {
+        self.entries
+            .iter()
+            .filter(|e| e.kind == EntryKind::Message && e.role == "user")
+            .enumerate()
+            .map(|(idx, entry)| RewindCheckpoint {
+                id: entry.id.clone(),
+                label: format!("#{} user", idx + 1),
+                preview: entry.content.replace(['\n', '\r'], " ").chars().take(68).collect(),
+            })
             .collect()
     }
 

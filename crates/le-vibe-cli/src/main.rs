@@ -932,8 +932,8 @@ fn run_interactive_tui(
                         ));
                     }
                     active_prompt = false;
-                    // Claude-Code-style `/goal` Proof Loop evaluator: keep iterating until
-                    // `PROOF_VERIFIED:` or `PROOF_BLOCKED:` or turn cap reached.
+                    // Claude-Code-style `/goal` Proof Loop evaluator: the decision lives in
+                    // `le_vibe_agent::workflows`, the CLI only renders it.
                     if let Some((cond, attempt, max_att)) = state.active_goal.clone() {
                         let last_reply = state
                             .blocks
@@ -944,38 +944,46 @@ fn run_interactive_tui(
                                 _ => None,
                             })
                             .unwrap_or("");
-                        if last_reply.contains("PROOF_VERIFIED:") {
-                            state.active_goal = None;
-                            state.blocks.push(TranscriptBlock::System(format!(
-                                "✓ Proof Loop verified on attempt {attempt}/{max_att}: {cond}"
-                            )));
-                        } else if last_reply.contains("PROOF_BLOCKED:") || attempt >= max_att {
-                            state.active_goal = None;
-                            state.blocks.push(TranscriptBlock::System(format!(
-                                "Proof Loop ended at attempt {attempt}/{max_att} (not verified)."
-                            )));
-                        } else {
-                            let next = attempt + 1;
-                            state.active_goal = Some((cond.clone(), next, max_att));
-                            let cont = format!(
-                                "PROOF LOOP CONTINUATION (attempt {next}/{max_att})\nStop condition still not proven: {cond}\nRun the deterministic check, inspect raw stdout/stderr, fix any remaining issue, and end with `PROOF_VERIFIED: <command & pass output>` or `PROOF_BLOCKED: <exact blocker>`."
-                            );
-                            state.is_busy = true;
-                            active_prompt = true;
-                            cancel.store(false, Ordering::SeqCst);
-                            state.active_started = Some(Instant::now());
-                            state.status_text = Some(format!("Proof Loop ({next}/{max_att})…"));
-                            let _ = cmd_tx.send(WorkerCmd::RunPrompt {
-                                provider: state.provider.clone(),
-                                model: state.model.clone(),
-                                thinking_level: state.thinking_level.clone(),
-                                mode: state.mode,
-                                shell: state.shell.clone(),
-                                max_turns: state.max_turns,
-                                retry_max: state.retry_max,
-                                context_window: state.agent_context_window(),
-                                prompt: cont,
-                            });
+                        match le_vibe_agent::evaluate_proof_reply(last_reply, attempt, max_att) {
+                            le_vibe_agent::ProofOutcome::Verified => {
+                                state.active_goal = None;
+                                state.blocks.push(TranscriptBlock::System(format!(
+                                    "\u{2713} Proof Loop verified on attempt {attempt}/{max_att}: {cond}"
+                                )));
+                            }
+                            le_vibe_agent::ProofOutcome::Blocked
+                            | le_vibe_agent::ProofOutcome::CapReached => {
+                                state.active_goal = None;
+                                state.blocks.push(TranscriptBlock::System(format!(
+                                    "Proof Loop ended at attempt {attempt}/{max_att} (not verified)."
+                                )));
+                            }
+                            le_vibe_agent::ProofOutcome::Continue => {
+                                let next = le_vibe_agent::ProofState {
+                                    condition: cond.clone(),
+                                    attempt: attempt + 1,
+                                    max_attempts: max_att,
+                                };
+                                state.active_goal = Some((cond, next.attempt, max_att));
+                                let cont = next.continuation_prompt();
+                                state.is_busy = true;
+                                active_prompt = true;
+                                cancel.store(false, Ordering::SeqCst);
+                                state.active_started = Some(Instant::now());
+                                state.status_text =
+                                    Some(format!("Proof Loop ({}/{max_att})\u{2026}", next.attempt));
+                                let _ = cmd_tx.send(WorkerCmd::RunPrompt {
+                                    provider: state.provider.clone(),
+                                    model: state.model.clone(),
+                                    thinking_level: state.thinking_level.clone(),
+                                    mode: state.mode,
+                                    shell: state.shell.clone(),
+                                    max_turns: state.max_turns,
+                                    retry_max: state.retry_max,
+                                    context_window: state.agent_context_window(),
+                                    prompt: cont,
+                                });
+                            }
                         }
                     }
                 }
@@ -1687,10 +1695,14 @@ fn run_interactive_tui(
                         continue;
                     }
                     state.mode = AgentMode::Normal;
-                    state.active_goal = Some((arg.to_string(), 1, 5));
-                    let goal_prompt = format!(
-                        "PROOF LOOP GOAL (attempt 1/5)\nBinary stop condition: {arg}\n\nFollow the 5-step Proof Loop (1. Act minimal diff -> 2. Run deterministic check -> 3. Inspect raw output -> 4. Assert & fix -> 5. Terminate on evidence).\nWhen the binary stop condition is proven with real command output, end your reply with:\nPROOF_VERIFIED: <exact command and observed pass output>\nIf genuinely blocked after retries, end with:\nPROOF_BLOCKED: <exact blocker>"
-                    );
+                    state.active_goal = Some((
+                        arg.to_string(),
+                        1,
+                        le_vibe_agent::workflows::PROOF_MAX_ATTEMPTS,
+                    ));
+                    let goal_prompt =
+                        le_vibe_agent::ProofState::new(arg, le_vibe_agent::workflows::PROOF_MAX_ATTEMPTS)
+                            .initial_prompt();
                     state.blocks.push(TranscriptBlock::User(format!("/goal {arg}")));
                     state.is_busy = true;
                     active_prompt = true;
@@ -2101,21 +2113,14 @@ fn run_interactive_tui(
                     let mut parts = trimmed.splitn(2, char::is_whitespace);
                     let raw_name = parts.next().unwrap_or("").trim();
                     let extra = parts.next().unwrap_or("").trim();
-                    let slug: String = raw_name
-                        .to_lowercase()
-                        .chars()
-                        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
-                        .collect();
-                    let slug = slug.trim_matches('-').to_string();
+                    let slug = le_vibe_agent::workflows::skill_slug(raw_name);
                     if slug.is_empty() {
                         state.blocks.push(TranscriptBlock::System(
                             "Usage: /skill-save <skill-name> [optional focus]".to_string(),
                         ));
                     } else {
-                        let target = format!(".le-vibe/skills/{slug}/SKILL.md");
-                        let distill_prompt = format!(
-                            "Distill the reusable workflow/procedure from this session into `{target}` using the agentskills.io format (YAML frontmatter with `name: {slug}` and concise `description:`, followed by clear step-by-step instructions, commands, and gotchas). {extra}\nWrite `{target}` directly using the `write` tool."
-                        );
+                        let distill_prompt =
+                            le_vibe_agent::workflows::skill_distillation_prompt(&slug, extra);
                         state.blocks.push(TranscriptBlock::User(format!("/skill-save {slug}")));
                         state.is_busy = true;
                         active_prompt = true;

@@ -41,9 +41,19 @@ All three triggers live in the agent loop; the CLI only forwards `context_window
   the window, or a `length` stop with **no output** (the input filled the window). These are checked
   before the empty-response guard, since such a reply has no content.
 - **Retention** (`compact::plan_cut`) — keeps the newest ~20k tokens verbatim and summarizes only the
-  head, always retaining at least the newest entry. Because `SessionStore::active_branch` stops at the
-  newest `compaction_summary`, the kept tail is re-appended as fresh entries so the next request still
-  sees it; `KEEP_TAIL_MAX_BYTES` (200 KB) bounds how much duplication repeated compactions can add.
+  head, always retaining at least the newest entry. The boundary is stored on the compaction entry as
+  `first_kept_entry_id` (+ `tokens_before`), so `SessionStore::context_entries()` restores the tail in
+  its original position and **nothing is duplicated** in the JSONL file.
+
+### Reading a session: `active_branch` vs `context_entries`
+
+| Method | Behaviour |
+| --- | --- |
+| `active_branch()` | Leaf→root, stops at the newest `compaction_summary`. Kept for compatibility (UI listings, resume previews). |
+| `context_entries()` | pi's `buildContextEntries`: emits the newest compaction once, then the entries from `first_kept_entry_id` onward (pre-boundary `role == "system"` messages dropped), then everything after it. This is what the agent sends to the model. |
+
+Branch summaries are written with `SessionStore::branch_with_summary(from_id, summary)`, which stores
+pi's `fromId` — the leaf that was abandoned when branching.
 - **Summarizer** (`compact::summarize`) — moved out of the CLI so it shares one retry policy with
   normal turns; `/compact`, `/handover`, and bug-report generation all call it.
 

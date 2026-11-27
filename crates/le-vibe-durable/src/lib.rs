@@ -43,6 +43,16 @@ pub struct SessionEntry {
     pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
+    /// pi's `firstKeptEntryId`: the oldest entry a compaction summary keeps verbatim.
+    /// Appended at the end of the struct so existing JSONL keeps its field order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_kept_entry_id: Option<String>,
+    /// Prompt tokens before a compaction ran (pi's `tokensBefore`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_before: Option<u64>,
+    /// pi's `fromId` on a branch summary: the leaf that was abandoned when branching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +66,19 @@ pub struct SessionMetaInfo {
 
 fn default_kind() -> EntryKind {
     EntryKind::Message
+}
+
+/// Everything needed to append one entry, including the pi-specific boundary metadata.
+struct EntryMetadata {
+    kind: EntryKind,
+    role: String,
+    content: String,
+    timestamp: Option<u64>,
+    tool_call_id: Option<String>,
+    tool_name: Option<String>,
+    first_kept_entry_id: Option<String>,
+    tokens_before: Option<u64>,
+    from_id: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -121,18 +144,39 @@ impl SessionStore {
         tool_call_id: Option<String>,
         tool_name: Option<String>,
     ) -> Result<SessionEntry, SessionError> {
-        self.next_id += 1;
-        let id = format!("msg_{}", self.next_id);
-        let parent_id = self.leaf_id.clone();
-        let entry = SessionEntry {
-            id: id.clone(),
-            parent_id,
+        self.append_entry_with_metadata(EntryMetadata {
             kind,
             role,
             content,
             timestamp,
             tool_call_id,
             tool_name,
+            first_kept_entry_id: None,
+            tokens_before: None,
+            from_id: None,
+        })
+    }
+
+    /// Append one entry with the pi-specific metadata fields set.
+    fn append_entry_with_metadata(
+        &mut self,
+        meta: EntryMetadata,
+    ) -> Result<SessionEntry, SessionError> {
+        self.next_id += 1;
+        let id = format!("msg_{}", self.next_id);
+        let parent_id = self.leaf_id.clone();
+        let entry = SessionEntry {
+            id: id.clone(),
+            parent_id,
+            kind: meta.kind,
+            role: meta.role,
+            content: meta.content,
+            timestamp: meta.timestamp,
+            tool_call_id: meta.tool_call_id,
+            tool_name: meta.tool_name,
+            first_kept_entry_id: meta.first_kept_entry_id,
+            tokens_before: meta.tokens_before,
+            from_id: meta.from_id,
         };
         if let Some(path) = &self.path {
             if let Some(parent) = path.parent() {
@@ -154,6 +198,67 @@ impl SessionStore {
 
     pub fn append_compaction(&mut self, summary: impl Into<String>) -> Result<SessionEntry, SessionError> {
         self.append_entry(EntryKind::CompactionSummary, "system".to_string(), summary.into())
+    }
+
+    /// Append a compaction summary that records pi's `firstKeptEntryId` boundary.
+    ///
+    /// `first_kept_entry_id` is the oldest entry the summary keeps verbatim, so the kept tail stays
+    /// in its original position instead of being copied after the summary.
+    pub fn append_compaction_with_keep(
+        &mut self,
+        summary: impl Into<String>,
+        first_kept_entry_id: Option<String>,
+        tokens_before: Option<u64>,
+    ) -> Result<SessionEntry, SessionError> {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .ok();
+        self.append_entry_with_metadata(EntryMetadata {
+            kind: EntryKind::CompactionSummary,
+            role: "system".to_string(),
+            content: summary.into(),
+            timestamp: ts,
+            tool_call_id: None,
+            tool_name: None,
+            first_kept_entry_id,
+            tokens_before,
+            from_id: None,
+        })
+    }
+
+    /// Branch to `from_id` (or a fresh root when `None`) and record the abandoned leaf as a
+    /// `branch_summary` entry, mirroring pi's `branchWithSummary`.
+    ///
+    /// The stored `from_id` field is the leaf that was abandoned; the `from_id` parameter is the
+    /// node to branch *from*.
+    pub fn branch_with_summary(
+        &mut self,
+        from_id: Option<&str>,
+        summary: impl Into<String>,
+    ) -> Result<SessionEntry, SessionError> {
+        if let Some(target) = from_id
+            && !self.entries.iter().any(|e| e.id == target)
+        {
+            return Err(SessionError::UnknownEntry(target.to_string()));
+        }
+        let abandoned = self.leaf_id.clone();
+        self.leaf_id = from_id.map(ToString::to_string);
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .ok();
+        self.append_entry_with_metadata(EntryMetadata {
+            kind: EntryKind::BranchSummary,
+            role: "system".to_string(),
+            content: summary.into(),
+            timestamp: ts,
+            tool_call_id: None,
+            tool_name: None,
+            first_kept_entry_id: None,
+            tokens_before: None,
+            from_id: abandoned,
+        })
     }
 
     pub fn append_branch_summary(&mut self, summary: impl Into<String>) -> Result<SessionEntry, SessionError> {
@@ -306,6 +411,9 @@ impl SessionStore {
     }
 
     /// Walks from the active leaf back to root, stopping at the latest compaction summary.
+    ///
+    /// Kept for compatibility; use [`SessionStore::context_entries`] for the compaction-aware view
+    /// that also restores the entries a summary keeps verbatim.
     pub fn active_branch(&self) -> Vec<SessionEntry> {
         let by_id: HashMap<&str, &SessionEntry> =
             self.entries.iter().map(|e| (e.id.as_str(), e)).collect();
@@ -323,6 +431,55 @@ impl SessionStore {
         }
         chain.reverse();
         chain
+    }
+
+    /// Full root→leaf path with no compaction short-circuit (pi's `buildSessionPath`).
+    fn full_path(&self) -> Vec<SessionEntry> {
+        let by_id: HashMap<&str, &SessionEntry> =
+            self.entries.iter().map(|e| (e.id.as_str(), e)).collect();
+        let mut chain = Vec::new();
+        let mut cursor = self.leaf_id.as_deref();
+        while let Some(id) = cursor {
+            let Some(entry) = by_id.get(id).copied() else {
+                break;
+            };
+            chain.push(entry.clone());
+            cursor = entry.parent_id.as_deref();
+        }
+        chain.reverse();
+        chain
+    }
+
+    /// Compaction-aware path, matching pi's `buildContextEntries`.
+    ///
+    /// The newest compaction on the path is emitted once, followed by the entries it keeps
+    /// verbatim (starting at `first_kept_entry_id`, skipping pre-boundary system entries) and then
+    /// every entry appended after it. Nothing is copied, so the file has no duplicated history.
+    pub fn context_entries(&self) -> Vec<SessionEntry> {
+        let path = self.full_path();
+        let Some(compaction_idx) = path
+            .iter()
+            .rposition(|e| e.kind == EntryKind::CompactionSummary)
+        else {
+            return path;
+        };
+        let compaction = &path[compaction_idx];
+        let mut out = Vec::with_capacity(path.len());
+        out.push(compaction.clone());
+
+        if let Some(first_kept) = compaction.first_kept_entry_id.as_deref() {
+            let mut found = false;
+            for entry in &path[..compaction_idx] {
+                if entry.id == first_kept {
+                    found = true;
+                }
+                if found && !(entry.kind == EntryKind::Message && entry.role == "system") {
+                    out.push(entry.clone());
+                }
+            }
+        }
+        out.extend(path[compaction_idx + 1..].iter().cloned());
+        out
     }
 
     pub fn entries(&self) -> &[SessionEntry] {

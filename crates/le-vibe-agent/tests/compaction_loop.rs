@@ -243,6 +243,59 @@ fn summarize_retries_with_the_unified_schedule_and_summarizes_only_the_head() {
     assert!(sent.contains("entry0"), "head must be summarized:\n{sent}");
 }
 
+/// The retained tail must survive compaction **without** being copied into the session file.
+#[test]
+fn applying_a_summary_records_a_boundary_and_duplicates_nothing() {
+    let mut session = SessionStore::in_memory();
+    seed_history(&mut session, 4, 400);
+    session.append("user", "TAIL_MARKER").unwrap();
+
+    let branch = session.context_entries();
+    let before_count = session.entries().len();
+    let plan = compact::plan_cut(
+        &branch
+            .iter()
+            .map(|e| le_vibe_agent::estimate_tokens(&e.content))
+            .collect::<Vec<_>>(),
+        50,
+    );
+    let summary = compact::SummaryPlan {
+        summary: "COMPACTED".into(),
+        keep_from: plan.keep_from,
+        summarized: plan.summarized,
+        kept: plan.kept,
+        before_tokens: 1_000,
+    };
+    let first_kept_id = branch[plan.keep_from].id.clone();
+    compact::apply_summary(&mut session, &branch, &summary).expect("apply");
+
+    // Exactly one new entry: the compaction. The kept tail was not re-appended.
+    assert_eq!(
+        session.entries().len(),
+        before_count + 1,
+        "compaction must add one entry, not copy the tail"
+    );
+    let compaction = session.entries().last().unwrap();
+    assert_eq!(compaction.kind, EntryKind::CompactionSummary);
+    assert_eq!(compaction.first_kept_entry_id.as_deref(), Some(first_kept_id.as_str()));
+    assert_eq!(compaction.tokens_before, Some(1_000));
+
+    // The tail is restored in order, after the summary, and matches the planned slice exactly.
+    let expected: Vec<&str> = branch[plan.keep_from..]
+        .iter()
+        .map(|e| e.content.as_str())
+        .collect();
+    let ctx = session.context_entries();
+    assert_eq!(ctx[0].content, "COMPACTED");
+    let tail: Vec<&str> = ctx[1..].iter().map(|e| e.content.as_str()).collect();
+    assert_eq!(tail, expected, "kept tail must survive in order");
+    assert_eq!(
+        tail.last().copied(),
+        Some("TAIL_MARKER"),
+        "the newest entry always survives"
+    );
+}
+
 #[test]
 fn applying_a_summary_appends_it_and_keeps_the_tail_verbatim() {
     let mut session = SessionStore::in_memory();
@@ -266,11 +319,11 @@ fn applying_a_summary_appends_it_and_keeps_the_tail_verbatim() {
     };
     compact::apply_summary(&mut session, &branch, &summary).expect("apply");
 
-    let active = session.active_branch();
+    let active = session.context_entries();
     assert_eq!(
         active[0].kind,
         EntryKind::CompactionSummary,
-        "compaction summary must become the branch root"
+        "compaction summary must become the context root"
     );
     assert_eq!(active[0].content, "COMPACTED");
     let tail: Vec<&str> = active[1..].iter().map(|e| e.content.as_str()).collect();

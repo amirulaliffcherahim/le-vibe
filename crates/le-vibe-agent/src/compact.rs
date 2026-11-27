@@ -23,9 +23,6 @@ pub const DEFAULT_INSTRUCTION: &str = "Summarize the conversation into a concise
 handoff covering: (1) user goal, (2) files inspected/modified, (3) key decisions and constraints, \
 (4) current state and remaining work. Keep under 600 words.";
 
-/// Cap on how much of the kept tail is re-appended after compaction, so repeated compactions
-/// cannot grow the branch without bound.
-const KEEP_TAIL_MAX_BYTES: usize = 200_000;
 
 /// Headroom kept free below the context window before compacting.
 pub const DEFAULT_RESERVE_TOKENS: u64 = 16_384;
@@ -252,49 +249,24 @@ fn is_retryable(err: &BridgeError) -> bool {
     .any(|needle| text.contains(needle))
 }
 
-/// Persist a summary and re-append the retained tail so the next request still sees it.
+/// Persist a summary with pi's `firstKeptEntryId` boundary.
 ///
-/// `SessionStore::active_branch` stops at the newest `compaction_summary`, so the tail has to be
-/// re-appended as fresh entries to stay in context. That duplicates the kept tail in the raw JSONL
-/// history; the alternative (a `keep_from` pointer in the session schema) would change
-/// `le-vibe-durable`'s DAG walk for every caller, and `KEEP_TAIL_MAX_BYTES` bounds the duplication.
+/// The retained tail is **not** copied: the boundary points at the first kept entry, so
+/// [`SessionStore::context_entries`] restores it in place. Nothing is duplicated on disk.
 pub fn apply_summary(
     session: &mut SessionStore,
     branch: &[SessionEntry],
     plan: &SummaryPlan,
 ) -> Result<(), SessionError> {
-    session.append_compaction(&plan.summary)?;
-    let mut budget = KEEP_TAIL_MAX_BYTES;
-    for entry in branch.iter().skip(plan.keep_from) {
-        let cost = entry.content.len();
-        if cost > budget {
-            break;
-        }
-        budget -= cost;
-        match entry.kind {
-            EntryKind::Message => {
-                session.append(&entry.role, &entry.content)?;
-            }
-            EntryKind::CompactionSummary | EntryKind::BranchSummary => {
-                session.append(&entry.role, &entry.content)?;
-            }
-            EntryKind::ToolCall => {
-                session.append_tool_call(
-                    entry.tool_call_id.clone().unwrap_or_default(),
-                    entry.tool_name.clone().unwrap_or_else(|| "tool".to_string()),
-                    &entry.content,
-                )?;
-            }
-            EntryKind::ToolResult => {
-                session.append_tool_result(
-                    entry.tool_call_id.clone().unwrap_or_default(),
-                    entry.tool_name.clone().unwrap_or_else(|| "tool".to_string()),
-                    &entry.content,
-                )?;
-            }
-            EntryKind::ModelChange | EntryKind::ModeChange | EntryKind::SessionMeta => {}
-        }
-    }
+    let first_kept = branch
+        .get(plan.keep_from)
+        .map(|entry| entry.id.clone())
+        .filter(|_| plan.kept > 0);
+    session.append_compaction_with_keep(
+        &plan.summary,
+        first_kept,
+        Some(plan.before_tokens),
+    )?;
     Ok(())
 }
 

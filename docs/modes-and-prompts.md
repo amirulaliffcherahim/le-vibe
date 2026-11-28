@@ -12,7 +12,16 @@ Cycle with `Shift+Tab` or switch with `/mode <name>`:
 | `rea` | `read`, `grep`, `find`, `ls`, `bash`, `powershell`, `memory_search`, `memory_read` | Reverse-engineering & inspection (no file writes) |
 | `cyber` | All tools | Defensive cybersecurity, code/config audit & hardening |
 
+## Editable Modes & Creator Skills (`examples/modes/`, `examples/skills/`)
+
+`le-vibe` ships `normal` as the single built-in default mode. Add custom personas as Markdown files
+with YAML frontmatter under `~/.le-vibe/mode/*.md` or `.le-vibe/mode/*.md` (see
+`examples/modes/reviewer.md` and `examples/modes/researcher.md`), and copy
+`examples/skills/skill-creator/` or `examples/skills/mode-creator/` into `~/.le-vibe/skill/` (then
+run `/reload`) to author new skills and modes interactively.
+
 ## Sectioned System Prompt (`build_system_prompt`)
+
 
 The prompt is a **short operating manual**, ordered so the cacheable prefix comes first and the
 most volatile block comes last. Rules sit at the top (`<operating_contract>`) and are restated at

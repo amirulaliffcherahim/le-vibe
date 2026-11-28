@@ -849,7 +849,10 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                 CompletionRequest {
                     provider: config.provider.clone(),
                     model: config.model.clone(),
-                    messages: crate::compress::age_stale_tool_results(&messages),
+                    // Keep history strictly append-only on the hot request path so the provider
+                    // KV cache prefix stays warm; append-time compression + reserve compaction
+                    // bound context without mutating already-sent messages.
+                    messages: messages.clone(),
                     system_prompt: config.system_prompt.clone(),
                     tools: tools.clone(),
                     thinking_level: config.thinking_level.clone(),
@@ -2533,5 +2536,125 @@ mod repeat_call_guard_tests {
         body.push_str(REPEAT_CALL_NOTE);
         assert_eq!(body.lines().next(), Some("exit_code=1"));
         assert!(body.ends_with(REPEAT_CALL_NOTE));
+    }
+
+    #[test]
+    fn appending_tool_results_past_six_keeps_earlier_messages_byte_identical() {
+        use crate::{AgentConfig, run_turn_loop};
+        use le_vibe_durable::SessionStore;
+        use le_vibe_pybridge::{
+            AssistantMessage, BridgeError, CompletionRequest, ExtensionPort, ModelSpec,
+            PolicyDecision, PolicyPort, ProviderPort, ToolCall, Usage,
+        };
+        use le_vibe_telemetry::TelemetryRecorder;
+        use serde_json::{Value, json};
+
+        struct RecordingBridge {
+            step: usize,
+            seen_messages: Vec<Vec<le_vibe_pybridge::ChatMessage>>,
+            big_body: String,
+        }
+        impl ProviderPort for RecordingBridge {
+            fn list_providers(&mut self) -> Result<Vec<String>, BridgeError> {
+                Ok(vec!["deepseek".into()])
+            }
+            fn list_models(&mut self, _p: Option<&str>) -> Result<Vec<ModelSpec>, BridgeError> {
+                Ok(vec![])
+            }
+            fn complete(&mut self, req: CompletionRequest) -> Result<AssistantMessage, BridgeError> {
+                self.seen_messages.push(req.messages);
+                self.step += 1;
+                let tool_calls = if self.step <= 9 {
+                    vec![ToolCall {
+                        id: format!("tc_{}", self.step),
+                        name: "ext_big".into(),
+                        arguments: json!({"n": self.step}),
+                        thought_signature: None,
+                    }]
+                } else {
+                    vec![]
+                };
+                Ok(AssistantMessage {
+                    provider: "deepseek".into(),
+                    model: "deepseek-v4-pro".into(),
+                    content: if tool_calls.is_empty() {
+                        "done".into()
+                    } else {
+                        String::new()
+                    },
+                    reasoning_content: None,
+                    tool_calls,
+                    stop_reason: if self.step <= 9 { "tool_calls" } else { "stop" }.into(),
+                    usage: Usage {
+                        input_tokens: 100,
+                        output_tokens: 10,
+                        cache_read_tokens: 0,
+                        cache_write_tokens: 0,
+                        cost_usd: 0.0,
+                    },
+                })
+            }
+        }
+        impl PolicyPort for RecordingBridge {
+            fn evaluate_tool_call(
+                &mut self,
+                _tool: &str,
+                _cmd: Option<&str>,
+                _path: Option<&str>,
+            ) -> Result<PolicyDecision, BridgeError> {
+                Ok(PolicyDecision {
+                    action: "allow".into(),
+                    reason: "ok".into(),
+                })
+            }
+        }
+        impl ExtensionPort for RecordingBridge {
+            fn list_extension_tools(
+                &mut self,
+            ) -> Result<Vec<le_vibe_pybridge::ToolDefinition>, BridgeError> {
+                Ok(vec![le_vibe_pybridge::ToolDefinition {
+                    name: "ext_big".into(),
+                    description: "returns 3KB".into(),
+                    parameters: json!({"type": "object"}),
+                }])
+            }
+            fn execute_extension_tool(
+                &mut self,
+                _name: &str,
+                args: Value,
+            ) -> Result<Value, BridgeError> {
+                Ok(Value::String(format!("step={} {}", args["n"], self.big_body)))
+            }
+            fn invoke_hook(&mut self, _event: &str, _payload: Value) -> Result<Value, BridgeError> {
+                Ok(json!({}))
+            }
+        }
+
+        let mut bridge = RecordingBridge {
+            step: 0,
+            seen_messages: Vec::new(),
+            big_body: "A".repeat(3_000),
+        };
+        let mut session = SessionStore::in_memory();
+        let telemetry = TelemetryRecorder::new();
+        let cfg = AgentConfig {
+            verify_edits: false,
+            ..AgentConfig::default()
+        };
+        run_turn_loop(&mut bridge, &mut session, &telemetry, &cfg, "run 9 steps").unwrap();
+
+        assert!(bridge.seen_messages.len() >= 10);
+        // On turns 7, 8, 9, 10, every earlier message sent on the prior turn must remain
+        // byte-identical so the provider KV cache prefix is never invalidated.
+        for pair in bridge.seen_messages.windows(2) {
+            let prev = &pair[0];
+            let next = &pair[1];
+            assert!(next.len() >= prev.len());
+            assert_eq!(
+                &next[..prev.len()],
+                prev.as_slice(),
+                "earlier messages mutated between turns (KV cache busted)"
+            );
+        }
     }
 }

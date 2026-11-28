@@ -306,11 +306,11 @@ modules or carries architectural risk.\n\
 4. Prove every code or config edit with the narrowest relevant check (unit test, linter, build, or \
 reproduction script).\n\
 5. Base every claim on actual tool output. Report exact exit codes and failing lines.\n\
-6. Batch independent lookups into one turn (parallel `grep`/`read`, or one `codemode` script): \
-every step re-sends the transcript, so an extra turn costs more than extra bytes. Read enough that \
-an `edit` cannot fail on ambiguity.\n\
-7. Route high-volume work (build logs, sweeps, speculative search) through `codemode` or \
-`spawn_agent`; only the conclusion then enters the transcript.\n
+6. Batch independent lookups into one turn (parallel `grep`/`read`): every step re-sends the \
+transcript, so an extra turn costs more than extra bytes. Read enough that `edit` stays unambiguous.\n\
+7. Use `read`, `edit`, and `powershell`/`bash` directly for single-file reads, localized edits, and \
+single test runs; reserve `codemode` for multi-file sweeps, log filtering, or scripted batch \
+transforms whose raw output would bloat context.\n\
 8. After three attempts at the same failure, stop patching: restate the task, list assumptions that \
 may be wrong, and change approach.\n\
 9. Match effort to the ask: greetings, connectivity checks, general questions and 1-2 word inputs \
@@ -326,12 +326,11 @@ are needed for a decision.\n\
 for durable decisions, constraints, preferences or bug root causes (stable `key`, 3-6 synonym \
 `keywords`) - never for task chatter.\n\
 - `web_search` / `fetch_content` only for external or current documentation.\n\
-- `codemode`, when available, is the cheap path for a sweep: one script, one turn.\n\
 - Style: plain language, ready-to-run commands and code in fenced blocks, compact tables, no \
 filler or tool narration.\n\
 </tools>\n\n\
 <environment>\n\
-os={os}, active_shell={shell}, cwd={cwd}, workspace={repo_state}\n\
+os={os}, active_shell={shell}\n\
 </environment>\n\n\
 <mode name=\"{}\">\n\
 {}\n{}
@@ -442,6 +441,12 @@ policy, SSE watchdog), tui (keys, layout, modals, markdown, prompts), cli (event
             }
         }
     }
+
+    // Volatile workspace metadata sits after static instructions so a `cd` does not
+    // invalidate `<mode>`, `<skills>`, or static instruction files in the KV cache prefix.
+    prompt.push_str(&format!(
+        "\n\n<workspace>\ncwd={cwd}, workspace={repo_state}\n</workspace>"
+    ));
 
     // Most volatile block last: a memory write mid-session must not invalidate the prefix above it.
     if !memory_toc.trim().is_empty() {

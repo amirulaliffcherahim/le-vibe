@@ -8,7 +8,7 @@ from typing import Any
 import httpx
 
 from le_vibe.providers.auth import VIBE_USER_AGENT, resolve_api_key
-from le_vibe.providers.catalog import list_models
+from le_vibe.providers.catalog import list_models, resolve_reasoning_effort
 from le_vibe.providers.transport import (
     FIRST_OUTPUT_WAIT_SECONDS,
     STREAM_IDLE_SECONDS,
@@ -165,9 +165,9 @@ def build_vibe_payload(
             }
             for t in context.tools
         ]
-    if model.reasoning and options.thinking_level != "off":
-        mapped = model.thinking_level_map.get(options.thinking_level, options.thinking_level)
-        if mapped != "none":
+    if model.reasoning:
+        mapped = resolve_reasoning_effort(model, options.thinking_level)
+        if mapped and mapped != "none":
             payload["reasoning_effort"] = mapped
     return payload
 

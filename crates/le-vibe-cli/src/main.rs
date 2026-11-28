@@ -2,6 +2,7 @@ mod cli;
 mod debug_log;
 mod features;
 mod learn;
+mod optimize;
 mod rpc;
 mod settings;
 #[cfg(feature = "dev-debug")]
@@ -156,9 +157,26 @@ fn main() {
         CliAction::Subcommand(ref sub, ref sub_args)
             if matches!(
                 sub.as_str(),
-                "usage" | "install" | "remove" | "list" | "update" | "doctor"
+                "usage" | "optimize" | "install" | "remove" | "list" | "update" | "doctor"
             ) =>
         {
+            if sub == "optimize" {
+                let paths = optimize::OptimizePaths::default_user();
+                if sub_args.iter().any(|a| a == "--rollback") {
+                    match optimize::run_optimize_rollback(&paths) {
+                        Ok(msg) => println!("{msg}"),
+                        Err(err) => eprintln!("Optimize rollback failed: {err}"),
+                    }
+                } else if sub_args.iter().any(|a| a == "--apply") {
+                    match optimize::run_optimize_apply(&paths) {
+                        Ok(msg) => println!("{msg}"),
+                        Err(err) => eprintln!("Optimize apply failed: {err}"),
+                    }
+                } else {
+                    println!("{}", optimize::run_optimize_dry_run(&paths));
+                }
+                return;
+            }
             if sub == "usage" {
                 let target = if let Some(arg) = sub_args.first() {
                     let p = std::path::PathBuf::from(arg);
@@ -1669,6 +1687,30 @@ fn run_interactive_tui(
                         None => "No forensic usage records found for this session yet.".to_string(),
                     };
                     state.blocks.push(TranscriptBlock::System(report));
+                    continue;
+                }
+                if input == "/optimize" || input.starts_with("/optimize ") {
+                    let arg = input.strip_prefix("/optimize").unwrap_or("").trim();
+                    let paths = optimize::OptimizePaths::default_user();
+                    let msg = match arg {
+                        "apply" => match optimize::run_optimize_apply(&paths) {
+                            Ok(m) => format!(
+                                "{m}\n(Takes effect on next session or `/reload`.)"
+                            ),
+                            Err(err) => format!("Optimize apply failed: {err}"),
+                        },
+                        "rollback" => match optimize::run_optimize_rollback(&paths) {
+                            Ok(m) => format!(
+                                "{m}\n(Takes effect on next session or `/reload`.)"
+                            ),
+                            Err(err) => format!("Optimize rollback failed: {err}"),
+                        },
+                        "" | "preview" | "dry-run" => optimize::run_optimize_dry_run(&paths),
+                        other => format!(
+                            "Unknown /optimize action {other:?}. Use: /optimize | /optimize apply | /optimize rollback"
+                        ),
+                    };
+                    state.blocks.push(TranscriptBlock::System(msg));
                     continue;
                 }
                 if let Some(arg) = input.strip_prefix("/ext load ") {

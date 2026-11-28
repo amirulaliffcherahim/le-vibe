@@ -117,6 +117,12 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandSpec] = &[
         picker_on_bare: false,
     },
     SlashCommandSpec {
+        name: "/optimize",
+        hint: "[apply|rollback]",
+        description: "Harness2 0-LLM usage optimizer (LEARNED_USAGE.md)",
+        picker_on_bare: false,
+    },
+    SlashCommandSpec {
         name: "/auth",
         hint: "",
         description: "View provider authentication status & sign in",

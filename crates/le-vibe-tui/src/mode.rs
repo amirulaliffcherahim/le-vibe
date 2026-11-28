@@ -564,6 +564,24 @@ are unavailable.\n"
     } else {
         ""
     };
+    let has_memory = spec.tools.get("memory_search") == Some(&true)
+        || spec.tools.get("memory_write") == Some(&true)
+        || spec.extensions.iter().any(|e| e.eq_ignore_ascii_case("memory"));
+    let has_web = spec.tools.get("web_search") == Some(&true)
+        || spec.tools.get("fetch_content") == Some(&true)
+        || spec.extensions.iter().any(|e| e.eq_ignore_ascii_case("web"));
+    let memory_hint = if has_memory {
+        "- `memory_search` when past decisions, gotchas or user preferences may apply. `memory_write` only \
+for durable decisions, constraints, preferences or bug root causes (stable `key`, 3-6 synonym \
+`keywords`) - never for task chatter.\n"
+    } else {
+        ""
+    };
+    let web_hint = if has_web {
+        "- `web_search` / `fetch_content` only for external or current documentation.\n"
+    } else {
+        ""
+    };
     // A non-repo start directory is a strong hint that the task is not a codebase sweep.
     let repo_state = if std::path::Path::new(cwd).join(".git").exists() {
         "git repo"
@@ -601,10 +619,8 @@ get a direct answer with no tool calls, plus one focused question when intent is
 {shell_hint}\
 - Compressed tool output keeps a reference id: call `retrieve_output` only when the missing lines \
 are needed for a decision.\n\
-- `memory_search` when past decisions, gotchas or user preferences may apply. `memory_write` only \
-for durable decisions, constraints, preferences or bug root causes (stable `key`, 3-6 synonym \
-`keywords`) - never for task chatter.\n\
-- `web_search` / `fetch_content` only for external or current documentation.\n\
+{memory_hint}\
+{web_hint}\
 - Style: plain language, ready-to-run commands and code in fenced blocks, compact tables, no \
 filler or tool narration.\n\
 </tools>\n\n\
@@ -684,6 +700,19 @@ policy, SSE watchdog), tui (keys, layout, modals, markdown, prompts), cli (event
                 "\n\n<append_system path=\"{}\">\n{}\n</append_system>",
                 ap.display(),
                 cap_utf8(&raw, 4000)
+            ));
+        }
+        // Bounded runtime rules from `/optimize`: frozen at session start (reloaded only on `/reload`).
+        let learned_path = std::path::Path::new(&home)
+            .join(".le-vibe")
+            .join("LEARNED_USAGE.md");
+        if let Ok(raw) = std::fs::read_to_string(&learned_path)
+            && !raw.trim().is_empty()
+        {
+            prompt.push_str(&format!(
+                "\n\n<learned_usage path=\"{}\">\n{}\n</learned_usage>",
+                learned_path.display(),
+                cap_utf8(&raw, 1500)
             ));
         }
     }

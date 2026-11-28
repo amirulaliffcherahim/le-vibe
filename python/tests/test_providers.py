@@ -717,6 +717,44 @@ def test_agy_refresh_evicts_on_invalid_grant_and_keeps_on_network_error(
 
 
 @pytest.mark.asyncio
+async def test_agy_synthesized_tool_call_ids_are_unique_across_turns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A per-response counter restarted at 1 every turn, so long sessions ended up with
+    dozens of tool results sharing `agy_call_1` and id-based pairing became ambiguous."""
+    import time
+    from le_vibe.providers import save_oidc_tokens
+
+    auth_file = tmp_path / "auth.json"
+    monkeypatch.setenv("LE_VIBE_AUTH_FILE", str(auth_file))
+    save_oidc_tokens(
+        "agy",
+        access_token="ya29.tok",
+        expires_at=time.time() + 3600,
+        project_id="aicode-consumers",
+        auth_file=auth_file,
+    )
+    # No `id` on the functionCall: this is the Gemini path that used to synthesize one.
+    sse = 'data: {"response":{"candidates":[{"content":{"parts":[{"functionCall":{"name":"read","args":{"path":"x.py"}}}]},"finishReason":"STOP"}]}}\ndata: [DONE]\n'
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=sse)
+
+    ids: list[str] = []
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = AgyProvider(client=client)
+        for _ in range(3):
+            msg = await provider.complete(
+                _grouped_flash_model(),
+                TranscriptContext(messages=[Message(role="user", content="read x.py")]),
+            )
+            ids.append(msg.tool_calls[0].id)
+
+    assert len(ids) == len(set(ids)), f"tool-call ids collided across turns: {ids}"
+    assert all(i.startswith("agy_call_") and i.endswith("_1") for i in ids)
+
+
+@pytest.mark.asyncio
 async def test_agy_claude_tool_call_id_roundtrips_and_headers_match_reference(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

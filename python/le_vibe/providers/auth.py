@@ -83,6 +83,20 @@ AGY_DEFAULT_CLIENT_SECRET = os.environ.get("AGY_OAUTH_CLIENT_SECRET", "").strip(
 AGY_TOKEN_EXPIRY_LEEWAY_S = 30.0
 # An OAuth access token shorter than this is a stub, not a credential.
 _MIN_PLAUSIBLE_TOKEN_CHARS = 20
+
+
+def shared_cli_stores_enabled(env: Mapping[str, str] | None = None) -> bool:
+    """Whether le-vibe may borrow from / write to other CLIs' credential stores.
+
+    Default **off**: le-vibe signs in as itself and keeps its grant in `~/.le-vibe/auth.json`.
+    The shared slots belong to `mistral-vibe` (`ai.mistral.vibe.oidc`) and `agy-cli`
+    (`gemini:antigravity` keyring + `~/.gemini/jetski-standalone-oauth-token`); reading them
+    makes le-vibe look logged in when it is not, and writing them silently rotates the other
+    client's token, which then forces *it* to re-login. Opt in with
+    `LE_VIBE_SHARE_CLI_CREDENTIALS=1` when a single sign-in for both tools is wanted.
+    """
+    env_map = env if env is not None else os.environ
+    return env_map.get("LE_VIBE_SHARE_CLI_CREDENTIALS", "").strip().lower() in {"1", "true", "yes"}
 _AGY_FATAL_OAUTH_ERRORS = frozenset({"invalid_grant", "invalid_client", "unauthorized_client"})
 _AGY_REQUIRED_SCOPES = frozenset(AGY_OAUTH_SCOPES.split()) - {"openid"}
 
@@ -526,7 +540,12 @@ def save_oidc_tokens(
             entry[key] = value
     store[provider] = entry
     path = _write_auth_store(store, auth_file)
-    if auth_file is None and not os.environ.get("LE_VIBE_AUTH_FILE"):
+    if (
+        auth_file is None
+        and not os.environ.get("LE_VIBE_AUTH_FILE")
+        and shared_cli_stores_enabled()
+    ):
+        # Mirrored only on opt-in: le-vibe's grant stays its own by default.
         if provider == "agy":
             _save_agy_official_token(entry)
         elif provider == "vibe":
@@ -775,13 +794,20 @@ def delete_credential(provider: ProviderId, *, auth_file: Path | None = None) ->
     if removed:
         _write_auth_store(store, auth_file)
     if auth_file is None and not os.environ.get("LE_VIBE_AUTH_FILE"):
+        # Revoke le-vibe's own grant (it is le-vibe's to give up), but leave the other CLIs'
+        # stores alone unless sharing was explicitly enabled: deleting `ai.mistral.vibe.oidc`
+        # or `~/.gemini/jetski-standalone-oauth-token` signs `mistral-vibe` / `agy-cli` out.
         if provider == "vibe":
-            expected = _load_vibe_official_token()
-            if expected and expected.get("refresh_token"):
-                _revoke_vibe_refresh_token(str(expected["refresh_token"]))
-            _keyring_delete(_VIBE_OIDC_KEYRING_SERVICE, _VIBE_OIDC_KEYRING_ENTRY)
-            _remove_vibe_env_key()
-        elif provider == "agy":
+            stored = _read_auth_store(auth_file).get("vibe")
+            if isinstance(stored, dict) and stored.get("refresh_token"):
+                _revoke_vibe_refresh_token(str(stored["refresh_token"]))
+            if shared_cli_stores_enabled():
+                expected = _load_vibe_official_token()
+                if expected and expected.get("refresh_token"):
+                    _revoke_vibe_refresh_token(str(expected["refresh_token"]))
+                _keyring_delete(_VIBE_OIDC_KEYRING_SERVICE, _VIBE_OIDC_KEYRING_ENTRY)
+                _remove_vibe_env_key()
+        elif provider == "agy" and shared_cli_stores_enabled():
             for service, account in _AGY_KEYRING_SLOTS:
                 _keyring_delete(service, account)
             try:
@@ -1318,9 +1344,10 @@ def get_agy_project_id(*, auth_file: Path | None = None) -> str:
     saved = _read_auth_store(auth_file).get("agy")
     if isinstance(saved, dict) and isinstance(saved.get("project_id"), str) and saved["project_id"]:
         return saved["project_id"]
-    official = _load_agy_official_token()
-    if official and isinstance(official.get("project_id"), str):
-        return official["project_id"]
+    if shared_cli_stores_enabled():
+        official = _load_agy_official_token()
+        if official and isinstance(official.get("project_id"), str):
+            return official["project_id"]
     return ""
 
 
@@ -1875,6 +1902,8 @@ def login_vibe_oidc(
 
 
 def _official_oidc_entry(provider: ProviderId) -> dict[str, Any] | None:
+    if not shared_cli_stores_enabled():
+        return None
     if provider == "agy":
         return _load_agy_official_token()
     if provider == "vibe":

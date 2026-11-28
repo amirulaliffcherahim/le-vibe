@@ -1118,3 +1118,57 @@ def test_a_stub_bundle_is_never_written_back(monkeypatch: pytest.MonkeyPatch) ->
     assert json.loads(written[0])["id_token"] == "kept-id-token"
 
 
+
+
+def test_other_clis_credential_stores_are_untouched_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """le-vibe signs in as itself: no reading and no writing of the shared slots, so an actual
+    `mistral-vibe` / `agy-cli` sign-in is neither borrowed nor rotated."""
+    import time
+    from le_vibe.providers import auth
+
+    monkeypatch.delenv("LE_VIBE_SHARE_CLI_CREDENTIALS", raising=False)
+    monkeypatch.delenv("LE_VIBE_AUTH_FILE", raising=False)
+    monkeypatch.setattr(auth, "default_auth_file", lambda: tmp_path / "auth.json")
+
+    reads: list[str] = []
+    writes: list[str] = []
+    deletes: list[str] = []
+    monkeypatch.setattr(
+        auth, "_load_vibe_official_token", lambda: reads.append("vibe") or {"access_token": "x" * 40}
+    )
+    monkeypatch.setattr(
+        auth, "_load_agy_official_token", lambda: reads.append("agy") or {"access_token": "y" * 40}
+    )
+    monkeypatch.setattr(auth, "_save_vibe_official_token", lambda entry: writes.append("vibe"))
+    monkeypatch.setattr(auth, "_save_agy_official_token", lambda entry: writes.append("agy"))
+    monkeypatch.setattr(
+        auth, "_keyring_delete", lambda service, entry: deletes.append(service)
+    )
+
+    assert auth._official_oidc_entry("vibe") is None
+    assert auth._official_oidc_entry("agy") is None
+
+    auth.save_oidc_tokens(
+        "vibe", access_token="own-access-token-long-enough", expires_at=time.time() + 3600
+    )
+    auth.save_oidc_tokens(
+        "agy", access_token="own-access-token-long-enough", expires_at=time.time() + 3600
+    )
+    auth.delete_credential("agy")
+
+    assert reads == [], "the shared stores must not be read by default"
+    assert writes == [], "the shared stores must not be written by default"
+    assert "gemini" not in deletes, "agy-cli's keyring must not be deleted"
+
+
+def test_sharing_is_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    from le_vibe.providers import auth
+
+    monkeypatch.setenv("LE_VIBE_SHARE_CLI_CREDENTIALS", "1")
+    assert auth.shared_cli_stores_enabled() is True
+    monkeypatch.setenv("LE_VIBE_SHARE_CLI_CREDENTIALS", "0")
+    assert auth.shared_cli_stores_enabled() is False
+    monkeypatch.delenv("LE_VIBE_SHARE_CLI_CREDENTIALS")
+    assert auth.shared_cli_stores_enabled({}) is False

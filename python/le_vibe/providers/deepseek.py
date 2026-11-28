@@ -114,7 +114,14 @@ class DeepSeekProvider:
         usage = Usage()
 
         async for chunk in stream_sse_json(
-            url, headers=headers, payload=payload, timeout_s=opts.timeout_s, client=self._client
+            url,
+            headers=headers,
+            payload=payload,
+            timeout_s=opts.timeout_s,
+            client=self._client,
+            max_retry_elapsed_s=0.0,
+            provider="deepseek",
+            model=model.id,
         ):
             if raw_usage := chunk.get("usage"):
                 in_tok = int(raw_usage.get("prompt_tokens", 0))
@@ -129,12 +136,17 @@ class DeepSeekProvider:
                     or raw_usage.get("prompt_tokens_details", {}).get("cache_write_tokens", 0)
                     or 0
                 )
+                reasoning_tok = int(
+                    (raw_usage.get("completion_tokens_details") or {}).get("reasoning_tokens", 0)
+                    or 0
+                )
                 uncached_in = max(0, in_tok - cache_read)
                 usage = Usage(
                     input_tokens=uncached_in,
                     output_tokens=out_tok,
                     cache_read_tokens=cache_read,
                     cache_write_tokens=cache_write,
+                    reasoning_tokens=reasoning_tok,
                     cost_usd=calculate_cost_usd(
                         input_tokens=uncached_in,
                         output_tokens=out_tok,

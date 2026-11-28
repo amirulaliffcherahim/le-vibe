@@ -20,7 +20,7 @@ from le_vibe.providers.catalog import list_models
 from le_vibe.providers.transport import (
     FIRST_OUTPUT_WAIT_SECONDS,
     STREAM_IDLE_SECONDS,
-    StreamStalledError,
+    calculate_cost_usd,
     stream_sse_json,
 )
 from le_vibe.providers.types import (
@@ -278,102 +278,87 @@ class AgyProvider:
         stop_reason = "stop"
         usage = Usage()
 
-        continuation_attempts = 0
         # Stable for this response, unique across responses in the session.
         call_salt = hashlib.sha1(
             str(payload.get("requestId") or uuid.uuid4()).encode()
         ).hexdigest()[:8]
-        stream_payload = payload
-        while True:
-            yielded_any = False
-            try:
-                async for chunk in stream_sse_json(
-                    url,
-                    headers=headers,
-                    payload=stream_payload,
-                    timeout_s=opts.timeout_s,
-                    client=self._client,
-                    on_unauthorized=_on_unauthorized,
-                    first_output_timeout_s=FIRST_OUTPUT_WAIT_SECONDS,
-                    idle_timeout_s=STREAM_IDLE_SECONDS,
-                    max_retry_elapsed_s=opts.timeout_s,
-                ):
-                    yielded_any = True
-                    inner = chunk.get("response") or chunk
-                    if meta := inner.get("usageMetadata"):
-                        prompt_tok = int(meta.get("promptTokenCount", 0))
-                        cache_read = int(meta.get("cachedContentTokenCount", 0))
-                        cache_write = int(meta.get("cacheCreationInputTokenCount", 0))
-                        usage = Usage(
-                            input_tokens=max(0, prompt_tok - cache_read),
-                            output_tokens=int(meta.get("candidatesTokenCount", 0)),
-                            cache_read_tokens=cache_read,
-                            cache_write_tokens=cache_write,
-                        )
+        # Rust le-vibe-agent is the single retry owner: fail fast in 1 HTTP attempt.
+        async for chunk in stream_sse_json(
+            url,
+            headers=headers,
+            payload=payload,
+            timeout_s=opts.timeout_s,
+            client=self._client,
+            on_unauthorized=_on_unauthorized,
+            first_output_timeout_s=FIRST_OUTPUT_WAIT_SECONDS,
+            idle_timeout_s=STREAM_IDLE_SECONDS,
+            max_retry_elapsed_s=0.0,
+            provider="agy",
+            model=model.id,
+        ):
+            inner = chunk.get("response") or chunk
+            if meta := inner.get("usageMetadata"):
+                prompt_tok = int(meta.get("promptTokenCount", 0))
+                cache_read = int(meta.get("cachedContentTokenCount", 0))
+                cache_write = int(meta.get("cacheCreationInputTokenCount", 0))
+                candidates_tok = int(meta.get("candidatesTokenCount", 0))
+                thoughts_tok = int(meta.get("thoughtsTokenCount", 0))
+                uncached_in = max(0, prompt_tok - cache_read)
+                # Gemini reports thoughtsTokenCount separately from candidatesTokenCount
+                # and bills output as candidates + thoughts.
+                billed_out = candidates_tok + thoughts_tok
+                usage = Usage(
+                    input_tokens=uncached_in,
+                    output_tokens=billed_out,
+                    cache_read_tokens=cache_read,
+                    cache_write_tokens=cache_write,
+                    reasoning_tokens=thoughts_tok,
+                    cost_usd=calculate_cost_usd(
+                        input_tokens=uncached_in,
+                        output_tokens=billed_out,
+                        cache_read_tokens=cache_read,
+                        input_per_m=model.cost.input,
+                        output_per_m=model.cost.output,
+                        cache_read_per_m=model.cost.cache_read,
+                    ),
+                )
 
-                    candidates = inner.get("candidates") or []
-                    if not candidates:
-                        continue
-                    cand = candidates[0]
-                    if finish := cand.get("finishReason"):
-                        stop_reason = str(finish).lower()
-                    parts = (cand.get("content") or {}).get("parts") or []
-                    for part in parts:
-                        if part.get("thought") and (txt := part.get("text")):
-                            reasoning_parts.append(txt)
-                            yield StreamEvent(type="thinking_delta", delta=txt)
-                        elif txt := part.get("text"):
-                            text_parts.append(txt)
-                            yield StreamEvent(type="text_delta", delta=txt)
-                        elif fc := part.get("functionCall"):
-                            sig = part.get("thoughtSignature")
-                            # Google returns the id for Claude-backed calls; keep it.
-                            raw_id = fc.get("id")
-                            call_id = (
-                                str(raw_id)
-                                if isinstance(raw_id, str) and raw_id.strip()
-                                # Salted per response: a bare counter restarted at 1 on every
-                                # turn, so one long session ended up with 80 tool results
-                                # sharing `agy_call_1` and tool-result pairing by id became
-                                # ambiguous. The salt is fixed for this response, so the ids
-                                # stay stable once persisted (prefix caching is unaffected).
-                                else f"agy_call_{call_salt}_{len(tool_calls) + 1}"
-                            )
-                            call = ToolCall(
-                                id=call_id,
-                                name=str(fc.get("name", "")),
-                                arguments=dict(fc.get("args") or {}),
-                                thought_signature=str(sig) if isinstance(sig, str) and sig else None,
-                            )
-                            tool_calls.append(call)
-                            yield StreamEvent(type="tool_call", tool_call=call)
-                break
-            except (StreamStalledError, RuntimeError) as exc:
-                if not yielded_any or continuation_attempts >= 2:
-                    raise
-                continuation_attempts += 1
-                # Resume with the partial assistant turn instead of restarting it.
-                contents = list(payload["request"]["contents"])
-                partial = "".join(text_parts)
-                if partial:
-                    contents.append({"role": "model", "parts": [{"text": partial}]})
-                    contents.append(
-                        {
-                            "role": "user",
-                            "parts": [{"text": "Continue exactly where you left off. Do not repeat text."}],
-                        }
+            candidates = inner.get("candidates") or []
+            if not candidates:
+                continue
+            cand = candidates[0]
+            if finish := cand.get("finishReason"):
+                stop_reason = str(finish).lower()
+            parts = (cand.get("content") or {}).get("parts") or []
+            for part in parts:
+                if part.get("thought") and (txt := part.get("text")):
+                    reasoning_parts.append(txt)
+                    yield StreamEvent(type="thinking_delta", delta=txt)
+                elif txt := part.get("text"):
+                    text_parts.append(txt)
+                    yield StreamEvent(type="text_delta", delta=txt)
+                elif fc := part.get("functionCall"):
+                    sig = part.get("thoughtSignature")
+                    # Google returns the id for Claude-backed calls; keep it.
+                    raw_id = fc.get("id")
+                    call_id = (
+                        str(raw_id)
+                        if isinstance(raw_id, str) and raw_id.strip()
+                        # Salted per response: a bare counter restarted at 1 on every
+                        # turn, so one long session ended up with 80 tool results
+                        # sharing `agy_call_1` and tool-result pairing by id became
+                        # ambiguous. The salt is fixed for this response, so the ids
+                        # stay stable once persisted (prefix caching is unaffected).
+                        else f"agy_call_{call_salt}_{len(tool_calls) + 1}"
                     )
-                stream_payload = {
-                    **payload,
-                    "request": {
-                        **payload["request"],
-                        "contents": contents,
-                        "labels": {
-                            **payload["request"].get("labels", {}),
-                            "continuation": "true",
-                        },
-                    },
-                }
+                    call = ToolCall(
+                        id=call_id,
+                        name=str(fc.get("name", "")),
+                        arguments=dict(fc.get("args") or {}),
+                        thought_signature=str(sig) if isinstance(sig, str) and sig else None,
+                    )
+                    tool_calls.append(call)
+                    yield StreamEvent(type="tool_call", tool_call=call)
 
         message = AssistantMessage(
             provider="agy",

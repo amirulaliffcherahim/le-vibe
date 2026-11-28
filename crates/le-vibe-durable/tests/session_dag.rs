@@ -73,6 +73,7 @@ fn turn_usage_is_persisted_so_a_finished_session_can_be_costed() {
                 input_tokens: 1_200,
                 cache_read_tokens: 9_000,
                 cache_write_tokens: 300,
+                reasoning_tokens: 0,
                 output_tokens: 450,
             },
         )
@@ -475,6 +476,7 @@ fn a_tool_call_entry_can_carry_the_turns_usage() {
                 input_tokens: 100,
                 cache_read_tokens: 900,
                 cache_write_tokens: 0,
+                reasoning_tokens: 0,
                 output_tokens: 20,
             }),
         )

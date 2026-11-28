@@ -301,6 +301,7 @@ fn entry_usage(usage: &le_vibe_pybridge::Usage) -> EntryUsage {
         cache_read_tokens: usage.cache_read_tokens,
         cache_write_tokens: usage.cache_write_tokens,
         output_tokens: usage.output_tokens,
+        reasoning_tokens: usage.reasoning_tokens,
     }
 }
 
@@ -910,13 +911,7 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
     let mut pending_anomalies: Vec<String> = Vec::new();
     let mut next_is_verification_nudge = false;
     let mut compaction_just_ran = false;
-    let mut cumulative_usage = le_vibe_pybridge::Usage {
-        input_tokens: 0,
-        output_tokens: 0,
-        cache_read_tokens: 0,
-        cache_write_tokens: 0,
-        cost_usd: 0.0,
-    };
+    let mut cumulative_usage = le_vibe_pybridge::Usage::default();
     let mut last_context_tokens: u64 = 0;
     let mut overflow_recovery_attempted = false;
     let mut threshold_compactions = 0usize;
@@ -1104,6 +1099,7 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                             cache_read: r.usage.cache_read_tokens,
                             cache_write: r.usage.cache_write_tokens,
                             out: r.usage.output_tokens,
+                            reasoning_tokens: r.usage.reasoning_tokens,
                             cost_usd: r.usage.cost_usd,
                             system_text: system_text_for_hash.clone(),
                             tools_text: tools_text_for_hash.clone(),
@@ -1332,6 +1328,9 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
         cumulative_usage.cache_write_tokens = cumulative_usage
             .cache_write_tokens
             .saturating_add(reply.usage.cache_write_tokens);
+        cumulative_usage.reasoning_tokens = cumulative_usage
+            .reasoning_tokens
+            .saturating_add(reply.usage.reasoning_tokens);
         cumulative_usage.cost_usd += reply.usage.cost_usd;
         if reply.usage.input_tokens > 0 {
             on_event(AgentEvent::TurnUsage {
@@ -2110,8 +2109,10 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
         tool_call_id: None,
         name: None,
     });
-    if !is_cancelled(cancel)
-        && let Ok(mut wrap_reply) = bridge.stream_complete(
+    if !is_cancelled(cancel) {
+        req_counter.fetch_add(1, Ordering::Relaxed);
+        let wrap_started = std::time::Instant::now();
+        let wrap_res = bridge.stream_complete(
             CompletionRequest {
                 provider: config.provider.clone(),
                 model: config.model.clone(),
@@ -2125,15 +2126,73 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                 "text_delta" => on_event(AgentEvent::TextDelta { delta: ev.delta }),
                 _ => {}
             },
-        )
-    {
-        wrap_reply.stop_reason = "max_turns".to_string();
-        let _ = session.append("assistant", &wrap_reply.content);
-        on_event(AgentEvent::TurnEnd {
-            stop_reason: wrap_reply.stop_reason.clone(),
-        });
-        hooks.run_stop();
-        return Ok(wrap_reply);
+        );
+        let wrap_wall_ms = wrap_started.elapsed().as_millis() as u64;
+        if let Ok(mut wrap_reply) = wrap_res {
+            cumulative_usage.input_tokens = cumulative_usage
+                .input_tokens
+                .saturating_add(wrap_reply.usage.input_tokens);
+            cumulative_usage.output_tokens = cumulative_usage
+                .output_tokens
+                .saturating_add(wrap_reply.usage.output_tokens);
+            cumulative_usage.cache_read_tokens = cumulative_usage
+                .cache_read_tokens
+                .saturating_add(wrap_reply.usage.cache_read_tokens);
+            cumulative_usage.cache_write_tokens = cumulative_usage
+                .cache_write_tokens
+                .saturating_add(wrap_reply.usage.cache_write_tokens);
+            cumulative_usage.reasoning_tokens = cumulative_usage
+                .reasoning_tokens
+                .saturating_add(wrap_reply.usage.reasoning_tokens);
+            cumulative_usage.cost_usd += wrap_reply.usage.cost_usd;
+            if let Some(logger) = &active_logger {
+                logger.record_request(UsageEventInput {
+                    turn_idx: config.max_turns + 1,
+                    source: "wrap_reply".to_string(),
+                    provider: config.provider.clone(),
+                    model: config.model.clone(),
+                    http_status: 200,
+                    stop_reason: "max_turns".to_string(),
+                    wall_ms: wrap_wall_ms,
+                    in_uncached: wrap_reply.usage.input_tokens,
+                    cache_read: wrap_reply.usage.cache_read_tokens,
+                    cache_write: wrap_reply.usage.cache_write_tokens,
+                    out: wrap_reply.usage.output_tokens,
+                    reasoning_tokens: wrap_reply.usage.reasoning_tokens,
+                    cost_usd: wrap_reply.usage.cost_usd,
+                    system_text: system_text_for_hash.clone(),
+                    tools_text: "[]".to_string(),
+                    ..Default::default()
+                });
+            }
+            wrap_reply.stop_reason = "max_turns".to_string();
+            wrap_reply.usage = cumulative_usage;
+            let _ = session.append_with_usage(
+                "assistant",
+                &wrap_reply.content,
+                entry_usage(&wrap_reply.usage),
+            );
+            on_event(AgentEvent::TurnEnd {
+                stop_reason: wrap_reply.stop_reason.clone(),
+            });
+            hooks.run_stop();
+            return Ok(wrap_reply);
+        } else if let Err(err) = wrap_res
+            && let Some(logger) = &active_logger
+        {
+            logger.record_request(UsageEventInput {
+                turn_idx: config.max_turns + 1,
+                source: "wrap_reply".to_string(),
+                provider: config.provider.clone(),
+                model: config.model.clone(),
+                http_status: extract_http_status(&err.to_string()).unwrap_or(500),
+                stop_reason: "error".to_string(),
+                wall_ms: wrap_wall_ms,
+                system_text: system_text_for_hash.clone(),
+                tools_text: "[]".to_string(),
+                ..Default::default()
+            });
+        }
     }
 
     let note = if last_partial_text.trim().is_empty() {
@@ -2165,6 +2224,7 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
             output_tokens: 0,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            reasoning_tokens: 0,
             cost_usd: 0.0,
         },
     })
@@ -2207,6 +2267,7 @@ mod tests {
                         output_tokens: 5,
                         cache_read_tokens: 0,
                         cache_write_tokens: 0,
+                        reasoning_tokens: 0,
                         cost_usd: 0.0,
                     },
                 })
@@ -2223,6 +2284,7 @@ mod tests {
                         output_tokens: 10,
                         cache_read_tokens: 0,
                         cache_write_tokens: 0,
+                        reasoning_tokens: 0,
                         cost_usd: 0.0,
                     },
                 })
@@ -2302,6 +2364,7 @@ mod tests {
                             output_tokens: 1,
                             cache_read_tokens: 0,
                             cache_write_tokens: 0,
+                            reasoning_tokens: 0,
                             cost_usd: 0.0,
                         },
                     })
@@ -2318,6 +2381,7 @@ mod tests {
                             output_tokens: 1,
                             cache_read_tokens: 0,
                             cache_write_tokens: 0,
+                            reasoning_tokens: 0,
                             cost_usd: 0.0,
                         },
                     })
@@ -2422,6 +2486,7 @@ mod tests {
                             output_tokens: 1,
                             cache_read_tokens: 0,
                             cache_write_tokens: 0,
+                            reasoning_tokens: 0,
                             cost_usd: 0.0,
                         },
                     })
@@ -2438,6 +2503,7 @@ mod tests {
                             output_tokens: 1,
                             cache_read_tokens: 0,
                             cache_write_tokens: 0,
+                            reasoning_tokens: 0,
                             cost_usd: 0.0,
                         },
                     })
@@ -2581,6 +2647,7 @@ mod tests {
                         output_tokens: 1,
                         cache_read_tokens: 0,
                         cache_write_tokens: 0,
+                        reasoning_tokens: 0,
                         cost_usd: 0.0,
                     },
                 })
@@ -2747,6 +2814,7 @@ mod tests {
                         output_tokens: 2,
                         cache_read_tokens: 0,
                         cache_write_tokens: 0,
+                        reasoning_tokens: 0,
                         cost_usd: 0.0,
                     },
                 })
@@ -2897,6 +2965,7 @@ mod repeat_call_guard_tests {
                         output_tokens: 10,
                         cache_read_tokens: 0,
                         cache_write_tokens: 0,
+                        reasoning_tokens: 0,
                         cost_usd: 0.0,
                     },
                 })
@@ -3018,6 +3087,7 @@ mod repeat_call_guard_tests {
                         output_tokens: 10,
                         cache_read_tokens: 0,
                         cache_write_tokens: 0,
+                        reasoning_tokens: 0,
                         cost_usd: 0.0,
                     },
                 })
@@ -3122,6 +3192,7 @@ mod repeat_call_guard_tests {
                         output_tokens: 10,
                         cache_read_tokens: 0,
                         cache_write_tokens: 0,
+                        reasoning_tokens: 0,
                         cost_usd: 0.001,
                     },
                 })
@@ -3190,6 +3261,141 @@ mod repeat_call_guard_tests {
         assert!(recs[1].anomalies.contains(&"RETRY_BURN".to_string()));
         assert_eq!(recs[2].stop_reason, "budget_limit");
         assert!(recs[2].anomalies.contains(&"BUDGET_STOP".to_string()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wrap_reply_accumulates_usage_and_emits_forensic_record() {
+        use crate::{AgentConfig, run_turn_loop};
+        use le_vibe_durable::SessionStore;
+        use le_vibe_pybridge::{
+            AssistantMessage, BridgeError, CompletionRequest, ExtensionPort, ModelSpec,
+            PolicyDecision, PolicyPort, ProviderPort, ToolCall, Usage,
+        };
+        use le_vibe_telemetry::TelemetryRecorder;
+        use le_vibe_telemetry::usage::{UsageLogger, format_usage_report, read_usage_log};
+        use serde_json::{Value, json};
+
+        struct MaxTurnsBridge {
+            calls: usize,
+        }
+        impl ProviderPort for MaxTurnsBridge {
+            fn list_providers(&mut self) -> Result<Vec<String>, BridgeError> {
+                Ok(vec!["agy".into()])
+            }
+            fn list_models(&mut self, _p: Option<&str>) -> Result<Vec<ModelSpec>, BridgeError> {
+                Ok(vec![])
+            }
+            fn complete(&mut self, req: CompletionRequest) -> Result<AssistantMessage, BridgeError> {
+                self.calls += 1;
+                if req.tools.is_empty() {
+                    return Ok(AssistantMessage {
+                        provider: "agy".into(),
+                        model: "gemini-4-neon".into(),
+                        content: "wrapped up".into(),
+                        reasoning_content: None,
+                        tool_calls: vec![],
+                        stop_reason: "stop".into(),
+                        usage: Usage {
+                            input_tokens: 120,
+                            output_tokens: 80,
+                            cache_read_tokens: 500,
+                            cache_write_tokens: 0,
+                            reasoning_tokens: 50,
+                            cost_usd: 0.002,
+                        },
+                    });
+                }
+                Ok(AssistantMessage {
+                    provider: "agy".into(),
+                    model: "gemini-4-neon".into(),
+                    content: String::new(),
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "tc_1".into(),
+                        name: "ext_step".into(),
+                        arguments: json!({}),
+                        thought_signature: None,
+                    }],
+                    stop_reason: "tool_calls".into(),
+                    usage: Usage {
+                        input_tokens: 300,
+                        output_tokens: 100,
+                        cache_read_tokens: 0,
+                        cache_write_tokens: 0,
+                        reasoning_tokens: 60,
+                        cost_usd: 0.003,
+                    },
+                })
+            }
+        }
+        impl PolicyPort for MaxTurnsBridge {
+            fn evaluate_tool_call(
+                &mut self,
+                _t: &str,
+                _c: Option<&str>,
+                _p: Option<&str>,
+            ) -> Result<PolicyDecision, BridgeError> {
+                Ok(PolicyDecision {
+                    action: "allow".into(),
+                    reason: "ok".into(),
+                })
+            }
+        }
+        impl ExtensionPort for MaxTurnsBridge {
+            fn list_extension_tools(
+                &mut self,
+            ) -> Result<Vec<le_vibe_pybridge::ToolDefinition>, BridgeError> {
+                Ok(vec![le_vibe_pybridge::ToolDefinition {
+                    name: "ext_step".into(),
+                    description: "step".into(),
+                    parameters: json!({"type": "object"}),
+                }])
+            }
+            fn execute_extension_tool(
+                &mut self,
+                _name: &str,
+                _args: Value,
+            ) -> Result<Value, BridgeError> {
+                Ok(Value::String("ok".into()))
+            }
+            fn invoke_hook(&mut self, _e: &str, _p: Value) -> Result<Value, BridgeError> {
+                Ok(json!({}))
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("le_vibe_wrap_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("usage-wrap.jsonl");
+        let logger = UsageLogger::with_debug_cache("wrap", log_path.clone(), false);
+
+        let mut bridge = MaxTurnsBridge { calls: 0 };
+        let mut session = SessionStore::in_memory();
+        let telemetry = TelemetryRecorder::new();
+        let cfg = AgentConfig {
+            provider: "agy".into(),
+            model: "gemini-4-neon".into(),
+            max_turns: 1,
+            verify_edits: false,
+            usage_logger: Some(logger),
+            ..AgentConfig::default()
+        };
+        let reply = run_turn_loop(&mut bridge, &mut session, &telemetry, &cfg, "go").unwrap();
+        assert_eq!(reply.stop_reason, "max_turns");
+        // Accumulated, not overwritten: 300+120=420 in, 100+80=180 out, 60+50=110 reasoning.
+        assert_eq!(reply.usage.input_tokens, 420);
+        assert_eq!(reply.usage.output_tokens, 180);
+        assert_eq!(reply.usage.reasoning_tokens, 110);
+
+        let recs = read_usage_log(&log_path).unwrap();
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0].source, "main");
+        assert_eq!(recs[1].source, "wrap_reply");
+        assert_eq!(recs[1].reasoning_tokens, 50);
+        let report = format_usage_report(&recs);
+        assert!(report.contains("wrap_reply") && report.contains("reasoning=110"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

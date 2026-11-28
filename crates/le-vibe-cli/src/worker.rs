@@ -469,6 +469,7 @@ pub(crate) enum WorkerMsg {
         output_tokens: u64,
         cache_read_tokens: u64,
         cache_write_tokens: u64,
+        reasoning_tokens: u64,
         cost_usd: f64,
         tps: Option<f64>,
         git_badges: String,
@@ -679,6 +680,19 @@ pub(crate) fn collect_sync_payload(
     }
 }
 
+fn session_usage_logger(session: &SessionStore) -> Option<le_vibe_telemetry::usage::UsageLogger> {
+    let sid = session
+        .path()?
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("session")
+        .to_string();
+    Some(le_vibe_telemetry::usage::UsageLogger::new(
+        sid.clone(),
+        le_vibe_telemetry::usage::default_usage_log_path(&sid),
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_tui_worker(
     mut bridge: PythonBridge,
@@ -805,8 +819,28 @@ pub(crate) fn spawn_tui_worker(
                         tools: Vec::new(),
                         thinking_level,
                     };
+                    let gf_started = Instant::now();
+                    let gf_logger = session_usage_logger(&session);
                     match bridge.complete(req) {
                         Ok(reply) => {
+                            if let Some(ul) = &gf_logger {
+                                ul.record_request(le_vibe_telemetry::usage::UsageEventInput {
+                                    turn_idx: 0,
+                                    source: "goldfish".to_string(),
+                                    provider: provider.clone(),
+                                    model: model.clone(),
+                                    http_status: 200,
+                                    stop_reason: reply.stop_reason.clone(),
+                                    wall_ms: gf_started.elapsed().as_millis() as u64,
+                                    in_uncached: reply.usage.input_tokens,
+                                    cache_read: reply.usage.cache_read_tokens,
+                                    cache_write: reply.usage.cache_write_tokens,
+                                    out: reply.usage.output_tokens,
+                                    reasoning_tokens: reply.usage.reasoning_tokens,
+                                    cost_usd: reply.usage.cost_usd,
+                                    ..Default::default()
+                                });
+                            }
                             let header =
                                 le_vibe_agent::workflows::goldfish_review_header(&source_label);
                             let _ = msg_tx.send(WorkerMsg::Agent(AgentEvent::TextDelta {
@@ -814,6 +848,18 @@ pub(crate) fn spawn_tui_worker(
                             }));
                         }
                         Err(err) => {
+                            if let Some(ul) = &gf_logger {
+                                ul.record_request(le_vibe_telemetry::usage::UsageEventInput {
+                                    turn_idx: 0,
+                                    source: "goldfish".to_string(),
+                                    provider: provider.clone(),
+                                    model: model.clone(),
+                                    http_status: 500,
+                                    stop_reason: "error".to_string(),
+                                    wall_ms: gf_started.elapsed().as_millis() as u64,
+                                    ..Default::default()
+                                });
+                            }
                             let _ = msg_tx.send(WorkerMsg::TurnError(format!(
                                 "Goldfish review failed: {err}"
                             )));
@@ -1092,8 +1138,23 @@ pub(crate) fn spawn_tui_worker(
                         "{}{extra}",
                         le_vibe_agent::workflows::MANUAL_COMPACT_INSTRUCTION
                     );
+                    let cmp_started = Instant::now();
+                    let cmp_logger = session_usage_logger(&session);
                     match llm_summary(&mut bridge, &session, &provider, &model, &prompt, 0) {
                         Ok(plan) => {
+                            if let Some(ul) = &cmp_logger {
+                                ul.record_request(le_vibe_telemetry::usage::UsageEventInput {
+                                    turn_idx: 0,
+                                    source: "compact".to_string(),
+                                    provider: provider.clone(),
+                                    model: model.clone(),
+                                    http_status: 200,
+                                    stop_reason: "stop".to_string(),
+                                    wall_ms: cmp_started.elapsed().as_millis() as u64,
+                                    compaction_occurred: true,
+                                    ..Default::default()
+                                });
+                            }
                             let (summary, flushed) = extract_and_flush_memories(&plan.summary);
                             let _ = session.append_compaction(&summary);
                             session_memory_toc =
@@ -1138,8 +1199,23 @@ pub(crate) fn spawn_tui_worker(
                         "{}{extra}{todo_ctx}",
                         le_vibe_agent::workflows::HANDOVER_INSTRUCTION
                     );
+                    let ho_started = Instant::now();
+                    let ho_logger = session_usage_logger(&session);
                     match llm_summary(&mut bridge, &session, &provider, &model, &prompt, 0) {
                         Ok(plan) => {
+                            if let Some(ul) = &ho_logger {
+                                ul.record_request(le_vibe_telemetry::usage::UsageEventInput {
+                                    turn_idx: 0,
+                                    source: "handover".to_string(),
+                                    provider: provider.clone(),
+                                    model: model.clone(),
+                                    http_status: 200,
+                                    stop_reason: "stop".to_string(),
+                                    wall_ms: ho_started.elapsed().as_millis() as u64,
+                                    compaction_occurred: true,
+                                    ..Default::default()
+                                });
+                            }
                             let (summary, flushed) = extract_and_flush_memories(&plan.summary);
                             let ts = SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
@@ -1274,6 +1350,8 @@ pub(crate) fn spawn_tui_worker(
                             } else {
                                 Some(entry.id.clone())
                             };
+                            let br_started = Instant::now();
+                            let br_logger = session_usage_logger(&session);
                             let branch_res = match le_vibe_agent::compact::branch_summary(
                                 &mut bridge,
                                 &mut session,
@@ -1283,7 +1361,22 @@ pub(crate) fn spawn_tui_worker(
                                 Some(&cancel),
                                 &mut |_, _, _| {},
                             ) {
-                                Ok(_) => Ok(()),
+                                Ok(_) => {
+                                    if let Some(ul) = &br_logger {
+                                        ul.record_request(le_vibe_telemetry::usage::UsageEventInput {
+                                            turn_idx: 0,
+                                            source: "branch_summary".to_string(),
+                                            provider: provider.clone(),
+                                            model: model.clone(),
+                                            http_status: 200,
+                                            stop_reason: "stop".to_string(),
+                                            wall_ms: br_started.elapsed().as_millis() as u64,
+                                            compaction_occurred: true,
+                                            ..Default::default()
+                                        });
+                                    }
+                                    Ok(())
+                                }
                                 Err(err) => {
                                     let _ = msg_tx.send(WorkerMsg::Notice(format!(
                                         "Branch summary failed ({err}); switching without one."
@@ -1959,6 +2052,7 @@ pub(crate) fn spawn_tui_worker(
                                 output_tokens: reply.usage.output_tokens,
                                 cache_read_tokens: reply.usage.cache_read_tokens,
                                 cache_write_tokens: reply.usage.cache_write_tokens,
+                                reasoning_tokens: reply.usage.reasoning_tokens,
                                 cost_usd: reply.usage.cost_usd,
                                 tps,
                                 git_badges: summarize_git_status(),

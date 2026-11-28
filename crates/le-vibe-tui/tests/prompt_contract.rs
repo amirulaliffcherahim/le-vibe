@@ -259,3 +259,34 @@ fn workspace_block_sits_after_instructions_so_cd_preserves_cache_prefix() {
     );
 }
 
+#[test]
+fn core_tools_block_omits_unloaded_memory_and_web_instructions() {
+    use le_vibe_tui::{ModeSpec, build_system_prompt_for_spec, parse_mode_markdown};
+
+    let core_prompt = build_system_prompt(AgentMode::Normal, "powershell", "C:/work/demo", "", &[], "");
+    let tools_start = core_prompt.find("<tools>").unwrap();
+    let tools_end = core_prompt.find("</tools>").unwrap();
+    let tools_block = &core_prompt[tools_start..tools_end];
+    assert!(
+        !tools_block.contains("memory_search") && !tools_block.contains("memory_write"),
+        "default core <tools> must omit memory_* instructions when unloaded:\n{tools_block}"
+    );
+    assert!(
+        !tools_block.contains("web_search") && !tools_block.contains("fetch_content"),
+        "default core <tools> must omit web_* instructions when unloaded:\n{tools_block}"
+    );
+
+    // When a mode enables web + memory, those tool hints appear.
+    let custom: ModeSpec = parse_mode_markdown(
+        "research",
+        "---\ndescription: Research\nextensions: [web]\ntools:\n  memory_search: true\n---\nResearch.",
+    );
+    let custom_prompt =
+        build_system_prompt_for_spec(&custom, "powershell", "C:/work/demo", "", &[], "");
+    let c_start = custom_prompt.find("<tools>").unwrap();
+    let c_end = custom_prompt.find("</tools>").unwrap();
+    let c_tools = &custom_prompt[c_start..c_end];
+    assert!(c_tools.contains("web_search") && c_tools.contains("fetch_content"));
+    assert!(c_tools.contains("memory_search") && c_tools.contains("memory_write"));
+}
+

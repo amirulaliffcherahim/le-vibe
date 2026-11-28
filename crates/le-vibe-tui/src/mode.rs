@@ -277,6 +277,20 @@ pub fn build_system_prompt(
     memory_toc: &str,
 ) -> String {
     let os = std::env::consts::OS;
+    // Tell the model which shell dialect is real here: a Unix-flavoured hint primes `tail`/`grep`
+    // on Windows and burns a whole turn on a guaranteed error.
+    let shell_hint = if cfg!(windows) {
+        "- Use PowerShell cmdlets or the Python stdlib inside `codemode`; Unix `tail`/`head`/`sed`/`grep` \
+are unavailable.\n"
+    } else {
+        ""
+    };
+    // A non-repo start directory is a strong hint that the task is not a codebase sweep.
+    let repo_state = if std::path::Path::new(cwd).join(".git").exists() {
+        "git repo"
+    } else {
+        "not a git repo"
+    };
     // Order is deliberate: the cacheable core goes first (KV-cache prefix), then per-repo context,
     // then the most volatile blocks (`<skills>`, `<memory_toc>`) last, so a memory write or a new
     // skill does not invalidate the prefix for everything before it.
@@ -292,21 +306,32 @@ modules or carries architectural risk.\n\
 4. Prove every code or config edit with the narrowest relevant check (unit test, linter, build, or \
 reproduction script).\n\
 5. Base every claim on actual tool output. Report exact exit codes and failing lines.\n\
+6. Batch independent lookups into one turn (parallel `grep`/`read`, or one `codemode` script): \
+every step re-sends the transcript, so an extra turn costs more than extra bytes. Read enough that \
+an `edit` cannot fail on ambiguity.\n\
+7. Route high-volume work (build logs, sweeps, speculative search) through `codemode` or \
+`spawn_agent`; only the conclusion then enters the transcript.\n
+8. After three attempts at the same failure, stop patching: restate the task, list assumptions that \
+may be wrong, and change approach.\n\
+9. Match effort to the ask: greetings, connectivity checks, general questions and 1-2 word inputs \
+get a direct answer with no tool calls, plus one focused question when intent is unclear.\n\
 </operating_contract>\n\n\
 
 <tools>\n\
 - Shell commands must be valid for `{shell}` on `{os}`.\n\
+{shell_hint}\
 - Compressed tool output keeps a reference id: call `retrieve_output` only when the missing lines \
 are needed for a decision.\n\
 - `memory_search` when past decisions, gotchas or user preferences may apply. `memory_write` only \
 for durable decisions, constraints, preferences or bug root causes (stable `key`, 3-6 synonym \
 `keywords`) - never for task chatter.\n\
 - `web_search` / `fetch_content` only for external or current documentation.\n\
+- `codemode`, when available, is the cheap path for a sweep: one script, one turn.\n\
 - Style: plain language, ready-to-run commands and code in fenced blocks, compact tables, no \
 filler or tool narration.\n\
 </tools>\n\n\
 <environment>\n\
-os={os}, active_shell={shell}, cwd={cwd}\n\
+os={os}, active_shell={shell}, cwd={cwd}, workspace={repo_state}\n\
 </environment>\n\n\
 <mode name=\"{}\">\n\
 {}\n{}
@@ -431,8 +456,9 @@ policy, SSE watchdog), tui (keys, layout, modals, markdown, prompts), cli (event
         "\n\n<non_negotiables>\n\
 1. Run a real check after editing, then report the command and its output.\n\
 2. Change only what the task requires; keep the diff minimal.\n\
-3. When blocked, report what you checked and ask one concise question instead of guessing.\n\
-4. Never fabricate test results, file paths, or tool output.\n\
+3. Batch independent reads and searches into one turn; each extra step re-bills the transcript.\n\
+4. When blocked, report what you checked and ask one concise question instead of guessing.\n\
+5. Never fabricate test results, file paths, or tool output.\n\
 </non_negotiables>",
     );
 

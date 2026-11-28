@@ -654,12 +654,25 @@ fn run_read(args: &Value) -> Result<String, ToolError> {
 
     if cut.first_line_exceeds_limit {
         let first_bytes = selected.first().map(String::len).unwrap_or(0);
+        // The hint must name a command that exists on this host: suggesting `sed`/`head` on
+        // Windows primes a Unix reflex that burns a whole turn on "term not recognized".
+        let how = if cfg!(windows) {
+            format!(
+                "PowerShell: (Get-Content -LiteralPath '{path}')[{idx}] or Python: open(r'{path}', encoding='utf-8').read().splitlines()[{idx}]",
+                idx = start_line,
+            )
+        } else {
+            format!(
+                "bash: sed -n '{line}p' {path} | head -c {max}",
+                line = start_line + 1,
+                max = truncate::DEFAULT_MAX_BYTES,
+            )
+        };
         return Ok(format!(
-            "[Line {line} is {size}, exceeds {limit} limit. Use bash: sed -n '{line}p' {path} | head -c {max}]",
+            "[Line {line} is {size}, exceeds {limit} limit. Read it with {how}]",
             line = start_line + 1,
             size = truncate::format_size(first_bytes),
             limit = truncate::format_size(truncate::DEFAULT_MAX_BYTES),
-            max = truncate::DEFAULT_MAX_BYTES,
         ));
     }
 

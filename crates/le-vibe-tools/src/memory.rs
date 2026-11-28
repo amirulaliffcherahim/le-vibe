@@ -247,9 +247,8 @@ pub fn default_project_memory_dir(cwd: &Path) -> PathBuf {
     let git_root = resolve_git_root(cwd);
     let key = git_root.to_string_lossy().replace('\\', "/").to_lowercase();
     home.join(".le-vibe")
-        .join("projects")
-        .join(hex_hash_16(&key))
         .join("memory")
+        .join(hex_hash_16(&key))
 }
 
 fn now_secs() -> u64 {

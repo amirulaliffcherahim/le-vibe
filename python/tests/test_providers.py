@@ -1051,7 +1051,7 @@ def test_agy_oauth_client_discovery_from_binary_caches_to_json(
 
     cid, csec = auth._load_agy_oauth_client()
     assert (cid, csec) == (fake_cid, fake_csec)
-    cached = json.loads((tmp_path / "agy_oauth.json").read_text(encoding="utf-8"))
+    cached = json.loads((tmp_path / "auth.json").read_text(encoding="utf-8"))["_agy_oauth_client"]
     assert cached == {"client_id": fake_cid, "client_secret": fake_csec}
 
 

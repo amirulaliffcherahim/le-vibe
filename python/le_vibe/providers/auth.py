@@ -315,20 +315,11 @@ def _discover_agy_oauth_client() -> tuple[str, str] | None:
     if pair is None:
         return None
     _AGY_OAUTH_CLIENT_CACHE = pair
-    # Cache to ~/.le-vibe/agy_oauth.json (0600) so future runs skip scanning the binary.
+    # Cache inside ~/.le-vibe/auth.json (`_agy_oauth_client`, 0600) so future runs skip scanning.
     try:
-        cfg_path = default_auth_file().parent / "agy_oauth.json"
-        cfg_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = cfg_path.with_suffix(".tmp")
-        tmp.write_text(
-            json.dumps({"client_id": pair[0], "client_secret": pair[1]}, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        try:
-            os.chmod(tmp, 0o600)
-        except OSError:
-            pass
-        os.replace(tmp, cfg_path)
+        store = _read_auth_store()
+        store["_agy_oauth_client"] = {"client_id": pair[0], "client_secret": pair[1]}
+        _write_auth_store(store)
     except OSError:
         pass
     return pair
@@ -342,6 +333,12 @@ def _load_agy_oauth_client() -> tuple[str, str]:
     )
     if cid and csec:
         return cid, csec
+    embedded = _read_auth_store().get("_agy_oauth_client")
+    if isinstance(embedded, dict):
+        file_cid = str(embedded.get("client_id", "")).strip()
+        file_csec = str(embedded.get("client_secret", "")).strip()
+        if file_cid and file_csec:
+            return file_cid, file_csec
     cfg_path = default_auth_file().parent / "agy_oauth.json"
     if cfg_path.exists():
         try:
@@ -357,7 +354,7 @@ def _load_agy_oauth_client() -> tuple[str, str]:
         if discovered is not None:
             return discovered
     raise RuntimeError(
-        "Missing AGY_OAUTH_CLIENT_ID / AGY_OAUTH_CLIENT_SECRET (set env vars or ~/.le-vibe/agy_oauth.json)"
+        "Missing AGY_OAUTH_CLIENT_ID / AGY_OAUTH_CLIENT_SECRET (set env vars or ~/.le-vibe/auth.json)"
     )
 
 

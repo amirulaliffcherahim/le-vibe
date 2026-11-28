@@ -700,10 +700,25 @@ fn trust_file_path() -> PathBuf {
     PathBuf::from(home).join(".le-vibe").join("trust.json")
 }
 
-/// Look up saved trust decision in `~/.le-vibe/trust.json` for `cwd` or an ancestor.
+fn settings_trust_file_path() -> PathBuf {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".le-vibe").join("settings.json")
+}
+
+/// Look up saved trust decision in `~/.le-vibe/settings.json` (`trusted_paths`) or legacy `trust.json`.
 pub(crate) fn lookup_project_trust(cwd: &Path) -> Option<bool> {
-    let content = fs::read_to_string(trust_file_path()).ok()?;
-    let map: BTreeMap<String, bool> = serde_json::from_str(&content).ok()?;
+    let map: BTreeMap<String, bool> = fs::read_to_string(settings_trust_file_path())
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("trusted_paths").cloned())
+        .and_then(|tp| serde_json::from_value(tp).ok())
+        .or_else(|| {
+            fs::read_to_string(trust_file_path())
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+        })?;
     let mut cur = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     loop {
         let key = canonical_folder_key(&cur);
@@ -717,19 +732,27 @@ pub(crate) fn lookup_project_trust(cwd: &Path) -> Option<bool> {
     None
 }
 
-/// Persist a trust decision for `cwd` in `~/.le-vibe/trust.json`.
+/// Persist a trust decision for `cwd` in `~/.le-vibe/settings.json` (`trusted_paths`).
 pub(crate) fn save_project_trust(cwd: &Path, trusted: bool) {
-    let path = trust_file_path();
+    let path = settings_trust_file_path();
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let mut map: BTreeMap<String, bool> = fs::read_to_string(&path)
+    let mut obj = fs::read_to_string(&path)
         .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&s).ok())
+        .unwrap_or_default();
+    let mut map: BTreeMap<String, bool> = obj
+        .get("trusted_paths")
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok())
         .unwrap_or_default();
     map.insert(canonical_folder_key(cwd), trusted);
-    if let Ok(json) = serde_json::to_string_pretty(&map) {
-        let _ = fs::write(path, json);
+    if let Ok(val) = serde_json::to_value(&map) {
+        obj.insert("trusted_paths".to_string(), val);
+        if let Ok(json) = serde_json::to_string_pretty(&serde_json::Value::Object(obj)) {
+            let _ = fs::write(path, json + "\n");
+        }
     }
 }
 

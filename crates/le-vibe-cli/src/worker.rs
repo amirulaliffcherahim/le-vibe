@@ -1760,6 +1760,7 @@ pub(crate) fn spawn_tui_worker(
                     {
                         sys.push_str(&format!("\n\n<cli_instructions>\n{}\n</cli_instructions>", extra.trim()));
                     }
+                    let layered_w = crate::settings::load_layered_settings().0;
                     let cfg = AgentConfig {
                         provider: provider.clone(),
                         model,
@@ -1779,6 +1780,15 @@ pub(crate) fn spawn_tui_worker(
                         codemode: codemode_setting.clone(),
                         steering_queue: Some(Arc::clone(&steering_queue)),
                         output_store: Some(Arc::clone(&output_store)),
+                        max_prompt_requests: layered_w
+                            .get("max_prompt_requests")
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or(0),
+                        max_prompt_uncached_tokens: layered_w
+                            .get("max_prompt_uncached_tokens")
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .unwrap_or(0),
+                        ..AgentConfig::default()
                     };
                     let mut stream_ms: u128 = 0;
                     let mut stream_start: Option<Instant> = None;

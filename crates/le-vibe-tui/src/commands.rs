@@ -105,6 +105,12 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandSpec] = &[
         picker_on_bare: true,
     },
     SlashCommandSpec {
+        name: "/cost",
+        hint: "",
+        description: "Read-only forensic token, cache-hit, anomaly & cost report for this session",
+        picker_on_bare: false,
+    },
+    SlashCommandSpec {
         name: "/auth",
         hint: "",
         description: "View provider authentication status & sign in",

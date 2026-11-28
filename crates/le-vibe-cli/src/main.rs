@@ -154,8 +154,37 @@ fn main() {
             return;
         }
         CliAction::Subcommand(ref sub, ref sub_args)
-            if matches!(sub.as_str(), "install" | "remove" | "list" | "update" | "doctor") =>
+            if matches!(
+                sub.as_str(),
+                "usage" | "install" | "remove" | "list" | "update" | "doctor"
+            ) =>
         {
+            if sub == "usage" {
+                let target = if let Some(arg) = sub_args.first() {
+                    let p = std::path::PathBuf::from(arg);
+                    if p.is_file() {
+                        Some(p)
+                    } else {
+                        Some(le_vibe_telemetry::usage::default_usage_log_path(arg))
+                    }
+                } else {
+                    le_vibe_telemetry::usage::latest_usage_log_path()
+                };
+                match target {
+                    Some(path) if path.is_file() => {
+                        match le_vibe_telemetry::usage::read_usage_log(&path) {
+                            Ok(recs) => println!(
+                                "{}",
+                                le_vibe_telemetry::usage::format_usage_report(&recs)
+                            ),
+                            Err(err) => eprintln!("Failed to read {}: {err}", path.display()),
+                        }
+                    }
+                    Some(path) => eprintln!("Usage log not found: {}", path.display()),
+                    None => println!("No forensic usage logs found in ~/.le-vibe/logs/."),
+                }
+                return;
+            }
             let home = std::env::var_os("USERPROFILE")
                 .or_else(|| std::env::var_os("HOME"))
                 .map(std::path::PathBuf::from)
@@ -430,6 +459,7 @@ fn main() {
                     {
                         le_vibe_tui::append_model_profile(&mut sys, &model_key, &note);
                     }
+                    let layered_p = load_layered_settings().0;
                     let cfg = AgentConfig {
                         provider,
                         model,
@@ -446,13 +476,21 @@ fn main() {
                         verify_edits: true,
                         allowed_tools,
                         mode_name: Some(agent_mode.name().to_string()),
-                        codemode: load_layered_settings()
-                            .0
+                        codemode: layered_p
                             .get("codemode")
                             .cloned()
                             .unwrap_or_else(|| "off".to_string()),
                         steering_queue: None,
                         output_store: Some(Arc::new(Mutex::new(le_vibe_agent::OutputStore::new()))),
+                        max_prompt_requests: layered_p
+                            .get("max_prompt_requests")
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or(0),
+                        max_prompt_uncached_tokens: layered_p
+                            .get("max_prompt_uncached_tokens")
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .unwrap_or(0),
+                        ..AgentConfig::default()
                     };
                     run_streaming_prompt(&mut bridge, &mut session, &telemetry, &cfg, &prompt, json_mode);
                     return;
@@ -1599,6 +1637,17 @@ fn run_interactive_tui(
                     state.usage_loading = true;
                     state.usage_scroll = 0;
                     let _ = cmd_tx.send(WorkerCmd::FetchUsage);
+                    continue;
+                }
+                if input == "/cost" {
+                    let log_path = le_vibe_telemetry::usage::latest_usage_log_path();
+                    let report = match log_path
+                        .and_then(|p| le_vibe_telemetry::usage::read_usage_log(&p).ok())
+                    {
+                        Some(recs) => le_vibe_telemetry::usage::format_usage_report(&recs),
+                        None => "No forensic usage records found for this session yet.".to_string(),
+                    };
+                    state.blocks.push(TranscriptBlock::System(report));
                     continue;
                 }
                 if input == "/reload" {

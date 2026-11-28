@@ -301,10 +301,14 @@ class AgyProvider:
                     yielded_any = True
                     inner = chunk.get("response") or chunk
                     if meta := inner.get("usageMetadata"):
+                        prompt_tok = int(meta.get("promptTokenCount", 0))
+                        cache_read = int(meta.get("cachedContentTokenCount", 0))
+                        cache_write = int(meta.get("cacheCreationInputTokenCount", 0))
                         usage = Usage(
-                            input_tokens=int(meta.get("promptTokenCount", 0)),
+                            input_tokens=max(0, prompt_tok - cache_read),
                             output_tokens=int(meta.get("candidatesTokenCount", 0)),
-                            cache_read_tokens=int(meta.get("cachedContentTokenCount", 0)),
+                            cache_read_tokens=cache_read,
+                            cache_write_tokens=cache_write,
                         )
 
                     candidates = inner.get("candidates") or []

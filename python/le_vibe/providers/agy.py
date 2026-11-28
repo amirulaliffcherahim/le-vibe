@@ -2,16 +2,27 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Sequence
 import hashlib
-import time
+import os
 import re
+import time
 from typing import Any
 import uuid
 
 import httpx
 
-from le_vibe.providers.auth import AGY_USER_AGENT, get_agy_project_id, resolve_api_key
+from le_vibe.providers.auth import (
+    _agy_endpoint_candidates,
+    _agy_headers,
+    get_agy_project_id,
+    resolve_api_key,
+)
 from le_vibe.providers.catalog import list_models
-from le_vibe.providers.transport import stream_sse_json
+from le_vibe.providers.transport import (
+    FIRST_OUTPUT_WAIT_SECONDS,
+    STREAM_IDLE_SECONDS,
+    StreamStalledError,
+    stream_sse_json,
+)
 from le_vibe.providers.types import (
     AssistantMessage,
     AuthCredential,
@@ -207,6 +218,25 @@ class AgyProvider:
     def resolve_auth(self, explicit_key: str | None = None) -> AuthCredential:
         return resolve_api_key("agy", explicit_key=explicit_key)
 
+    def _build_stream_headers(
+        self,
+        cred: AuthCredential,
+        *,
+        project_id: str,
+        endpoint: str,
+        request_id: str,
+        extra_headers: dict[str, str] | Any,
+    ) -> dict[str, str]:
+        is_aicode = "aicode.googleapis.com" in endpoint
+        headers = _agy_headers(
+            cred.token,
+            project_id=project_id,
+            request_id=request_id if is_aicode else "",
+        )
+        headers.update(cred.extra_headers)
+        headers.update(extra_headers)
+        return headers
+
     async def stream(
         self,
         model: ModelSpec,
@@ -215,16 +245,32 @@ class AgyProvider:
     ) -> AsyncIterator[StreamEvent]:
         opts = options or StreamOptions()
         cred = self.resolve_auth(opts.api_key)
-        headers = {
-            "Authorization": f"Bearer {cred.token}",
-            "Content-Type": "application/json",
-            "User-Agent": AGY_USER_AGENT,
-            **cred.extra_headers,
-            **opts.extra_headers,
-        }
         project_id = cred.project_id or get_agy_project_id()
-        url = f"{model.base_url.rstrip('/')}/v1internal:streamGenerateContent?alt=sse"
+        env_override = (
+            os.environ.get("AGY_ENDPOINT_URL", "").strip()
+            or os.environ.get("CLOUD_CODE_URL", "").strip()
+            or os.environ.get("AICODE_ENDPOINT_URL", "").strip()
+        )
+        endpoint = env_override or model.base_url or _agy_endpoint_candidates()[0]
+        url = f"{endpoint.rstrip('/')}/v1internal:streamGenerateContent?alt=sse"
         payload = build_agy_payload(model, context, opts, project_id=project_id)
+        headers = self._build_stream_headers(
+            cred,
+            project_id=project_id,
+            endpoint=endpoint,
+            request_id=str(payload.get("requestId") or ""),
+            extra_headers=opts.extra_headers,
+        )
+
+        async def _on_unauthorized() -> dict[str, str] | None:
+            refreshed = resolve_api_key("agy", force_refresh=True)
+            return self._build_stream_headers(
+                refreshed,
+                project_id=refreshed.project_id or project_id,
+                endpoint=endpoint,
+                request_id=str(payload.get("requestId") or ""),
+                extra_headers=opts.extra_headers,
+            )
 
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
@@ -232,41 +278,89 @@ class AgyProvider:
         stop_reason = "stop"
         usage = Usage()
 
-        async for chunk in stream_sse_json(
-            url, headers=headers, payload=payload, timeout_s=opts.timeout_s, client=self._client
-        ):
-            inner = chunk.get("response") or chunk
-            if meta := inner.get("usageMetadata"):
-                usage = Usage(
-                    input_tokens=int(meta.get("promptTokenCount", 0)),
-                    output_tokens=int(meta.get("candidatesTokenCount", 0)),
-                    cache_read_tokens=int(meta.get("cachedContentTokenCount", 0)),
-                )
+        continuation_attempts = 0
+        stream_payload = payload
+        while True:
+            yielded_any = False
+            try:
+                async for chunk in stream_sse_json(
+                    url,
+                    headers=headers,
+                    payload=stream_payload,
+                    timeout_s=opts.timeout_s,
+                    client=self._client,
+                    on_unauthorized=_on_unauthorized,
+                    first_output_timeout_s=FIRST_OUTPUT_WAIT_SECONDS,
+                    idle_timeout_s=STREAM_IDLE_SECONDS,
+                    max_retry_elapsed_s=opts.timeout_s,
+                ):
+                    yielded_any = True
+                    inner = chunk.get("response") or chunk
+                    if meta := inner.get("usageMetadata"):
+                        usage = Usage(
+                            input_tokens=int(meta.get("promptTokenCount", 0)),
+                            output_tokens=int(meta.get("candidatesTokenCount", 0)),
+                            cache_read_tokens=int(meta.get("cachedContentTokenCount", 0)),
+                        )
 
-            candidates = inner.get("candidates") or []
-            if not candidates:
-                continue
-            cand = candidates[0]
-            if finish := cand.get("finishReason"):
-                stop_reason = str(finish).lower()
-            parts = (cand.get("content") or {}).get("parts") or []
-            for part in parts:
-                if part.get("thought") and (txt := part.get("text")):
-                    reasoning_parts.append(txt)
-                    yield StreamEvent(type="thinking_delta", delta=txt)
-                elif txt := part.get("text"):
-                    text_parts.append(txt)
-                    yield StreamEvent(type="text_delta", delta=txt)
-                elif fc := part.get("functionCall"):
-                    sig = part.get("thoughtSignature")
-                    call = ToolCall(
-                        id=f"agy_call_{len(tool_calls) + 1}",
-                        name=str(fc.get("name", "")),
-                        arguments=dict(fc.get("args") or {}),
-                        thought_signature=str(sig) if isinstance(sig, str) and sig else None,
+                    candidates = inner.get("candidates") or []
+                    if not candidates:
+                        continue
+                    cand = candidates[0]
+                    if finish := cand.get("finishReason"):
+                        stop_reason = str(finish).lower()
+                    parts = (cand.get("content") or {}).get("parts") or []
+                    for part in parts:
+                        if part.get("thought") and (txt := part.get("text")):
+                            reasoning_parts.append(txt)
+                            yield StreamEvent(type="thinking_delta", delta=txt)
+                        elif txt := part.get("text"):
+                            text_parts.append(txt)
+                            yield StreamEvent(type="text_delta", delta=txt)
+                        elif fc := part.get("functionCall"):
+                            sig = part.get("thoughtSignature")
+                            # Google returns the id for Claude-backed calls; keep it.
+                            raw_id = fc.get("id")
+                            call_id = (
+                                str(raw_id)
+                                if isinstance(raw_id, str) and raw_id.strip()
+                                else f"agy_call_{len(tool_calls) + 1}"
+                            )
+                            call = ToolCall(
+                                id=call_id,
+                                name=str(fc.get("name", "")),
+                                arguments=dict(fc.get("args") or {}),
+                                thought_signature=str(sig) if isinstance(sig, str) and sig else None,
+                            )
+                            tool_calls.append(call)
+                            yield StreamEvent(type="tool_call", tool_call=call)
+                break
+            except (StreamStalledError, RuntimeError) as exc:
+                if not yielded_any or continuation_attempts >= 2:
+                    raise
+                continuation_attempts += 1
+                # Resume with the partial assistant turn instead of restarting it.
+                contents = list(payload["request"]["contents"])
+                partial = "".join(text_parts)
+                if partial:
+                    contents.append({"role": "model", "parts": [{"text": partial}]})
+                    contents.append(
+                        {
+                            "role": "user",
+                            "parts": [{"text": "Continue exactly where you left off. Do not repeat text."}],
+                        }
                     )
-                    tool_calls.append(call)
-                    yield StreamEvent(type="tool_call", tool_call=call)
+                stream_payload = {
+                    **payload,
+                    "request": {
+                        **payload["request"],
+                        "contents": contents,
+                        "labels": {
+                            **payload["request"].get("labels", {}),
+                            "continuation": "true",
+                        },
+                    },
+                }
 
         message = AssistantMessage(
             provider="agy",

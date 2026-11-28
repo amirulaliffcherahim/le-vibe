@@ -301,6 +301,21 @@ pub(crate) fn scope_file() -> PathBuf {
 }
 
 pub(crate) fn load_scope() -> Vec<(String, String)> {
+    let parse_rows = |arr: &Vec<Value>| -> Vec<(String, String)> {
+        arr.iter()
+            .filter_map(|row| {
+                let provider = row.get("provider")?.as_str()?.to_string();
+                let id = row.get("id")?.as_str()?.to_string();
+                Some((provider, id))
+            })
+            .collect()
+    };
+    if let Ok(raw) = fs::read_to_string(settings_file())
+        && let Ok(val) = serde_json::from_str::<Value>(&raw)
+        && let Some(rows) = val.get("scoped_models").and_then(Value::as_array)
+    {
+        return parse_rows(rows);
+    }
     let Ok(raw) = fs::read_to_string(scope_file()) else {
         return Vec::new();
     };
@@ -310,31 +325,27 @@ pub(crate) fn load_scope() -> Vec<(String, String)> {
     value
         .get("models")
         .and_then(Value::as_array)
-        .map(|rows| {
-            rows.iter()
-                .filter_map(|row| {
-                    let provider = row.get("provider")?.as_str()?.to_string();
-                    let id = row.get("id")?.as_str()?.to_string();
-                    Some((provider, id))
-                })
-                .collect()
-        })
+        .map(parse_rows)
         .unwrap_or_default()
 }
 
 pub(crate) fn save_scope(scope: &[(String, String)]) {
-    let path = scope_file();
+    let path = settings_file();
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
+    let mut obj = fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Map<String, Value>>(&s).ok())
+        .unwrap_or_default();
     let rows: Vec<Value> = scope
         .iter()
         .map(|(provider, id)| json!({ "provider": provider, "id": id }))
         .collect();
+    obj.insert("scoped_models".to_string(), Value::Array(rows));
     let _ = fs::write(
         path,
-        serde_json::to_string_pretty(&json!({ "models": rows })).unwrap_or_default() + "
-",
+        serde_json::to_string_pretty(&Value::Object(obj)).unwrap_or_default() + "\n",
     );
 }
 
@@ -364,7 +375,6 @@ pub(crate) fn default_skill_dirs() -> Vec<String> {
         ".le-vibe/skills".to_string(),
         ".agents/skill".to_string(),
         ".agents/skills".to_string(),
-        ".pi/skills".to_string(),
     ];
     if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
         let h = PathBuf::from(home);
@@ -372,7 +382,6 @@ pub(crate) fn default_skill_dirs() -> Vec<String> {
         dirs.push(h.join(".le-vibe").join("skills").display().to_string());
         dirs.push(h.join(".agents").join("skill").display().to_string());
         dirs.push(h.join(".agents").join("skills").display().to_string());
-        dirs.push(h.join(".pi").join("agent").join("skills").display().to_string());
     }
     dirs
 }

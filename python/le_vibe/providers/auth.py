@@ -3,12 +3,15 @@ from __future__ import annotations
 import base64
 from collections.abc import Mapping
 import hashlib
+import hmac
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import os
 from pathlib import Path
 import secrets
+import socket
 import sys
+import threading
 import time
 from urllib.parse import parse_qs, urlencode, urlsplit
 import webbrowser
@@ -30,19 +33,21 @@ MISTRAL_OIDC_REDIRECT_URI = "http://127.0.0.1:8766/callback"
 MISTRAL_OIDC_SCOPE = "openid offline_access email profile"
 MISTRAL_CONSOLE_API_BASE = "https://console.mistral.ai/api"
 
-AGY_OAUTH_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+AGY_OAUTH_AUTH_URL = "https://accounts.google.com/o/oauth2/auth"
 AGY_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
-AGY_OAUTH_REDIRECT_URI = "http://localhost:51121/oauth-callback"
+AGY_OAUTH_CALLBACK_PATH = "/auth/callback"
+AGY_OAUTH_OOB_REDIRECT_URI = "https://antigravity.google/oauth-callback"
+AGY_OAUTH_SUCCESS_URL = "https://antigravity.google/auth-success?app=cli"
 AGY_OAUTH_SCOPES = (
-    "https://www.googleapis.com/auth/aicode "
     "https://www.googleapis.com/auth/cloud-platform "
     "https://www.googleapis.com/auth/userinfo.email "
     "https://www.googleapis.com/auth/userinfo.profile "
     "https://www.googleapis.com/auth/cclog "
-    "https://www.googleapis.com/auth/experimentsandconfigs"
+    "https://www.googleapis.com/auth/experimentsandconfigs "
+    "https://www.googleapis.com/auth/aicode"
 )
 AGY_USER_AGENT = (
-    "antigravity/cli/1.4.2 (aidev_client; os_type=linux; arch=amd64; cl=985595000; auth_method=consumer)"
+    "antigravity/cli/1.5.18 (aidev_client; os_type=linux; arch=amd64; cl=985595000; auth_method=consumer)"
 )
 AGY_ENDPOINTS: tuple[str, ...] = (
     "https://daily-cloudcode-pa.googleapis.com",
@@ -51,11 +56,16 @@ AGY_ENDPOINTS: tuple[str, ...] = (
 )
 AGY_DEFAULT_CLIENT_ID = os.environ.get("AGY_OAUTH_CLIENT_ID", "")
 AGY_DEFAULT_CLIENT_SECRET = os.environ.get("AGY_OAUTH_CLIENT_SECRET", "")
+AGY_REFRESH_LOCK = threading.Lock()
+AGY_TOKEN_EXPIRY_LEEWAY_S = 60.0
+_AGY_FATAL_OAUTH_ERRORS = frozenset({"invalid_grant", "invalid_client", "unauthorized_client"})
 
 
 def _load_agy_oauth_client() -> tuple[str, str]:
-    if AGY_DEFAULT_CLIENT_ID and AGY_DEFAULT_CLIENT_SECRET:
-        return AGY_DEFAULT_CLIENT_ID, AGY_DEFAULT_CLIENT_SECRET
+    env_cid = os.environ.get("AGY_OAUTH_CLIENT_ID", "").strip() or AGY_DEFAULT_CLIENT_ID.strip()
+    env_csec = os.environ.get("AGY_OAUTH_CLIENT_SECRET", "").strip() or AGY_DEFAULT_CLIENT_SECRET.strip()
+    if env_cid and env_csec:
+        return env_cid, env_csec
     cfg_path = default_auth_file().parent / "agy_oauth.json"
     if cfg_path.exists():
         try:
@@ -69,6 +79,73 @@ def _load_agy_oauth_client() -> tuple[str, str]:
     raise RuntimeError(
         "Missing AGY_OAUTH_CLIENT_ID / AGY_OAUTH_CLIENT_SECRET (set env vars or ~/.le-vibe/agy_oauth.json)"
     )
+
+
+def _should_use_agy_oob_auth(env: Mapping[str, str] | None = None) -> bool:
+    env_map = env if env is not None else os.environ
+    override = env_map.get("ANTIGRAVITY_REMOTE_OOB_AUTH", "").strip().lower()
+    if override in {"1", "true", "yes"}:
+        return True
+    if override in {"0", "false", "no"}:
+        return False
+    return bool(env_map.get("SSH_CLIENT") or env_map.get("SSH_TTY") or env_map.get("SSH_CONNECTION"))
+
+
+def _extract_agy_auth_code(submitted: str, expected_state: str) -> str:
+    """Parse either a pasted callback URL or raw authorization code (matching agy-cli OOB flow)."""
+    raw = submitted.strip()
+    if not raw:
+        raise RuntimeError("Please enter the authorization code.")
+    if "://" in raw or raw.startswith("?") or ("code=" in raw and "&" in raw):
+        parsed = urlsplit(raw)
+        qs = parse_qs(parsed.query)
+        if err := qs.get("error"):
+            desc = (qs.get("error_description") or [""])[0]
+            detail = f"{err[0]}: {desc}" if desc else err[0]
+            raise RuntimeError(f"Antigravity login failed: {detail}")
+        got_state = (qs.get("state") or [""])[0]
+        if got_state and not hmac.compare_digest(got_state, expected_state):
+            raise RuntimeError("Authorization state mismatch. Please copy the code from the latest browser tab.")
+        code = (qs.get("code") or [""])[0].strip()
+        if not code:
+            raise RuntimeError("No authorization code found in the pasted URL.")
+        return code
+    return raw
+
+
+class _HTTPServerV6(HTTPServer):
+    address_family = socket.AF_INET6
+
+
+def _bind_agy_loopback_servers(handler_cls: type[BaseHTTPRequestHandler]) -> tuple[list[HTTPServer], int]:
+    """Bind ephemeral loopback listeners on 127.0.0.1:0 + [::1]:<port> (fallback to localhost:0), matching agy-cli."""
+    servers: list[HTTPServer] = []
+    try:
+        v4 = HTTPServer(("127.0.0.1", 0), handler_cls)
+        v4.timeout = 0.25
+        port = int(v4.server_address[1])
+        servers.append(v4)
+        try:
+            v6 = _HTTPServerV6(("::1", port), handler_cls)
+            v6.timeout = 0.25
+            servers.append(v6)
+        except OSError:
+            pass
+        return servers, port
+    except OSError:
+        fallback = HTTPServer(("localhost", 0), handler_cls)
+        fallback.timeout = 0.25
+        return [fallback], int(fallback.server_address[1])
+
+
+def _is_fatal_oauth_error(resp: httpx.Response) -> bool:
+    if resp.status_code not in {400, 401}:
+        return False
+    try:
+        err = str(resp.json().get("error") or "").strip().lower()
+    except Exception:
+        return False
+    return err in _AGY_FATAL_OAUTH_ERRORS
 
 
 class MissingAPIKeyError(RuntimeError):
@@ -429,52 +506,85 @@ def _resolve_oidc_credential(
     )
     needs_refresh = (
         isinstance(expires_at, (int, float))
-        and time.time() >= float(expires_at) - 60.0
+        and time.time() >= float(expires_at) - AGY_TOKEN_EXPIRY_LEEWAY_S
         and isinstance(refresh_token, str)
         and isinstance(token_endpoint, str)
     ) or (provider == "vibe" and not id_token and isinstance(refresh_token, str) and isinstance(token_endpoint, str))
 
     if needs_refresh:
-        refresh_data: dict[str, str] = {
-            "grant_type": "refresh_token",
-            "client_id": effective_client_id,
-            "refresh_token": str(refresh_token),
-        }
-        if provider == "agy":
-            try:
-                cid, csec = _load_agy_oauth_client()
-                refresh_data["client_id"] = cid
-                refresh_data["client_secret"] = csec
-            except RuntimeError:
-                pass
+        lock_ctx = AGY_REFRESH_LOCK if provider == "agy" else None
+        if lock_ctx is not None:
+            lock_ctx.acquire()
         try:
-            with httpx.Client(timeout=20.0) as client:
-                resp = client.post(str(token_endpoint), data=refresh_data)
-                if resp.is_success:
-                    data = resp.json()
-                    access_token = str(data.get("access_token") or access_token)
-                    refresh_token = str(data.get("refresh_token") or refresh_token)
-                    id_token = str(data.get("id_token") or id_token)
-                    new_exp = time.time() + float(data.get("expires_in", 3600))
-                    if provider == "vibe" and id_token and not org_id:
-                        org_id, ws_id = _discover_vibe_tenant(id_token)
-                    if provider == "agy" and not project_id:
-                        project_id = discover_agy_project_id(access_token)
-                    save_oidc_tokens(
-                        provider,
-                        access_token=access_token,
-                        refresh_token=str(refresh_token),
-                        id_token=id_token or None,
-                        expires_at=new_exp,
-                        token_endpoint=str(token_endpoint),
-                        client_id=refresh_data["client_id"],
-                        project_id=project_id or None,
-                        organization_id=org_id or None,
-                        workspace_id=ws_id or None,
-                        auth_file=auth_file,
-                    )
-        except Exception:
-            pass
+            # Re-read store under lock so concurrent callers reuse a fresh token.
+            if provider == "agy":
+                latest = _read_auth_store(auth_file).get("agy")
+                if isinstance(latest, dict):
+                    latest_exp = latest.get("expires_at")
+                    latest_tok = latest.get("access_token")
+                    if (
+                        isinstance(latest_tok, str)
+                        and latest_tok.strip()
+                        and isinstance(latest_exp, (int, float))
+                        and time.time() < float(latest_exp) - AGY_TOKEN_EXPIRY_LEEWAY_S
+                    ):
+                        access_token = latest_tok
+                        refresh_token = latest.get("refresh_token") or refresh_token
+                        id_token = str(latest.get("id_token") or id_token)
+                        expires_at = latest_exp
+                        project_id = str(latest.get("project_id") or project_id)
+                        needs_refresh = False
+
+            if needs_refresh:
+                refresh_data: dict[str, str] = {
+                    "grant_type": "refresh_token",
+                    "client_id": effective_client_id,
+                    "refresh_token": str(refresh_token),
+                }
+                if provider == "agy":
+                    try:
+                        cid, csec = _load_agy_oauth_client()
+                        refresh_data["client_id"] = cid
+                        refresh_data["client_secret"] = csec
+                    except RuntimeError:
+                        pass
+                try:
+                    with httpx.Client(timeout=20.0) as client:
+                        resp = client.post(str(token_endpoint), data=refresh_data)
+                        if resp.is_success:
+                            data = resp.json()
+                            access_token = str(data.get("access_token") or access_token)
+                            refresh_token = str(data.get("refresh_token") or refresh_token)
+                            id_token = str(data.get("id_token") or id_token)
+                            new_exp = time.time() + float(data.get("expires_in", 3600))
+                            expires_at = new_exp
+                            if provider == "vibe" and id_token and not org_id:
+                                org_id, ws_id = _discover_vibe_tenant(id_token)
+                            if provider == "agy" and not project_id:
+                                project_id = discover_agy_project_id(access_token)
+                            save_oidc_tokens(
+                                provider,
+                                access_token=access_token,
+                                refresh_token=str(refresh_token),
+                                id_token=id_token or None,
+                                expires_at=new_exp,
+                                token_endpoint=str(token_endpoint),
+                                client_id=refresh_data["client_id"],
+                                project_id=project_id or None,
+                                organization_id=org_id or None,
+                                workspace_id=ws_id or None,
+                                auth_file=auth_file,
+                            )
+                        elif provider == "agy" and _is_fatal_oauth_error(resp):
+                            # Match agy-cli: definitively rejected credentials are evicted, while
+                            # transient/network failures keep the stored token intact.
+                            delete_credential("agy", auth_file=auth_file)
+                            return None
+                except Exception:
+                    pass
+        finally:
+            if lock_ctx is not None:
+                lock_ctx.release()
 
     if provider == "vibe":
         bearer = id_token or access_token.strip()
@@ -494,6 +604,7 @@ def _resolve_oidc_credential(
                 "agy",
                 access_token=access_token.strip(),
                 refresh_token=str(refresh_token) if isinstance(refresh_token, str) else None,
+                id_token=id_token or None,
                 expires_at=float(expires_at) if isinstance(expires_at, (int, float)) else None,
                 token_endpoint=str(token_endpoint) if isinstance(token_endpoint, str) else None,
                 client_id=effective_client_id,
@@ -509,20 +620,18 @@ def _resolve_oidc_credential(
     )
 
 
-def login_agy_oauth(
+def _build_agy_auth_url(
     *,
-    auth_file: Path | None = None,
-    timeout_s: float = 180.0,
-) -> Path:
-    """Run Google Antigravity OAuth 2.0 PKCE browser login and persist tokens."""
-    client_id, client_secret = _load_agy_oauth_client()
-    verifier, challenge = _pkce_pair()
-    state = secrets.token_urlsafe(24)
+    client_id: str,
+    redirect_uri: str,
+    state: str,
+    challenge: str,
+) -> str:
     params = urlencode(
         {
             "response_type": "code",
             "client_id": client_id,
-            "redirect_uri": AGY_OAUTH_REDIRECT_URI,
+            "redirect_uri": redirect_uri,
             "scope": AGY_OAUTH_SCOPES,
             "access_type": "offline",
             "prompt": "consent",
@@ -531,67 +640,153 @@ def login_agy_oauth(
             "code_challenge_method": "S256",
         }
     )
-    auth_url = f"{AGY_OAUTH_AUTH_URL}?{params}"
+    return f"{AGY_OAUTH_AUTH_URL}?{params}"
 
-    parsed_redirect = urlsplit(AGY_OAUTH_REDIRECT_URI)
-    host = "127.0.0.1"
-    port = parsed_redirect.port or 51121
-    callback_path = parsed_redirect.path or "/oauth-callback"
 
-    captured: dict[str, str] = {}
+def login_agy_oauth(
+    *,
+    auth_file: Path | None = None,
+    timeout_s: float = 180.0,
+    oob: bool | None = None,
+    code_reader: object | None = None,
+) -> Path:
+    """Run Google Antigravity OAuth 2.0 PKCE login (dual-stack loopback or OOB), matching agy-cli."""
+    client_id, client_secret = _load_agy_oauth_client()
+    verifier, challenge = _pkce_pair()
+    state = secrets.token_urlsafe(24)
+    use_oob = _should_use_agy_oob_auth() if oob is None else oob
 
-    class _AgyCallbackHandler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:  # noqa: N802
-            req_url = urlsplit(self.path)
-            if req_url.path != callback_path:
-                self.send_response(404)
+    if use_oob:
+        redirect_uri = AGY_OAUTH_OOB_REDIRECT_URI
+        auth_url = _build_agy_auth_url(
+            client_id=client_id,
+            redirect_uri=redirect_uri,
+            state=state,
+            challenge=challenge,
+        )
+        print(f"Open this URL in your browser to sign in to Antigravity (agy):\n{auth_url}", file=sys.stderr, flush=True)
+        if callable(code_reader):
+            submitted = str(code_reader())
+        else:
+            print("Enter the authorization code (or full callback URL): ", end="", file=sys.stderr, flush=True)
+            submitted = sys.stdin.readline()
+        auth_code = _extract_agy_auth_code(submitted, state)
+    else:
+        captured: dict[str, str] = {}
+        done = threading.Event()
+        cap_lock = threading.Lock()
+
+        class _AgyCallbackHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                req_url = urlsplit(self.path)
+                if req_url.path != AGY_OAUTH_CALLBACK_PATH:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                qs = parse_qs(req_url.query)
+                got_state = (qs.get("state") or [""])[0]
+                if not hmac.compare_digest(got_state, state):
+                    self.send_response(400)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(b"Invalid state parameter")
+                    with cap_lock:
+                        if not done.is_set():
+                            captured["error"] = "state_mismatch"
+                            done.set()
+                    return
+
+                if err := qs.get("error"):
+                    desc = (qs.get("error_description") or [""])[0]
+                    detail = f"{err[0]}: {desc}" if desc else err[0]
+                    self.send_response(400)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(f"Google sign-in was canceled or access was denied: {detail}".encode("utf-8"))
+                    with cap_lock:
+                        if not done.is_set():
+                            captured["error"] = detail
+                            done.set()
+                    return
+
+                code = (qs.get("code") or [""])[0].strip()
+                if not code:
+                    self.send_response(400)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(b"No authorization code in callback")
+                    with cap_lock:
+                        if not done.is_set():
+                            captured["error"] = "no authorization code in callback"
+                            done.set()
+                    return
+
+                with cap_lock:
+                    if done.is_set():
+                        self.send_response(409)
+                        self.send_header("Content-Type", "text/plain; charset=utf-8")
+                        self.end_headers()
+                        self.wfile.write(b"Sign-in session is no longer active. Please start sign-in again.")
+                        return
+                    captured["code"] = code
+                    done.set()
+
+                self.send_response(302)
+                self.send_header("Location", AGY_OAUTH_SUCCESS_URL)
                 self.end_headers()
+
+            def log_message(self, format: str, *args: object) -> None:  # noqa: A002
                 return
-            qs = parse_qs(req_url.query)
-            if err := qs.get("error"):
-                captured["error"] = err[0]
-            if code := qs.get("code"):
-                captured["code"] = code[0]
-            if got_state := qs.get("state"):
-                captured["state"] = got_state[0]
 
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            body = (
-                "<html><body><h2>le-vibe: Antigravity (agy) login complete.</h2>"
-                "<p>You can close this window and return to your terminal.</p></body></html>"
-            )
-            self.wfile.write(body.encode("utf-8"))
+        servers, port = _bind_agy_loopback_servers(_AgyCallbackHandler)
+        redirect_uri = f"http://localhost:{port}{AGY_OAUTH_CALLBACK_PATH}"
+        auth_url = _build_agy_auth_url(
+            client_id=client_id,
+            redirect_uri=redirect_uri,
+            state=state,
+            challenge=challenge,
+        )
 
-        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
-            return
+        def _serve(srv: HTTPServer) -> None:
+            while not done.is_set():
+                try:
+                    srv.handle_request()
+                except OSError:
+                    break
 
-    server = HTTPServer((host, port), _AgyCallbackHandler)
-    server.timeout = 1.0
-    print(f"Opening browser for Antigravity (agy) login:\n{auth_url}", file=sys.stderr, flush=True)
-    webbrowser.open(auth_url)
+        threads = [threading.Thread(target=_serve, args=(s,), daemon=True) for s in servers]
+        for t in threads:
+            t.start()
 
-    deadline = time.time() + timeout_s
-    try:
-        while time.time() < deadline and "code" not in captured and "error" not in captured:
-            server.handle_request()
-    finally:
-        server.server_close()
+        print(f"Opening browser for Antigravity (agy) login:\n{auth_url}", file=sys.stderr, flush=True)
+        webbrowser.open(auth_url)
 
-    if "error" in captured:
-        raise RuntimeError(f"Antigravity login failed: {captured['error']}")
-    if "code" not in captured:
-        raise TimeoutError("Timed out waiting for Antigravity browser login callback")
-    if captured.get("state") != state:
-        raise RuntimeError("Antigravity login state mismatch")
+        try:
+            done.wait(timeout=timeout_s)
+        finally:
+            done.set()
+            for s in servers:
+                try:
+                    s.server_close()
+                except OSError:
+                    pass
+            for t in threads:
+                t.join(timeout=1.0)
+
+        if "error" in captured:
+            if captured["error"] == "state_mismatch":
+                raise RuntimeError("Antigravity login state mismatch")
+            raise RuntimeError(f"Antigravity login failed: {captured['error']}")
+        if "code" not in captured:
+            raise TimeoutError("Timed out waiting for Antigravity browser login callback")
+        auth_code = captured["code"]
 
     token_data: dict[str, str] = {
         "grant_type": "authorization_code",
         "client_id": client_id,
         "client_secret": client_secret,
-        "code": captured["code"],
-        "redirect_uri": AGY_OAUTH_REDIRECT_URI,
+        "code": auth_code,
+        "redirect_uri": redirect_uri,
         "code_verifier": verifier,
     }
 
@@ -602,6 +797,7 @@ def login_agy_oauth(
 
     access_token = str(tok["access_token"])
     refresh_token = tok.get("refresh_token")
+    id_token = str(tok.get("id_token") or "")
     expires_in = float(tok.get("expires_in", 3600))
     project_id = discover_agy_project_id(access_token)
 
@@ -609,6 +805,7 @@ def login_agy_oauth(
         "agy",
         access_token=access_token,
         refresh_token=str(refresh_token) if refresh_token else None,
+        id_token=id_token or None,
         expires_at=time.time() + expires_in,
         token_endpoint=AGY_OAUTH_TOKEN_URL,
         client_id=client_id,

@@ -463,3 +463,167 @@ def test_default_thinking_prefers_medium_or_high_when_no_medium() -> None:
         thinking_level_map={"off": "none", "high": "high"},
     )
     assert default_thinking_for_model(only_high) == "high"
+
+
+def test_agy_oauth_oob_detection_and_code_extraction() -> None:
+    from le_vibe.providers.auth import _extract_agy_auth_code, _should_use_agy_oob_auth
+
+    assert _should_use_agy_oob_auth({}) is False
+    assert _should_use_agy_oob_auth({"SSH_CONNECTION": "1.2.3.4 1234 5.6.7.8 22"}) is True
+    assert _should_use_agy_oob_auth({"ANTIGRAVITY_REMOTE_OOB_AUTH": "1"}) is True
+    assert _should_use_agy_oob_auth({"SSH_TTY": "/dev/pts/0", "ANTIGRAVITY_REMOTE_OOB_AUTH": "false"}) is False
+
+    assert _extract_agy_auth_code("raw-code-123", "st-1") == "raw-code-123"
+    assert (
+        _extract_agy_auth_code(
+            "https://antigravity.google/oauth-callback?code=cb-456&state=st-1",
+            "st-1",
+        )
+        == "cb-456"
+    )
+    with pytest.raises(RuntimeError, match="state mismatch"):
+        _extract_agy_auth_code(
+            "https://antigravity.google/oauth-callback?code=cb-456&state=wrong",
+            "st-1",
+        )
+    with pytest.raises(RuntimeError, match="access_denied"):
+        _extract_agy_auth_code(
+            "https://antigravity.google/oauth-callback?error=access_denied&error_description=nope",
+            "st-1",
+        )
+
+
+def test_agy_oauth_loopback_login_uses_ephemeral_port_and_redirects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+    from urllib.parse import parse_qs, urlsplit
+    from le_vibe.providers import auth
+
+    auth_file = tmp_path / "auth.json"
+    monkeypatch.setenv("AGY_OAUTH_CLIENT_ID", "test-cid")
+    monkeypatch.setenv("AGY_OAUTH_CLIENT_SECRET", "test-csec")
+    monkeypatch.setattr(auth, "discover_agy_project_id", lambda tok: "proj-123")
+
+    seen_redirect_uri: list[str] = []
+    callback_status: list[tuple[int, str]] = []
+    real_httpx_client = httpx.Client
+
+    def fake_open(url: str) -> bool:
+        qs = parse_qs(urlsplit(url).query)
+        redirect_uri = qs["redirect_uri"][0]
+        state = qs["state"][0]
+        seen_redirect_uri.append(redirect_uri)
+
+        def _hit() -> None:
+            with real_httpx_client(follow_redirects=False) as c:
+                r = c.get(f"{redirect_uri}?code=code-ok&state={state}")
+                callback_status.append((r.status_code, r.headers.get("location", "")))
+
+        threading.Thread(target=_hit, daemon=True).start()
+        return True
+
+    monkeypatch.setattr(auth.webbrowser, "open", fake_open)
+
+    exchanged: list[dict[str, str]] = []
+
+    class _FakeClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> "_FakeClient":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def post(self, url: str, data: dict[str, str]) -> httpx.Response:
+            exchanged.append(dict(data))
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", url),
+                json={
+                    "access_token": "ya29.fresh",
+                    "refresh_token": "1//ref",
+                    "id_token": "id-jwt-1",
+                    "expires_in": 3600,
+                },
+            )
+
+    monkeypatch.setattr(auth.httpx, "Client", _FakeClient)
+
+    out_path = auth.login_agy_oauth(auth_file=auth_file, timeout_s=5.0, oob=False)
+    assert out_path == auth_file
+    assert seen_redirect_uri[0].startswith("http://localhost:")
+    assert seen_redirect_uri[0].endswith("/auth/callback")
+    assert callback_status == [(302, auth.AGY_OAUTH_SUCCESS_URL)]
+    assert exchanged[0]["redirect_uri"] == seen_redirect_uri[0]
+    assert exchanged[0]["code"] == "code-ok"
+
+    stored = json.loads(auth_file.read_text(encoding="utf-8"))["agy"]
+    assert stored["access_token"] == "ya29.fresh"
+    assert stored["id_token"] == "id-jwt-1"
+    assert stored["project_id"] == "proj-123"
+
+
+def test_agy_refresh_evicts_on_invalid_grant_and_keeps_on_network_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from le_vibe.providers import auth, save_oidc_tokens
+
+    auth_file = tmp_path / "auth.json"
+    monkeypatch.setenv("AGY_OAUTH_CLIENT_ID", "test-cid")
+    monkeypatch.setenv("AGY_OAUTH_CLIENT_SECRET", "test-csec")
+
+    # 1) Transient network error keeps stored token intact.
+    save_oidc_tokens(
+        "agy",
+        access_token="ya29.stale",
+        refresh_token="1//ref",
+        expires_at=1.0,
+        token_endpoint=auth.AGY_OAUTH_TOKEN_URL,
+        client_id="test-cid",
+        project_id="proj-1",
+        auth_file=auth_file,
+    )
+
+    class _NetErrClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> "_NetErrClient":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def post(self, url: str, data: dict[str, str]) -> httpx.Response:
+            raise httpx.ConnectError("offline")
+
+    monkeypatch.setattr(auth.httpx, "Client", _NetErrClient)
+    cred = auth.resolve_api_key("agy", env={}, auth_file=auth_file)
+    assert cred.token == "ya29.stale"
+    assert "agy" in json.loads(auth_file.read_text(encoding="utf-8"))
+
+    # 2) Definitive invalid_grant evicts stored credential.
+    class _InvalidGrantClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> "_InvalidGrantClient":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def post(self, url: str, data: dict[str, str]) -> httpx.Response:
+            return httpx.Response(
+                400,
+                request=httpx.Request("POST", url),
+                json={"error": "invalid_grant"},
+            )
+
+    monkeypatch.setattr(auth.httpx, "Client", _InvalidGrantClient)
+    with pytest.raises(MissingAPIKeyError):
+        auth.resolve_api_key("agy", env={}, auth_file=auth_file)
+    assert "agy" not in json.loads(auth_file.read_text(encoding="utf-8"))

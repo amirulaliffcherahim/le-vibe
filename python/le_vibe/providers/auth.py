@@ -81,6 +81,8 @@ AGY_ENDPOINTS: tuple[str, ...] = (
 AGY_DEFAULT_CLIENT_ID = os.environ.get("AGY_OAUTH_CLIENT_ID", "").strip()
 AGY_DEFAULT_CLIENT_SECRET = os.environ.get("AGY_OAUTH_CLIENT_SECRET", "").strip()
 AGY_TOKEN_EXPIRY_LEEWAY_S = 30.0
+# An OAuth access token shorter than this is a stub, not a credential.
+_MIN_PLAUSIBLE_TOKEN_CHARS = 20
 _AGY_FATAL_OAUTH_ERRORS = frozenset({"invalid_grant", "invalid_client", "unauthorized_client"})
 _AGY_REQUIRED_SCOPES = frozenset(AGY_OAUTH_SCOPES.split()) - {"openid"}
 
@@ -663,6 +665,10 @@ def _load_agy_official_token() -> dict[str, Any] | None:
 
 
 def _save_vibe_official_token(entry: Mapping[str, Any]) -> None:
+    # Never write a bundle that cannot be read back usefully: it would shadow the auth store on
+    # the next run and look like "you must log in again".
+    if len(str(entry.get("access_token") or "")) < _MIN_PLAUSIBLE_TOKEN_CHARS:
+        return
     payload: dict[str, Any] = {
         "version": 1,
         "issuer": entry.get("issuer") or MISTRAL_OIDC_ISSUER,
@@ -671,7 +677,9 @@ def _save_vibe_official_token(entry: Mapping[str, Any]) -> None:
         "subject": entry.get("subject") or "",
         "access_token": entry.get("access_token") or "",
         "refresh_token": entry.get("refresh_token"),
-        "id_token": entry.get("id_token") or "",
+        # Refreshes often omit a fresh ID token; keep the one already held instead of blanking
+        # it, which used to force a refresh (and a token rotation) on every single call.
+        "id_token": entry.get("id_token") or _existing_vibe_id_token(),
         "expires_at": entry.get("expires_at") or 0.0,
         "nonce": entry.get("nonce"),
         "id_token_expires_at": entry.get("id_token_expires_at"),
@@ -688,6 +696,21 @@ def _save_vibe_official_token(entry: Mapping[str, Any]) -> None:
         _VIBE_OIDC_KEYRING_ENTRY,
         json.dumps(payload, separators=(",", ":")),
     )
+
+
+def _existing_vibe_id_token() -> str:
+    """The ID token already in the shared slot, so a refresh without one cannot blank it."""
+    raw = _keyring_get(_VIBE_OIDC_KEYRING_SERVICE, _VIBE_OIDC_KEYRING_ENTRY)
+    if not raw:
+        return ""
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    token = data.get("id_token")
+    return token if isinstance(token, str) else ""
 
 
 def _discover_vibe_token_endpoint(issuer: str) -> str:
@@ -717,6 +740,11 @@ def _load_vibe_official_token() -> dict[str, Any] | None:
     except json.JSONDecodeError:
         return None
     if not isinstance(data, dict) or not data.get("access_token"):
+        return None
+    # A real OAuth access token is hundreds of characters; a stub of a dozen means the shared
+    # slot holds something unusable (another client's placeholder, or a half-written bundle).
+    # Treat it as absent so the auth store can still answer.
+    if len(str(data.get("access_token"))) < _MIN_PLAUSIBLE_TOKEN_CHARS:
         return None
     issuer = str(data.get("issuer") or MISTRAL_OIDC_ISSUER)
     entry: dict[str, Any] = {
@@ -1885,8 +1913,15 @@ def resolve_api_key(
     if auth_file is None and not os.environ.get("LE_VIBE_AUTH_FILE"):
         official = _official_oidc_entry(provider)
         if official is not None:
-            if cred := _resolve_oidc_credential(provider, official, auth_file=auth_file, force_refresh=force_refresh):
-                return cred
+            try:
+                if cred := _resolve_oidc_credential(
+                    provider, official, auth_file=auth_file, force_refresh=force_refresh
+                ):
+                    return cred
+            except (MissingAPIKeyError, RuntimeError):
+                # The shared store is one source, not the only one: a stale or corrupt entry
+                # there must not shadow a good credential in le-vibe's own auth store.
+                pass
     saved = _read_auth_store(auth_file).get(provider)
     if isinstance(saved, dict) and saved.get("type") == "oidc":
         if cred := _resolve_oidc_credential(provider, saved, auth_file=auth_file, force_refresh=force_refresh):

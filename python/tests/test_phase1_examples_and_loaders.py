@@ -99,3 +99,20 @@ def test_read_before_edit_and_dirty_repo_policy(monkeypatch) -> None:
     assert store.evaluate_tool_call("bash", command="git checkout .").action == "allow"
 
 
+def test_shipped_creator_skills_are_lean_and_valid() -> None:
+    from le_vibe.extensions import discover_skills
+
+    skills_root = Path(__file__).resolve().parents[2] / "examples" / "skills"
+    skills = discover_skills([skills_root])
+    by_name = {s.name: s for s in skills}
+    for required in ("skill-creator", "mode-creator"):
+        assert required in by_name, f"missing {required} under {skills_root}"
+        spec = by_name[required]
+        assert spec.description.strip()
+        assert spec.body.strip()
+        raw = spec.path.read_text(encoding="utf-8")
+        assert len(raw.splitlines()) <= 120
+        assert len(raw.encode("utf-8")) <= 4000
+
+
+

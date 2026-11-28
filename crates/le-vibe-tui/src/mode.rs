@@ -861,5 +861,27 @@ Review the diff for regressions. Cite exact file:line. Make zero edits.
         assert_eq!(builtins.len(), 1);
         assert_eq!(builtins[0].id, "normal");
     }
+
+    #[test]
+    fn shipped_example_modes_parse_cleanly() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("examples")
+            .join("modes");
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .expect("examples/modes exists")
+            .filter_map(|e| e.ok().map(|x| x.path()))
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("md"))
+            .collect();
+        assert!(!entries.is_empty(), "expected example mode files");
+        for path in entries {
+            let id = path.file_stem().and_then(|s| s.to_str()).unwrap();
+            let raw = std::fs::read_to_string(&path).unwrap();
+            let spec = parse_mode_markdown(id, &raw);
+            assert!(!spec.description.trim().is_empty(), "{id} empty description");
+            assert!(!spec.body.trim().is_empty(), "{id} empty body");
+        }
+    }
 }
 

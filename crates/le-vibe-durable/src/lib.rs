@@ -359,15 +359,33 @@ impl SessionStore {
         tool_name: impl Into<String>,
         arguments_json: impl Into<String>,
     ) -> Result<SessionEntry, SessionError> {
+        self.append_tool_call_with_usage(tool_call_id, tool_name, arguments_json, None)
+    }
+
+    /// A tool-calling turn has no assistant message entry, so the turn's usage rides on its first
+    /// tool call. Without this every tool-calling turn went unaccounted for, and a finished
+    /// session under-reported its tokens by the whole conversation.
+    pub fn append_tool_call_with_usage(
+        &mut self,
+        tool_call_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        arguments_json: impl Into<String>,
+        usage: Option<EntryUsage>,
+    ) -> Result<SessionEntry, SessionError> {
         let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).ok();
-        self.append_full_entry(
-            EntryKind::ToolCall,
-            "assistant".to_string(),
-            arguments_json.into(),
-            ts,
-            Some(tool_call_id.into()),
-            Some(tool_name.into()),
-        )
+        self.append_entry_with_metadata(EntryMetadata {
+            kind: EntryKind::ToolCall,
+            role: "assistant".to_string(),
+            content: arguments_json.into(),
+            timestamp: ts,
+            tool_call_id: Some(tool_call_id.into()),
+            tool_name: Some(tool_name.into()),
+            first_kept_entry_id: None,
+            tokens_before: None,
+            from_id: None,
+            target_id: None,
+            usage,
+        })
     }
 
     pub fn append_tool_result(

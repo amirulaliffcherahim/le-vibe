@@ -459,3 +459,32 @@ fn rewind_checkpoints_ignore_compaction_summaries() {
     let rows = store.rewind_checkpoints();
     assert_eq!(rows.len(), 2, "summary is system, not a checkpoint");
 }
+
+#[test]
+fn a_tool_call_entry_can_carry_the_turns_usage() {
+    let dir = temp_dir("tool_call_usage");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("s.jsonl");
+    let mut store = SessionStore::open(&path).unwrap();
+    store
+        .append_tool_call_with_usage(
+            "call_1",
+            "read",
+            r#"{"path":"a.py"}"#,
+            Some(EntryUsage {
+                input_tokens: 100,
+                cache_read_tokens: 900,
+                cache_write_tokens: 0,
+                output_tokens: 20,
+            }),
+        )
+        .unwrap();
+    // The second call in the same turn does not carry it again.
+    store.append_tool_call("call_2", "read", "{}").unwrap();
+
+    let reloaded = SessionStore::open(&path).unwrap();
+    let entries = reloaded.entries();
+    assert_eq!(entries[0].usage.map(|u| u.cache_read_tokens), Some(900));
+    assert!(entries[1].usage.is_none(), "usage is recorded once per turn");
+    let _ = std::fs::remove_dir_all(&dir);
+}

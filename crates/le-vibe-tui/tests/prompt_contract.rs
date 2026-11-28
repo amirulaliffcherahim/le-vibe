@@ -194,3 +194,24 @@ fn windows_hints_name_powershell_and_rule_out_unix_tools() {
         "{core}"
     );
 }
+
+#[test]
+fn codemode_rule_directs_localized_work_to_native_tools_first() {
+    let core = static_core(AgentMode::Normal, "C:/work/demo");
+    let start = core.find("<operating_contract>").unwrap();
+    let end = core.find("</operating_contract>").unwrap();
+    let contract = &core[start..end];
+    assert!(
+        contract.contains("single-file reads") && contract.contains("localized edits"),
+        "Rule 7 must direct simple reads/edits to native tools: {contract}"
+    );
+    assert!(
+        contract.contains("reserve `codemode` for multi-file sweeps"),
+        "Rule 7 must reserve codemode for sweeps/log filtering/batch transforms: {contract}"
+    );
+    assert!(
+        !contract.contains("\n\n8."),
+        "Rule 7 must not emit a stray blank line before Rule 8: {contract}"
+    );
+}
+

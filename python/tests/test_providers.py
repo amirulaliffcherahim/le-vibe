@@ -1172,3 +1172,68 @@ def test_sharing_is_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
     assert auth.shared_cli_stores_enabled() is False
     monkeypatch.delenv("LE_VIBE_SHARE_CLI_CREDENTIALS")
     assert auth.shared_cli_stores_enabled({}) is False
+
+
+@pytest.mark.parametrize(
+    ("model_id", "requested", "expected"),
+    [
+        # deepseek-v4-1-flash*: ["none", "low", "high", "max"] (medium/xhigh -> high)
+        ("deepseek-v4-1-flash-1017", "none", "none"),
+        ("deepseek-v4-1-flash-1017", "off", "none"),
+        ("deepseek-v4-1-flash-1017", "low", "low"),
+        ("deepseek-v4-1-flash-1017", "medium", "high"),
+        ("deepseek-v4-1-flash-1017", "high", "high"),
+        ("deepseek-v4-1-flash-1017", "xhigh", "high"),
+        ("deepseek-v4-1-flash-1017", "max", "max"),
+        # mistral-large-4*: ["low", "medium", "high"] (none -> low, xhigh/max -> high)
+        ("mistral-large-4-0", "none", "low"),
+        ("mistral-large-4-0", "off", "low"),
+        ("mistral-large-4-0", "low", "low"),
+        ("mistral-large-4-0", "medium", "medium"),
+        ("mistral-large-4-0", "high", "high"),
+        ("mistral-large-4-0", "xhigh", "high"),
+        ("mistral-large-4-0", "max", "high"),
+        # mistral-small-2603 / mistral-medium-3-5: ["none", "high"] (any non-none -> high)
+        ("mistral-small-2603", "none", "none"),
+        ("mistral-small-2603", "off", "none"),
+        ("mistral-small-2603", "low", "high"),
+        ("mistral-small-2603", "medium", "high"),
+        ("mistral-small-2603", "high", "high"),
+        ("mistral-small-2603", "xhigh", "high"),
+        ("mistral-small-2603", "max", "high"),
+        ("mistral-medium-3-5", "none", "none"),
+        ("mistral-medium-3-5", "low", "high"),
+        ("mistral-medium-3-5", "medium", "high"),
+        ("mistral-medium-3-5", "max", "high"),
+        # zai-glm-5-3*: ["low", "high", "max"] (none -> low, medium -> high, xhigh -> max)
+        ("zai-glm-5-3", "none", "low"),
+        ("zai-glm-5-3", "off", "low"),
+        ("zai-glm-5-3", "low", "low"),
+        ("zai-glm-5-3", "medium", "high"),
+        ("zai-glm-5-3", "high", "high"),
+        ("zai-glm-5-3", "xhigh", "max"),
+        ("zai-glm-5-3", "max", "max"),
+    ],
+)
+def test_vibe_per_model_reasoning_effort_clamping(
+    model_id: str, requested: str, expected: str
+) -> None:
+    from le_vibe.providers.catalog import resolve_reasoning_effort
+    from le_vibe.providers.types import ModelSpec
+
+    model = ModelSpec(
+        id=model_id,
+        name=model_id,
+        provider="vibe",
+        base_url="https://api.mistral.ai/v1",
+        reasoning=True,
+    )
+    assert resolve_reasoning_effort(model, requested) == expected
+
+    ctx = TranscriptContext(messages=[Message(role="user", content="hi")])
+    payload = build_vibe_payload(model, ctx, StreamOptions(thinking_level=requested))  # type: ignore[arg-type]
+    if expected == "none":
+        assert "reasoning_effort" not in payload
+    else:
+        assert payload["reasoning_effort"] == expected
+

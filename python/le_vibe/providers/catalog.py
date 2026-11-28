@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass
+import fnmatch
 import json
 import os
 from pathlib import Path
@@ -559,6 +561,104 @@ async def refresh_model_catalogs(
     _LAST_REFRESH = time.time()
     _save_cached_catalogs()
     return counts
+
+
+@dataclass(frozen=True, slots=True)
+class ModelReasoningCapability:
+    """Supported `reasoning_effort` values and nearest-level fallback for a model family."""
+
+    pattern: str
+    supported: tuple[str, ...]
+    fallback: Mapping[str, str]
+
+
+# Per-model reasoning capabilities (matched against lowercase model.id).
+# Keeps clamping in the catalog layer instead of hardcoding provider-wide rules.
+MODEL_REASONING_CAPABILITIES: tuple[ModelReasoningCapability, ...] = (
+    ModelReasoningCapability(
+        pattern="deepseek-v4-1-flash*",
+        supported=("none", "low", "high", "max"),
+        fallback={"minimal": "low", "medium": "high", "xhigh": "high"},
+    ),
+    ModelReasoningCapability(
+        pattern="mistral-large-4*",
+        supported=("low", "medium", "high"),
+        fallback={"none": "low", "minimal": "low", "xhigh": "high", "max": "high"},
+    ),
+    ModelReasoningCapability(
+        pattern="mistral-small-2603",
+        supported=("none", "high"),
+        fallback={
+            "minimal": "high",
+            "low": "high",
+            "medium": "high",
+            "xhigh": "high",
+            "max": "high",
+        },
+    ),
+    ModelReasoningCapability(
+        pattern="mistral-medium-3-5",
+        supported=("none", "high"),
+        fallback={
+            "minimal": "high",
+            "low": "high",
+            "medium": "high",
+            "xhigh": "high",
+            "max": "high",
+        },
+    ),
+    ModelReasoningCapability(
+        pattern="zai-glm-5-3*",
+        supported=("low", "high", "max"),
+        fallback={"none": "low", "minimal": "low", "medium": "high", "xhigh": "max"},
+    ),
+)
+
+_EFFORT_LADDER: tuple[str, ...] = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+
+
+def _nearest_supported_effort(level: str, supported: tuple[str, ...]) -> str:
+    if level in supported:
+        return level
+    if level in _EFFORT_LADDER:
+        target = _EFFORT_LADDER.index(level)
+        ranked = sorted(
+            (s for s in supported if s in _EFFORT_LADDER),
+            key=lambda s: (abs(_EFFORT_LADDER.index(s) - target), -_EFFORT_LADDER.index(s)),
+        )
+        if ranked:
+            return ranked[0]
+    return "high" if "high" in supported else supported[0]
+
+
+def resolve_reasoning_effort(model: ModelSpec, requested: str) -> str:
+    """Clamp a requested thinking level to a valid `reasoning_effort` for `model`."""
+    raw = (requested or "medium").strip().lower()
+    normalized = "none" if raw in {"off", "none"} else raw
+    mid = model.id.lower()
+
+    for cap in MODEL_REASONING_CAPABILITIES:
+        if fnmatch.fnmatchcase(mid, cap.pattern):
+            if normalized in cap.supported:
+                return normalized
+            if normalized in cap.fallback:
+                return cap.fallback[normalized]
+            return _nearest_supported_effort(normalized, cap.supported)
+
+    if model.thinking_level_map:
+        if raw in model.thinking_level_map:
+            mapped = model.thinking_level_map[raw]
+            return "none" if mapped in {"off", "none"} else mapped
+        if normalized in model.thinking_level_map:
+            mapped = model.thinking_level_map[normalized]
+            return "none" if mapped in {"off", "none"} else mapped
+        supported = tuple(
+            dict.fromkeys("none" if v in {"off", "none"} else v for v in model.thinking_level_map.values())
+        )
+        if supported:
+            return _nearest_supported_effort(normalized, supported)
+
+    return normalized
 
 
 def default_thinking_for_model(model: ModelSpec) -> str:

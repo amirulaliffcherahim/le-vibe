@@ -100,6 +100,18 @@ pub enum ApprovalChoice {
     Deny,
 }
 
+/// Persona configuration for `spawn_agent(mode="...")`, decoupled from `le-vibe-tui`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentPersona {
+    pub id: String,
+    pub system_prompt: String,
+    pub allowed_tools: Option<Vec<String>>,
+    pub model: Option<String>,
+    pub thinking: Option<String>,
+    pub max_turns: Option<usize>,
+    pub verify_edits: Option<bool>,
+}
+
 pub struct AgentConfig {
     pub provider: String,
     pub model: String,
@@ -135,6 +147,8 @@ pub struct AgentConfig {
     pub prompt_request_counter: Option<Arc<AtomicUsize>>,
     /// Shared uncached input token counter across parent + subagents for `max_prompt_uncached_tokens`.
     pub prompt_uncached_counter: Option<Arc<AtomicU64>>,
+    /// Subagent personas available to `spawn_agent(mode="...")`.
+    pub subagent_personas: Vec<SubagentPersona>,
 }
 
 /// Classify a successful reply as an overflow, if it is one.
@@ -193,6 +207,7 @@ impl Default for AgentConfig {
             request_source: None,
             prompt_request_counter: None,
             prompt_uncached_counter: None,
+            subagent_personas: Vec::new(),
         }
     }
 }
@@ -1734,44 +1749,104 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .trim();
+                let req_mode = tc
+                    .arguments
+                    .get("mode")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let persona = req_mode.and_then(|m| {
+                    config
+                        .subagent_personas
+                        .iter()
+                        .find(|p| p.id.eq_ignore_ascii_case(m))
+                });
                 if task.is_empty() {
                     ("Tool error: spawn_agent requires non-empty `task`".to_string(), true)
+                } else if let Some(m) = req_mode
+                    && persona.is_none()
+                {
+                    let avail: Vec<&str> = config
+                        .subagent_personas
+                        .iter()
+                        .map(|p| p.id.as_str())
+                        .collect();
+                    (
+                        format!(
+                            "Tool error: unknown subagent mode `{m}`. Available: {}",
+                            if avail.is_empty() {
+                                "(none)".to_string()
+                            } else {
+                                avail.join(", ")
+                            }
+                        ),
+                        true,
+                    )
                 } else {
                     on_event(AgentEvent::Status {
                         text: format!("Subagent researching: {}...", task.chars().take(48).collect::<String>()),
                     });
                     let mut child_session = SessionStore::in_memory();
                     let mut child_todos = TodoStore::new();
-                    let child_cfg = AgentConfig {
-                        provider: config.provider.clone(),
-                        model: config.model.clone(),
-                        system_prompt: Some(
-                            "You are an isolated read-only research subagent. Use read, grep, find, and ls to investigate the task thoroughly, then return a concise, concrete answer with exact file paths and line numbers.".to_string(),
+                    let (child_provider, child_model) = match persona
+                        .and_then(|p| p.model.as_deref())
+                        .and_then(|spec| spec.split_once('/'))
+                    {
+                        Some((p, m)) => (p.trim().to_string(), m.trim().to_string()),
+                        None => (
+                            config.provider.clone(),
+                            persona
+                                .and_then(|p| p.model.clone())
+                                .unwrap_or_else(|| config.model.clone()),
                         ),
-                        thinking_level: config.thinking_level.clone(),
-                        max_turns: 12,
+                    };
+                    let child_cfg = AgentConfig {
+                        provider: child_provider,
+                        model: child_model,
+                        system_prompt: Some(
+                            persona
+                                .map(|p| p.system_prompt.clone())
+                                .unwrap_or_else(|| {
+                                    "You are an isolated read-only research subagent. Use read, grep, find, and ls to investigate the task thoroughly, then return a concise, concrete answer with exact file paths and line numbers.".to_string()
+                                }),
+                        ),
+                        thinking_level: persona
+                            .and_then(|p| p.thinking.clone())
+                            .unwrap_or_else(|| config.thinking_level.clone()),
+                        max_turns: persona.and_then(|p| p.max_turns).unwrap_or(12),
                         max_retries: config.max_retries,
                         base_delay_ms: config.base_delay_ms,
                         max_delay_ms: config.max_delay_ms,
-                        allowed_tools: Some(vec![
-                            "read".to_string(),
-                            "grep".to_string(),
-                            "find".to_string(),
-                            "ls".to_string(),
-                        ]),
-                        mode_name: Some("ask".to_string()),
+                        allowed_tools: persona
+                            .and_then(|p| p.allowed_tools.clone())
+                            .or_else(|| {
+                                Some(vec![
+                                    "read".to_string(),
+                                    "grep".to_string(),
+                                    "find".to_string(),
+                                    "ls".to_string(),
+                                ])
+                            }),
+                        mode_name: Some(
+                            persona
+                                .map(|p| p.id.clone())
+                                .unwrap_or_else(|| "ask".to_string()),
+                        ),
                         codemode: "off".to_string(),
                         steering_queue: None,
                         output_store: config.output_store.clone(),
                         context_window: config.context_window,
                         reserve_tokens: config.reserve_tokens,
-                        verify_edits: config.verify_edits,
+                        verify_edits: persona
+                            .and_then(|p| p.verify_edits)
+                            .unwrap_or(config.verify_edits),
                         max_prompt_requests: config.max_prompt_requests,
                         max_prompt_uncached_tokens: config.max_prompt_uncached_tokens,
                         usage_logger: active_logger.clone(),
                         request_source: Some("subagent".to_string()),
                         prompt_request_counter: Some(Arc::clone(&req_counter)),
                         prompt_uncached_counter: Some(Arc::clone(&uncached_counter)),
+                        subagent_personas: Vec::new(),
                     };
                     let mut noop_ev = |_: AgentEvent| {};
                     let mut deny_all = |_: ApprovalRequest| ApprovalChoice::Deny;

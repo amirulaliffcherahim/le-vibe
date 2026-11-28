@@ -544,14 +544,15 @@ fn run_interactive_tui(
             .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "on" | "yes"))
             .unwrap_or(default)
     };
+    state.modes = crate::settings::discover_modes();
     if let Some(saved_shell) = layered.get("terminal") {
         state.shell = saved_shell.clone();
     }
     if let Some(saved_theme) = layered.get("theme").and_then(|s| ThemeId::from_name(s)) {
         state.theme = saved_theme;
     }
-    if let Some(saved_mode) = layered.get("mode").and_then(|s| AgentMode::from_name(s)) {
-        state.mode = saved_mode;
+    if let Some(saved_mode) = layered.get("mode") {
+        state.set_active_mode(saved_mode);
     }
     if let Some(saved_thinking) = layered.get("thinking") {
         state.thinking_level = saved_thinking.clone();
@@ -659,7 +660,7 @@ fn run_interactive_tui(
     let mut last_catalog_check = Instant::now();
     let mut last_spinner_tick = Instant::now();
     let mut last_live_usage: Option<Value> = None;
-    let mut last_recorded_mode = state.mode;
+    let mut last_recorded_mode = state.active_mode_name().to_string();
     let mut turn_tools_count: usize = 0;
     let mut loop_scheduler = LoopScheduler::default();
     let mut last_quit_press: Option<Instant> = None;
@@ -670,10 +671,10 @@ fn run_interactive_tui(
     let mut active_prompt = false;
 
     loop {
-        if state.mode != last_recorded_mode {
-            last_recorded_mode = state.mode;
+        if state.active_mode_name() != last_recorded_mode {
+            last_recorded_mode = state.active_mode_name().to_string();
             needs_redraw = true;
-            let _ = cmd_tx.send(WorkerCmd::RecordModeChange(state.mode.name().to_string()));
+            let _ = cmd_tx.send(WorkerCmd::RecordModeChange(last_recorded_mode.clone()));
         }
         loop {
             let msg = match msg_rx.try_recv() {
@@ -1009,6 +1010,7 @@ fn run_interactive_tui(
                                     model: state.model.clone(),
                                     thinking_level: state.thinking_level.clone(),
                                     mode: state.mode,
+                                    mode_id: state.active_mode_name().to_string(),
                                     shell: state.shell.clone(),
                                     max_turns: state.max_turns,
                                     retry_max: state.retry_max,
@@ -1150,6 +1152,7 @@ fn run_interactive_tui(
                                 model: state.model.clone(),
                                 thinking_level: state.thinking_level.clone(),
                                 mode: state.mode,
+                                mode_id: state.active_mode_name().to_string(),
                                 shell: state.shell.clone(),
                                 max_turns: state.max_turns,
                                 retry_max: state.retry_max,
@@ -1189,6 +1192,7 @@ fn run_interactive_tui(
                 model: state.model.clone(),
                 thinking_level: state.thinking_level.clone(),
                 mode: state.mode,
+                mode_id: state.active_mode_name().to_string(),
                 shell: state.shell.clone(),
                 max_turns: state.max_turns,
                 retry_max: state.retry_max,
@@ -1655,15 +1659,17 @@ fn run_interactive_tui(
                 if input == "/reload" {
                     let (layered, origins) = load_layered_settings();
                     state.config_origins = origins;
+                    state.modes = crate::settings::discover_modes();
                     if let Some(t) = layered.get("theme").and_then(|s| ThemeId::from_name(s)) {
                         state.theme = t;
                     }
                     if let Some(sh) = layered.get("terminal") {
                         state.shell = sh.clone();
                     }
-                    if let Some(m) = layered.get("mode").and_then(|s| AgentMode::from_name(s)) {
-                        state.mode = m;
+                    if let Some(m) = layered.get("mode") {
+                        state.set_active_mode(m);
                     }
+                    let _ = cmd_tx.send(WorkerCmd::ReloadProjectResources);
                     state.workspace_files = scan_workspace_files(std::path::Path::new("."), 1500);
                     state.is_busy = true;
                     state.status_text = Some("Reloading catalogs, settings, policy, plugins & MCP...".to_string());
@@ -1765,6 +1771,7 @@ fn run_interactive_tui(
                         model: state.model.clone(),
                         thinking_level: state.thinking_level.clone(),
                         mode: state.mode,
+                        mode_id: state.active_mode_name().to_string(),
                         shell: state.shell.clone(),
                         max_turns: state.max_turns,
                         retry_max: state.retry_max,
@@ -1776,27 +1783,36 @@ fn run_interactive_tui(
                 }
                 if input == "/mode" {
                     state.modal = ActiveModal::ModePicker;
-                    state.modal_idx = match state.mode {
-                        AgentMode::Normal => 0,
-                        AgentMode::Plan => 1,
-                        AgentMode::Ask => 2,
-                        AgentMode::Rea => 3,
-                        AgentMode::Cyber => 4,
-                    };
+                    let cur_name = state.active_mode_name().to_string();
+                    state.modal_idx = state
+                        .primary_modes()
+                        .iter()
+                        .position(|m| m.id.eq_ignore_ascii_case(&cur_name))
+                        .unwrap_or(0);
                     continue;
                 }
                 if let Some(arg) = input.strip_prefix("/mode ") {
-                    if let Some(m) = AgentMode::from_name(arg) {
-                        state.mode = m;
+                    if state.set_active_mode(arg) {
+                        let active_name = state.active_mode_name().to_string();
+                        let desc = state
+                            .modes
+                            .iter()
+                            .find(|m| m.id.eq_ignore_ascii_case(&active_name))
+                            .map(|m| m.description.clone())
+                            .unwrap_or_default();
                         state.blocks.push(TranscriptBlock::System(format!(
-                            "Switched mode to [{}] — {}",
-                            m.name(),
-                            m.description()
+                            "Switched mode to [{active_name}] — {desc}"
                         )));
                     } else {
+                        let names: Vec<&str> = state
+                            .primary_modes()
+                            .into_iter()
+                            .map(|m| m.id.as_str())
+                            .collect();
                         state.blocks.push(TranscriptBlock::System(format!(
-                            "Unknown mode {:?}. Choose: normal, plan, ask, rea, cyber.",
-                            arg.trim()
+                            "Unknown mode {:?}. Choose: {}.",
+                            arg.trim(),
+                            names.join(", ")
                         )));
                     }
                     continue;
@@ -2030,6 +2046,7 @@ fn run_interactive_tui(
                         model: state.model.clone(),
                         thinking_level: state.thinking_level.clone(),
                         mode: state.mode,
+                        mode_id: state.active_mode_name().to_string(),
                         shell: state.shell.clone(),
                         max_turns: state.max_turns,
                         retry_max: state.retry_max,
@@ -2185,6 +2202,7 @@ fn run_interactive_tui(
                             model: state.model.clone(),
                             thinking_level: state.thinking_level.clone(),
                             mode: state.mode,
+                            mode_id: state.active_mode_name().to_string(),
                             shell: state.shell.clone(),
                             max_turns: state.max_turns,
                             retry_max: state.retry_max,
@@ -2451,6 +2469,7 @@ fn run_interactive_tui(
                             model: state.model.clone(),
                             thinking_level: state.thinking_level.clone(),
                             mode: state.mode,
+                            mode_id: state.active_mode_name().to_string(),
                             shell: state.shell.clone(),
                             max_turns: state.max_turns,
                             retry_max: state.retry_max,
@@ -2508,6 +2527,7 @@ fn run_interactive_tui(
                     model: state.model.clone(),
                     thinking_level: state.thinking_level.clone(),
                     mode: state.mode,
+                    mode_id: state.active_mode_name().to_string(),
                     shell: state.shell.clone(),
                     max_turns: state.max_turns,
                     retry_max: state.retry_max,

@@ -314,6 +314,8 @@ pub struct TuiState {
     pub model: String,
     pub thinking_level: String,
     pub mode: AgentMode,
+    pub active_mode_id: String,
+    pub modes: Vec<crate::ModeSpec>,
     pub theme: ThemeId,
     pub shell: String,
     pub model_default_thinking: BTreeMap<(String, String), String>,
@@ -428,6 +430,8 @@ impl TuiState {
             model,
             thinking_level: "medium".to_string(),
             mode: AgentMode::Normal,
+            active_mode_id: "normal".to_string(),
+            modes: crate::ModeSpec::builtins(),
             theme: ThemeId::Pi,
             shell: if cfg!(windows) {
                 "powershell".to_string()
@@ -756,6 +760,62 @@ impl TuiState {
             .map(|t| t.elapsed().as_millis() as u64)
             .unwrap_or(0);
         self.active_ms.saturating_add(live)
+    }
+
+    pub fn primary_modes(&self) -> Vec<&crate::ModeSpec> {
+        self.modes
+            .iter()
+            .filter(|m| m.scope.is_primary())
+            .collect()
+    }
+
+    pub fn active_mode_name(&self) -> &str {
+        if self.active_mode_id.is_empty() {
+            self.mode.name()
+        } else {
+            &self.active_mode_id
+        }
+    }
+
+    pub fn set_active_mode(&mut self, id: &str) -> bool {
+        let needle = id.trim().to_ascii_lowercase();
+        if let Some(found) = self
+            .modes
+            .iter()
+            .find(|m| m.id.eq_ignore_ascii_case(&needle) && m.scope.is_primary())
+        {
+            self.active_mode_id = found.id.clone();
+            self.mode = found
+                .builtin
+                .or_else(|| AgentMode::from_name(&found.id))
+                .unwrap_or(AgentMode::Normal);
+            return true;
+        }
+        if let Some(builtin) = AgentMode::from_name(&needle) {
+            self.active_mode_id = builtin.name().to_string();
+            self.mode = builtin;
+            return true;
+        }
+        false
+    }
+
+    pub fn cycle_mode(&mut self) {
+        let primaries: Vec<String> = self
+            .primary_modes()
+            .into_iter()
+            .map(|m| m.id.clone())
+            .collect();
+        if primaries.is_empty() {
+            self.mode = self.mode.next();
+            self.active_mode_id = self.mode.name().to_string();
+            return;
+        }
+        let cur = primaries
+            .iter()
+            .position(|id| id.eq_ignore_ascii_case(self.active_mode_name()))
+            .unwrap_or(0);
+        let next_id = primaries[(cur + 1) % primaries.len()].clone();
+        self.set_active_mode(&next_id);
     }
 
     pub fn record_usage(

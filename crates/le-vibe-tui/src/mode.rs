@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentMode {
     Normal,
@@ -268,8 +270,283 @@ fn cap_utf8(text: &str, max_bytes: usize) -> String {
     format!("{}...[truncated]", &trimmed[..idx])
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModeScope {
+    Primary,
+    Subagent,
+    All,
+}
+
+impl ModeScope {
+    pub fn from_str_lossy(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "primary" => Self::Primary,
+            "subagent" => Self::Subagent,
+            _ => Self::All,
+        }
+    }
+
+    pub fn is_primary(self) -> bool {
+        !matches!(self, Self::Subagent)
+    }
+
+    pub fn is_subagent(self) -> bool {
+        !matches!(self, Self::Primary)
+    }
+}
+
+/// Editable persona / mode specification (built-in or loaded from `~/.le-vibe/modes/*.md` or
+/// `<repo>/.le-vibe/modes/*.md` with YAML frontmatter).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModeSpec {
+    pub id: String,
+    pub description: String,
+    pub scope: ModeScope,
+    pub can_write: bool,
+    pub verify_edits: Option<bool>,
+    pub model: Option<String>,
+    pub thinking: Option<String>,
+    pub max_turns: Option<usize>,
+    pub tools: BTreeMap<String, bool>,
+    pub body: String,
+    pub builtin: Option<AgentMode>,
+}
+
+const ALL_BUILTIN_TOOL_NAMES: &[&str] = &[
+    "read",
+    "write",
+    "edit",
+    "grep",
+    "find",
+    "ls",
+    "bash",
+    "powershell",
+    "todo",
+    "ask_user_question",
+    "web_search",
+    "fetch_content",
+    "retrieve_output",
+    "memory_search",
+    "memory_write",
+    "memory_read",
+    "memory_delete",
+    "spawn_agent",
+    "load_skill",
+    "codemode",
+];
+
+const READONLY_TOOL_NAMES: &[&str] = &[
+    "read",
+    "grep",
+    "find",
+    "ls",
+    "todo",
+    "ask_user_question",
+    "memory_search",
+    "memory_read",
+    "retrieve_output",
+    "web_search",
+    "fetch_content",
+];
+
+impl ModeSpec {
+    pub fn from_builtin(mode: AgentMode) -> Self {
+        let steps = mode.mode_steps();
+        let body = if steps.is_empty() {
+            mode.system_prompt().to_string()
+        } else {
+            format!("{}\n{steps}", mode.system_prompt())
+        };
+        Self {
+            id: mode.name().to_string(),
+            description: mode.description().to_string(),
+            scope: ModeScope::All,
+            can_write: mode.can_write(),
+            verify_edits: None,
+            model: None,
+            thinking: None,
+            max_turns: None,
+            tools: BTreeMap::new(),
+            body,
+            builtin: Some(mode),
+        }
+    }
+
+    pub fn builtins() -> Vec<Self> {
+        ALL_MODES.iter().copied().map(Self::from_builtin).collect()
+    }
+
+    /// Resolve the tool allowlist for this mode (`None` = all registered tools allowed).
+    pub fn resolve_allowed_tools(&self) -> Option<Vec<String>> {
+        if self.tools.is_empty() {
+            if let Some(b) = self.builtin
+                && self.can_write == b.can_write()
+            {
+                return b.allowed_tools();
+            }
+            if !self.can_write {
+                return Some(READONLY_TOOL_NAMES.iter().map(|s| (*s).to_string()).collect());
+            }
+            return None;
+        }
+        let base: Vec<&str> = if self.can_write {
+            ALL_BUILTIN_TOOL_NAMES.to_vec()
+        } else {
+            READONLY_TOOL_NAMES.to_vec()
+        };
+        let mut allowed: std::collections::BTreeSet<String> =
+            base.into_iter().map(str::to_string).collect();
+        for (name, enabled) in &self.tools {
+            if *enabled {
+                allowed.insert(name.clone());
+            } else {
+                allowed.remove(name);
+            }
+        }
+        Some(allowed.into_iter().collect())
+    }
+}
+
+fn strip_inline_comment(val: &str) -> &str {
+    let mut in_single = false;
+    let mut in_double = false;
+    for (idx, ch) in val.char_indices() {
+        match ch {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '#' if !in_single && !in_double => return val[..idx].trim(),
+            _ => {}
+        }
+    }
+    val.trim()
+}
+
+fn unquote_yaml(val: &str) -> String {
+    let s = strip_inline_comment(val).trim();
+    if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
+    {
+        s[1..s.len() - 1].to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Parse a Markdown mode file with optional YAML frontmatter (`--- ... ---`).
+/// Pure Rust, zero external YAML crate needed.
+pub fn parse_mode_markdown(id: &str, raw: &str) -> ModeSpec {
+    let clean_id = id.trim().to_ascii_lowercase();
+    let mut spec = AgentMode::from_name(&clean_id)
+        .map(ModeSpec::from_builtin)
+        .unwrap_or_else(|| ModeSpec {
+            id: clean_id.clone(),
+            description: format!("Custom mode `{clean_id}`"),
+            scope: ModeScope::All,
+            can_write: true,
+            verify_edits: None,
+            model: None,
+            thinking: None,
+            max_turns: None,
+            tools: BTreeMap::new(),
+            body: String::new(),
+            builtin: None,
+        });
+
+    let normalized = raw.replace("\r\n", "\n");
+    let trimmed = normalized.trim_start_matches('\u{feff}');
+    let (frontmatter, body) = if let Some(rest) = trimmed.strip_prefix("---\n") {
+        if let Some(end) = rest.find("\n---") {
+            let fm = &rest[..end];
+            let after = &rest[end + 4..];
+            let body = after.strip_prefix('\n').unwrap_or(after).trim();
+            (Some(fm), body)
+        } else {
+            (None, trimmed.trim())
+        }
+    } else {
+        (None, trimmed.trim())
+    };
+
+    if !body.is_empty() {
+        spec.body = body.to_string();
+    }
+
+    if let Some(fm) = frontmatter {
+        let mut in_tools = false;
+        for line in fm.lines() {
+            let raw_trimmed = line.trim();
+            if raw_trimmed.is_empty() || raw_trimmed.starts_with('#') {
+                continue;
+            }
+            let indented = line.starts_with(' ') || line.starts_with('\t');
+            if in_tools && indented {
+                if let Some((k, v)) = raw_trimmed.split_once(':') {
+                    let tool_name = unquote_yaml(k);
+                    let val = unquote_yaml(v).to_ascii_lowercase();
+                    if !tool_name.is_empty() && matches!(val.as_str(), "true" | "false") {
+                        spec.tools.insert(tool_name, val == "true");
+                    }
+                }
+                continue;
+            }
+            in_tools = false;
+            if let Some((k, v)) = raw_trimmed.split_once(':') {
+                let key = k.trim().to_ascii_lowercase();
+                let val = unquote_yaml(v);
+                match key.as_str() {
+                    "description" if !val.is_empty() => spec.description = val,
+                    "scope" if !val.is_empty() => spec.scope = ModeScope::from_str_lossy(&val),
+                    "can_write" => {
+                        if matches!(val.to_ascii_lowercase().as_str(), "true" | "false") {
+                            spec.can_write = val.eq_ignore_ascii_case("true");
+                        }
+                    }
+                    "verify_edits" => {
+                        if matches!(val.to_ascii_lowercase().as_str(), "true" | "false") {
+                            spec.verify_edits = Some(val.eq_ignore_ascii_case("true"));
+                        }
+                    }
+                    "model" if !val.is_empty() => spec.model = Some(val),
+                    "thinking" if !val.is_empty() => spec.thinking = Some(val),
+                    "max_turns" => {
+                        if let Ok(n) = val.parse::<usize>()
+                            && n > 0
+                        {
+                            spec.max_turns = Some(n);
+                        }
+                    }
+                    "tools" => {
+                        in_tools = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    spec
+}
+
 pub fn build_system_prompt(
     mode: AgentMode,
+    shell: &str,
+    cwd: &str,
+    self_repo: &str,
+    skills: &[(String, String, String)],
+    memory_toc: &str,
+) -> String {
+    build_system_prompt_for_spec(
+        &ModeSpec::from_builtin(mode),
+        shell,
+        cwd,
+        self_repo,
+        skills,
+        memory_toc,
+    )
+}
+
+pub fn build_system_prompt_for_spec(
+    spec: &ModeSpec,
     shell: &str,
     cwd: &str,
     self_repo: &str,
@@ -333,12 +610,10 @@ filler or tool narration.\n\
 os={os}, active_shell={shell}\n\
 </environment>\n\n\
 <mode name=\"{}\">\n\
-{}\n{}
-\
+{}\n\
 </mode>\n\n",
-        mode.name(),
-        mode.system_prompt(),
-        mode.mode_steps(),
+        spec.id,
+        spec.body,
     );
 
     // Self-debugging guidance is only worth its tokens when working inside le-vibe itself.
@@ -492,3 +767,61 @@ pub const ALL_SHELLS: &[(&str, &str)] = &[
     ("sh", "POSIX Shell (sh -c)"),
     ("other", "Custom shell (type: /term <executable>)"),
 ];
+
+#[cfg(test)]
+mod mode_spec_tests {
+    use super::*;
+
+    #[test]
+    fn parses_frontmatter_tools_and_body() {
+        let raw = "\
+---
+description: Read-only code & usage reviewer
+scope: subagent           # primary | subagent | all
+can_write: false
+verify_edits: false
+model: vibe/mistral-large-4-0
+thinking: medium
+max_turns: 20
+tools:
+  read: true
+  grep: true
+  edit: false
+  powershell: false
+---
+Review the diff for regressions. Cite exact file:line. Make zero edits.
+";
+        let spec = parse_mode_markdown("reviewer", raw);
+        assert_eq!(spec.id, "reviewer");
+        assert_eq!(spec.description, "Read-only code & usage reviewer");
+        assert_eq!(spec.scope, ModeScope::Subagent);
+        assert!(!spec.can_write);
+        assert_eq!(spec.verify_edits, Some(false));
+        assert_eq!(spec.model.as_deref(), Some("vibe/mistral-large-4-0"));
+        assert_eq!(spec.thinking.as_deref(), Some("medium"));
+        assert_eq!(spec.max_turns, Some(20));
+        assert_eq!(spec.tools.get("read"), Some(&true));
+        assert_eq!(spec.tools.get("edit"), Some(&false));
+        assert!(spec.body.contains("Review the diff"));
+
+        let allowed = spec.resolve_allowed_tools().expect("filtered list");
+        assert!(allowed.contains(&"read".to_string()));
+        assert!(allowed.contains(&"grep".to_string()));
+        assert!(!allowed.contains(&"edit".to_string()));
+        assert!(!allowed.contains(&"powershell".to_string()));
+    }
+
+    #[test]
+    fn custom_mode_keeps_core_kv_cache_prefix_identical_to_builtin() {
+        let custom = parse_mode_markdown(
+            "reviewer",
+            "---\ndescription: Reviewer\ncan_write: false\n---\nAudit only.",
+        );
+        let p_norm = build_system_prompt(AgentMode::Normal, "powershell", "C:/w", "", &[], "");
+        let p_rev = build_system_prompt_for_spec(&custom, "powershell", "C:/w", "", &[], "");
+        let mode_at = p_norm.find("<mode name=").unwrap();
+        assert_eq!(&p_norm[..mode_at], &p_rev[..mode_at]);
+        assert!(p_rev.contains("<mode name=\"reviewer\">\nAudit only.\n</mode>"));
+    }
+}
+

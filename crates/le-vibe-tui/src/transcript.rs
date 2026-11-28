@@ -1660,7 +1660,7 @@ pub(crate) fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         AgentMode::Rea => pal.secondary,
         AgentMode::Cyber => pal.error,
     };
-    let mode_pill = format!(" ▸ {}", state.mode.name());
+    let mode_pill = format!(" ▸ {}", state.active_mode_name());
     let quota_badge = state
         .provider_quota_badge
         .get(&state.provider)

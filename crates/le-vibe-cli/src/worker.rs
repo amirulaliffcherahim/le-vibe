@@ -5,8 +5,8 @@ use le_vibe_pybridge::{ChatMessage, CompletionRequest, PolicyPort, ProviderPort,
 use le_vibe_telemetry::TelemetryRecorder;
 use le_vibe_tools::TodoStore;
 use le_vibe_tui::{
-    AgentMode, QuestionItem, QuestionOption, QuestionSession, TuiState, append_model_profile,
-    build_system_prompt, format_tokens,
+    AgentMode, ModeSpec, QuestionItem, QuestionOption, QuestionSession, TuiState,
+    append_model_profile, build_system_prompt_for_spec, format_tokens,
 };
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -333,6 +333,7 @@ pub(crate) enum WorkerCmd {
         model: String,
         thinking_level: String,
         mode: AgentMode,
+        mode_id: String,
         shell: String,
         max_turns: usize,
         retry_max: usize,
@@ -721,6 +722,7 @@ pub(crate) fn spawn_tui_worker(
         let mut codemode_setting = "off".to_string();
         // Resolved once: the `tools` setting pins the schema for the whole session.
         let pinned_tools = crate::settings::pinned_tools();
+        let mut loaded_modes = crate::settings::discover_modes();
         // Freeze `<memory_toc>` and `<model_profile>` per session/model so mid-session
         // `memory_write` never busts the provider KV-cache prefix.
         let mut session_memory_toc = le_vibe_tools::memory::MemoryRagStore::open_default().build_toc(25);
@@ -1622,6 +1624,7 @@ pub(crate) fn spawn_tui_worker(
                     let _ = msg_tx.send(WorkerMsg::Idle);
                 }
                 WorkerCmd::ReloadProjectResources => {
+                    loaded_modes = crate::settings::discover_modes();
                     let mcp_paths = default_mcp_paths();
                     mcp = McpManager::from_config_files(&mcp_paths);
                     let _ = bridge.reload_extensions();
@@ -1703,8 +1706,8 @@ pub(crate) fn spawn_tui_worker(
                         .into_iter()
                         .map(|s| (s.name, s.description, s.path))
                         .collect();
-                    let sys = build_system_prompt(
-                        mode,
+                    let sys = build_system_prompt_for_spec(
+                        &ModeSpec::from_builtin(mode),
                         &shell,
                         &cwd_string(),
                         &self_repo_path(),
@@ -1806,6 +1809,7 @@ pub(crate) fn spawn_tui_worker(
                     model,
                     thinking_level,
                     mode,
+                    mode_id,
                     shell,
                     max_turns,
                     retry_max,
@@ -1814,9 +1818,32 @@ pub(crate) fn spawn_tui_worker(
                     prompt,
                 } => {
                     cancel.store(false, Ordering::SeqCst);
+                    let mode_spec = loaded_modes
+                        .iter()
+                        .find(|m| m.id.eq_ignore_ascii_case(&mode_id))
+                        .cloned()
+                        .unwrap_or_else(|| ModeSpec::from_builtin(mode));
+                    let (eff_provider, eff_model) = match mode_spec
+                        .model
+                        .as_deref()
+                        .and_then(|s| s.split_once('/'))
+                    {
+                        Some((p, m)) => (p.trim().to_string(), m.trim().to_string()),
+                        None => (
+                            provider.clone(),
+                            mode_spec.model.clone().unwrap_or_else(|| model.clone()),
+                        ),
+                    };
+                    let eff_thinking = mode_spec
+                        .thinking
+                        .clone()
+                        .unwrap_or_else(|| thinking_level.clone());
+                    let eff_max_turns = mode_spec.max_turns.unwrap_or(max_turns);
+                    let eff_verify = mode_spec.verify_edits.unwrap_or(verify_edits);
+
                     if session.active_branch().is_empty() {
                         let _ = session.append_model_change(format!(
-                            "{provider}/{model}:{thinking_level}"
+                            "{eff_provider}/{eff_model}:{eff_thinking}"
                         ));
                     }
                     let skill_dirs = default_skill_dirs();
@@ -1827,15 +1854,15 @@ pub(crate) fn spawn_tui_worker(
                         .into_iter()
                         .map(|s| (s.name, s.description, s.path))
                         .collect();
-                    let mut sys = build_system_prompt(
-                        mode,
+                    let mut sys = build_system_prompt_for_spec(
+                        &mode_spec,
                         &shell,
                         &cwd_string(),
                         &self_repo_path(),
                         &discovered_skills,
                         &session_memory_toc,
                     );
-                    let model_key = format!("{provider}/{model}");
+                    let model_key = format!("{eff_provider}/{eff_model}");
                     let cached_note = match &session_model_note {
                         Some((k, note)) if k == &model_key => note.clone(),
                         _ => {
@@ -1855,21 +1882,21 @@ pub(crate) fn spawn_tui_worker(
                     }
                     let layered_w = crate::settings::load_layered_settings().0;
                     let cfg = AgentConfig {
-                        provider: provider.clone(),
-                        model,
+                        provider: eff_provider.clone(),
+                        model: eff_model,
                         system_prompt: Some(sys),
-                        thinking_level,
-                        max_turns,
+                        thinking_level: eff_thinking,
+                        max_turns: eff_max_turns,
                         max_retries: retry_max,
                         base_delay_ms: le_vibe_agent::DEFAULT_BASE_DELAY_MS,
                         max_delay_ms: le_vibe_agent::DEFAULT_MAX_DELAY_MS,
                         context_window,
                         reserve_tokens: le_vibe_agent::DEFAULT_RESERVE_TOKENS,
-                        verify_edits,
+                        verify_edits: eff_verify,
                         allowed_tools: pinned_tools
                             .clone()
-                            .or_else(|| mode.allowed_tools()),
-                        mode_name: Some(mode.name().to_string()),
+                            .or_else(|| mode_spec.resolve_allowed_tools()),
+                        mode_name: Some(mode_spec.id.clone()),
                         codemode: codemode_setting.clone(),
                         steering_queue: Some(Arc::clone(&steering_queue)),
                         output_store: Some(Arc::clone(&output_store)),
@@ -1881,6 +1908,9 @@ pub(crate) fn spawn_tui_worker(
                             .get("max_prompt_uncached_tokens")
                             .and_then(|v| v.parse::<u64>().ok())
                             .unwrap_or(0),
+                        subagent_personas: crate::settings::subagent_personas_from_modes(
+                            &loaded_modes,
+                        ),
                         ..AgentConfig::default()
                     };
                     let mut stream_ms: u128 = 0;

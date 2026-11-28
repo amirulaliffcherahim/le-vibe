@@ -31,7 +31,10 @@ pub use diagram::{extract_latest_xml_block, project_xml_diagram};
 pub use editor::wrap_editor_lines;
 pub use export::{export_session_html, export_session_markdown};
 pub use input::{apply_wheel_scroll, handle_key_event, poll_tui_action};
-pub use mode::{ALL_MODES, ALL_SHELLS, AgentMode, append_model_profile, build_system_prompt};
+pub use mode::{
+    ALL_MODES, ALL_SHELLS, AgentMode, ModeScope, ModeSpec, append_model_profile,
+    build_system_prompt, build_system_prompt_for_spec, parse_mode_markdown,
+};
 pub use probe::{ProbeFrame, key_from_spec, press, render_frame, render_frame_text};
 pub use state::{
     ActiveModal, CompactionReason, FrameBuffer, ProviderUsageStats, QuestionItem, QuestionOption,

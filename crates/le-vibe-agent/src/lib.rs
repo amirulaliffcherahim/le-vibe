@@ -10,7 +10,7 @@ pub use overflow::{estimate_tokens, is_context_overflow, is_context_overflow_tex
 pub use verification::{NUDGE_MESSAGE, VerificationGate};
 pub use workflows::{ProofOutcome, ProofState, evaluate_proof_reply};
 
-use le_vibe_durable::{EntryKind, SessionStore};
+use le_vibe_durable::{EntryKind, EntryUsage, SessionStore};
 use le_vibe_mcp::McpManager;
 use le_vibe_pybridge::{
     AssistantMessage, BridgeError, ChatMessage, CompletionRequest, ExtensionPort, PolicyPort,
@@ -199,6 +199,16 @@ pub fn mode_transition_reminder(prev: Option<&str>, current: &str) -> Option<Str
         _ => return None,
     };
     Some(msg)
+}
+
+/// Snapshot one turn's provider usage for the session log.
+fn entry_usage(usage: &le_vibe_pybridge::Usage) -> EntryUsage {
+    EntryUsage {
+        input_tokens: usage.input_tokens,
+        cache_read_tokens: usage.cache_read_tokens,
+        cache_write_tokens: usage.cache_write_tokens,
+        output_tokens: usage.output_tokens,
+    }
 }
 
 pub fn sanitize_messages_for_provider(provider: &str, messages: &mut Vec<ChatMessage>) {
@@ -1023,7 +1033,7 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
             // VerificationGate: an edit followed by no command is not "done". One nudge per prompt,
             // then the gate gives up so a forgetful model cannot loop forever here.
             if gate.should_nudge() {
-                session.append("assistant", &reply.content)?;
+                session.append_with_usage("assistant", &reply.content, entry_usage(&reply.usage))?;
                 messages.push(ChatMessage {
                     role: "assistant".to_string(),
                     content: reply.content.clone(),
@@ -1046,8 +1056,9 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                 continue;
             }
             let mut final_reply = reply;
+            let turn_usage = entry_usage(&final_reply.usage);
             final_reply.usage = cumulative_usage;
-            session.append("assistant", &final_reply.content)?;
+            session.append_with_usage("assistant", &final_reply.content, turn_usage)?;
             on_event(AgentEvent::TurnEnd {
                 stop_reason: final_reply.stop_reason.clone(),
             });

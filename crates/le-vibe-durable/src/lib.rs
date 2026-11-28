@@ -58,6 +58,9 @@ pub struct SessionEntry {
     /// pi's `targetId` on a label entry: the entry the label belongs to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_id: Option<String>,
+    /// Provider-reported usage for this turn, so a finished session can be costed afterwards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<EntryUsage>,
 }
 
 /// One node of the session tree (pi's `SessionTreeNode`), plus whether it is on the active path.
@@ -103,6 +106,24 @@ fn default_kind() -> EntryKind {
     EntryKind::Message
 }
 
+/// Token usage for one model turn, persisted with the entry.
+///
+/// The TUI footer shows live counters, but a finished session could not be costed after the fact:
+/// any cost comparison between harnesses needs to read input / cache / output per turn out of the
+/// session log. Optional and skipped when absent, so older logs still load and unknown fields are
+/// ignored by readers that predate it.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EntryUsage {
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+}
+
 /// Everything needed to append one entry, including the pi-specific boundary metadata.
 struct EntryMetadata {
     kind: EntryKind,
@@ -115,6 +136,7 @@ struct EntryMetadata {
     tokens_before: Option<u64>,
     from_id: Option<String>,
     target_id: Option<String>,
+    usage: Option<EntryUsage>,
 }
 
 #[derive(Debug, Default)]
@@ -191,6 +213,7 @@ impl SessionStore {
             tokens_before: None,
             from_id: None,
             target_id: None,
+            usage: None,
         })
     }
 
@@ -215,6 +238,7 @@ impl SessionStore {
             tokens_before: meta.tokens_before,
             from_id: meta.from_id,
             target_id: meta.target_id,
+            usage: meta.usage,
         };
         if let Some(path) = &self.path {
             if let Some(parent) = path.parent() {
@@ -232,6 +256,28 @@ impl SessionStore {
 
     pub fn append(&mut self, role: impl Into<String>, content: impl Into<String>) -> Result<SessionEntry, SessionError> {
         self.append_entry(EntryKind::Message, role.into(), content.into())
+    }
+
+    /// Append an assistant turn together with the usage the provider reported for it.
+    pub fn append_with_usage(
+        &mut self,
+        role: impl Into<String>,
+        content: impl Into<String>,
+        usage: EntryUsage,
+    ) -> Result<SessionEntry, SessionError> {
+        self.append_entry_with_metadata(EntryMetadata {
+            kind: EntryKind::Message,
+            role: role.into(),
+            content: content.into(),
+            timestamp: None,
+            tool_call_id: None,
+            tool_name: None,
+            first_kept_entry_id: None,
+            tokens_before: None,
+            from_id: None,
+            target_id: None,
+            usage: Some(usage),
+        })
     }
 
     pub fn append_compaction(&mut self, summary: impl Into<String>) -> Result<SessionEntry, SessionError> {
@@ -263,6 +309,7 @@ impl SessionStore {
             tokens_before,
             from_id: None,
             target_id: None,
+            usage: None,
         })
     }
 
@@ -298,6 +345,7 @@ impl SessionStore {
             tokens_before: None,
             from_id: abandoned,
             target_id: None,
+            usage: None,
         })
     }
 
@@ -557,6 +605,7 @@ impl SessionStore {
             tokens_before: None,
             from_id: None,
             target_id: Some(entry_id.to_string()),
+            usage: None,
         })?;
         // A label annotates the tree; it must not move the active leaf.
         self.leaf_id = previous_leaf;

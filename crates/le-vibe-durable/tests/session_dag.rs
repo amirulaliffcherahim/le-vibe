@@ -1,7 +1,7 @@
 //! Session DAG parity with pi's `session-manager.ts`: the `firstKeptEntryId` compaction boundary,
 //! branch summaries, and legacy-file tolerance.
 
-use le_vibe_durable::{EntryKind, SessionEntry, SessionStore};
+use le_vibe_durable::{EntryKind, EntryUsage, SessionEntry, SessionStore};
 use std::path::{Path, PathBuf};
 
 fn temp_dir(tag: &str) -> PathBuf {
@@ -50,12 +50,43 @@ fn ordinary_entries_do_not_serialize_the_new_fields() {
     let mut store = SessionStore::in_memory();
     store.append("user", "q").unwrap();
     let json = serde_json::to_string(&store.entries()[0]).unwrap();
-    for key in ["first_kept_entry_id", "tokens_before", "from_id"] {
+    for key in ["first_kept_entry_id", "tokens_before", "from_id", "usage"] {
         assert!(
             !json.contains(key),
             "compact entries must omit {key}: {json}"
         );
     }
+}
+
+#[test]
+fn turn_usage_is_persisted_so_a_finished_session_can_be_costed() {
+    let dir = temp_dir("turn_usage");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("s.jsonl");
+    let mut store = SessionStore::open(&path).unwrap();
+    store.append("user", "q").unwrap();
+    store
+        .append_with_usage(
+            "assistant",
+            "a",
+            EntryUsage {
+                input_tokens: 1_200,
+                cache_read_tokens: 9_000,
+                cache_write_tokens: 300,
+                output_tokens: 450,
+            },
+        )
+        .unwrap();
+
+    let reloaded = SessionStore::open(&path).unwrap();
+    let usage = reloaded.entries()[1].usage.expect("usage survives a reload");
+    assert_eq!(usage.input_tokens, 1_200);
+    assert_eq!(usage.cache_read_tokens, 9_000);
+    assert_eq!(usage.cache_write_tokens, 300);
+    assert_eq!(usage.output_tokens, 450);
+    assert!(reloaded.entries()[0].usage.is_none());
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---------------------------------------------------------------------------

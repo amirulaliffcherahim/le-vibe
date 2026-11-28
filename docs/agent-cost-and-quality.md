@@ -64,6 +64,39 @@ Modes narrow this: `plan`/`ask`/`rea` send 11-14 tools, `normal`/`cyber` send al
   percentage, plus one compact-and-retry on silent overflow.
 - **One 401 -> one forced refresh -> one replay.** No retry storm on auth failures.
 
+## Measuring a run
+
+Every assistant turn now persists the provider-reported usage into the session log:
+
+```json
+{"id":"msg_7","kind":"message","role":"assistant","content":"...","usage":{"input_tokens":1200,"cache_read_tokens":9000,"cache_write_tokens":300,"output_tokens":450}}
+```
+
+The footer's counters are live-only; this is what lets a finished session be costed. `usage` is
+`Option`al and skipped when absent, so older logs still load.
+
+Tokens per solved task for one session:
+
+```python
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])          # or a glob over ~/.le-vibe/sessions/**/*.jsonl
+inp = cache = out = turns = 0
+for line in path.read_text(encoding="utf-8").splitlines():
+    e = json.loads(line)
+    u = e.get("usage") or {}
+    if not u:
+        continue
+    turns += 1
+    inp += u.get("input_tokens", 0)
+    cache += u.get("cache_read_tokens", 0)
+    out += u.get("output_tokens", 0)
+print(f"turns={turns} uncached_in={inp} cache_read={cache} out={out} billed_in={inp + cache} total={inp + cache + out}")
+```
+
+Compare like with like: same model, same tasks, same 3 runs, one proxy counting every call.
+A number from a single self-selected task is not a benchmark — the published spread between
+different task sets is larger than the spread between harnesses.
+
 ## Rules of thumb when adding to le-vibe
 
 - A new tool costs its schema on **every** call of **every** session. Budget ~300 tok; keep the

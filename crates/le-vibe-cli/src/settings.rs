@@ -204,6 +204,13 @@ fn read_settings_map(path: &Path) -> BTreeMap<String, String> {
             Value::String(s) => s,
             Value::Bool(b) => b.to_string(),
             Value::Number(n) => n.to_string(),
+            // A list of strings (`"tools": ["read", "grep"]`) joins to the same comma form
+            // the `--tools` flag uses, so both spellings parse identically downstream.
+            Value::Array(items) => items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(","),
             _ => continue,
         };
         if !s.trim().is_empty() {
@@ -211,6 +218,22 @@ fn read_settings_map(path: &Path) -> BTreeMap<String, String> {
         }
     }
     out
+}
+
+/// The `tools` setting: a pinned tool set that replaces the mode default, so a session only pays
+/// the schema bytes it actually uses. Accepts a JSON array or the comma form `--tools` takes;
+/// the flag on the command line still wins over it.
+pub(crate) fn pinned_tools() -> Option<Vec<String>> {
+    parse_tool_list(load_layered_settings().0.get("tools")?)
+}
+
+fn parse_tool_list(raw: &str) -> Option<Vec<String>> {
+    let tools: Vec<String> = raw
+        .split([',', ' '])
+        .map(|s| s.trim().trim_matches(['"', '[', ']']).to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    (!tools.is_empty()).then_some(tools)
 }
 
 /// Loads user (`~/.le-vibe/settings.json`) then project (`.le-vibe/settings.json`),
@@ -527,3 +550,23 @@ pub(crate) fn open_session_with_opts(opts: &crate::cli::CliOptions) -> SessionSt
     SessionStore::open(p).unwrap_or_else(|_| SessionStore::in_memory())
 }
 
+
+#[cfg(test)]
+mod pinned_tools_tests {
+    use super::parse_tool_list;
+
+    #[test]
+    fn accepts_comma_space_and_json_array_forms() {
+        let want = vec!["read".to_string(), "grep".to_string()];
+        assert_eq!(parse_tool_list("read,grep").unwrap(), want);
+        assert_eq!(parse_tool_list(" read , grep ").unwrap(), want);
+        assert_eq!(parse_tool_list(r#"["read", "grep"]"#).unwrap(), want);
+        assert_eq!(parse_tool_list("read grep").unwrap(), want);
+    }
+
+    #[test]
+    fn empty_or_blank_pins_nothing() {
+        assert_eq!(parse_tool_list(""), None);
+        assert_eq!(parse_tool_list("  ,  "), None);
+    }
+}

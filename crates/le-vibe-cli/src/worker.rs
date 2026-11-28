@@ -705,6 +705,8 @@ pub(crate) fn spawn_tui_worker(
         let mut todos = TodoStore::new();
         let output_store = Arc::new(Mutex::new(OutputStore::new()));
         let mut codemode_setting = "off".to_string();
+        // Resolved once: the `tools` setting pins the schema for the whole session.
+        let pinned_tools = crate::settings::pinned_tools();
         // Freeze `<memory_toc>` and `<model_profile>` per session/model so mid-session
         // `memory_write` never busts the provider KV-cache prefix.
         let mut session_memory_toc = le_vibe_tools::memory::MemoryRagStore::open_default().build_toc(25);
@@ -1770,7 +1772,9 @@ pub(crate) fn spawn_tui_worker(
                         context_window,
                         reserve_tokens: le_vibe_agent::DEFAULT_RESERVE_TOKENS,
                         verify_edits,
-                        allowed_tools: mode.allowed_tools(),
+                        allowed_tools: pinned_tools
+                            .clone()
+                            .or_else(|| mode.allowed_tools()),
                         mode_name: Some(mode.name().to_string()),
                         codemode: codemode_setting.clone(),
                         steering_queue: Some(Arc::clone(&steering_queue)),

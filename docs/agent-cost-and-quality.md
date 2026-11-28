@@ -43,10 +43,22 @@ Measured on this repo (`cargo test -p le-vibe-tui --test prompt_size_probe`):
 | **Fixed prefix** | **~2,800 tok** | **every call** |
 
 Reference points: pi ~1,474 tok, Claude Code ~1,161 tok. le-vibe's prefix is larger mainly because
-it carries 20 tools where pi carries 4. That is a deliberate quality trade — memory, subagents,
-codemode, skills and web tools live in the same request.
+it carries 20 builtins where stock pi carries 4. That is a deliberate quality trade — memory,
+subagents, codemode, skills and web tools live in the same request.
 
-Modes narrow this: `plan`/`ask`/`rea` send 11-14 tools, `normal`/`cyber` send all 20.
+**This is a stock-vs-stock comparison, not a like-for-like one.** A pi install with the same
+feature set loaded as extensions or MCP servers pays the same per-call schema bill; the published
+figures above also show that code-mode plugin hosts land in the 50-70k range on the same model.
+The honest conclusion is not "fewer features" — it is *pay only for the tools this mode needs*.
+
+Three levers exist, cheapest to most invasive:
+
+1. **`tools` setting** — pin the exposed set in `~/.le-vibe/settings.json`, as an array or a comma
+   string: `"tools": ["read", "write", "edit", "grep", "ls", "bash", "powershell"]`.
+   That drops ~2,400 B (~600 tok) per call versus all 20. `--tools a,b,c` overrides it for one run.
+2. **Mode defaults** — `plan`/`ask` send 11, `rea` 14, `normal`/`cyber` all registered tools.
+3. **`codemode`** — batch many tool calls into one Python script: one turn instead of N, and the
+   sub-tools' schemas do not have to be in the request at all.
 
 ## What le-vibe does to keep cost down
 

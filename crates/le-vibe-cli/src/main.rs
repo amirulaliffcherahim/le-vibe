@@ -41,8 +41,9 @@ use crate::settings::{
     arg_value, current_git_branch, current_repo_name, cwd_string, default_mcp_paths,
     default_model_for, format_cwd, load_history, load_layered_settings, load_scope,
     open_session_with_opts, project_settings_file, resolve_python_dir, resolve_python_exe,
-    save_history, save_scope, save_setting, save_setting_for_scope, scan_workspace_files,
-    self_repo_path, sessions_dir, settings_file, summarize_git_status, trust_cwd_in_policy,
+    pinned_tools, save_history, save_scope, save_setting, save_setting_for_scope,
+    scan_workspace_files, self_repo_path, sessions_dir, settings_file, summarize_git_status,
+    trust_cwd_in_policy,
 };
 use crate::worker::{WorkerCmd, WorkerMsg, spawn_tui_worker, update_quota_badges, usage_report};
 
@@ -406,7 +407,10 @@ fn main() {
                         .as_deref()
                         .and_then(AgentMode::from_name)
                         .unwrap_or(AgentMode::Normal);
-                    let allowed_tools = opts.allowed_tools.or_else(|| agent_mode.allowed_tools());
+                    let allowed_tools = opts
+                        .allowed_tools
+                        .or_else(pinned_tools)
+                        .or_else(|| agent_mode.allowed_tools());
                     let mut sys = build_system_prompt(
                         agent_mode,
                         "powershell",

@@ -53,7 +53,8 @@ SUBCOMMANDS:
   install <file.py|git-url>    Install a Python extension into ~/.le-vibe/extensions/
   remove <name>                Remove an installed extension
   list                         List installed extensions
-  update                       Pull latest main & reinstall le-vibe binary
+  update [--release|--tag <v>|--local|--from <bin>]
+                               Hot-swap le-vibe from GitHub release or local build (works while running)
   doctor                       Run local environment, auth, MCP & config health check
 
 OPTIONS:

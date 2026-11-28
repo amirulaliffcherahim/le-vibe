@@ -279,6 +279,10 @@ class AgyProvider:
         usage = Usage()
 
         continuation_attempts = 0
+        # Stable for this response, unique across responses in the session.
+        call_salt = hashlib.sha1(
+            str(payload.get("requestId") or uuid.uuid4()).encode()
+        ).hexdigest()[:8]
         stream_payload = payload
         while True:
             yielded_any = False
@@ -324,7 +328,12 @@ class AgyProvider:
                             call_id = (
                                 str(raw_id)
                                 if isinstance(raw_id, str) and raw_id.strip()
-                                else f"agy_call_{len(tool_calls) + 1}"
+                                # Salted per response: a bare counter restarted at 1 on every
+                                # turn, so one long session ended up with 80 tool results
+                                # sharing `agy_call_1` and tool-result pairing by id became
+                                # ambiguous. The salt is fixed for this response, so the ids
+                                # stay stable once persisted (prefix caching is unaffected).
+                                else f"agy_call_{call_salt}_{len(tool_calls) + 1}"
                             )
                             call = ToolCall(
                                 id=call_id,

@@ -34,7 +34,7 @@ class PythonToolSpec:
 
 def parse_skill_file(skill_md: Path) -> SkillSpec:
     raw = skill_md.read_text(encoding="utf-8")
-    name = skill_md.parent.name
+    name = skill_md.parent.name if skill_md.name.upper() == "SKILL.MD" else skill_md.stem
     description = ""
     body = raw
 
@@ -52,10 +52,17 @@ def parse_skill_file(skill_md: Path) -> SkillSpec:
 
 def discover_skills(roots: Sequence[Path]) -> list[SkillSpec]:
     discovered: list[SkillSpec] = []
+    seen_paths: set[Path] = set()
     for root in roots:
         if not root.exists():
             continue
-        for skill_md in sorted(root.rglob("SKILL.md")):
+        for skill_md in sorted(root.rglob("*.md")):
+            if skill_md.name.startswith("_") or skill_md.name.upper() == "README.MD":
+                continue
+            resolved = skill_md.resolve()
+            if resolved in seen_paths:
+                continue
+            seen_paths.add(resolved)
             discovered.append(parse_skill_file(skill_md))
     return discovered
 

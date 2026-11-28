@@ -353,7 +353,7 @@ impl ModeSpec {
     }
 
     pub fn builtins() -> Vec<Self> {
-        ALL_MODES.iter().copied().map(Self::from_builtin).collect()
+        vec![Self::from_builtin(AgentMode::Normal)]
     }
 
     /// Resolve the tool allowlist for this mode (`None` = all registered tools allowed).
@@ -853,6 +853,13 @@ Review the diff for regressions. Cite exact file:line. Make zero edits.
         let mode_at = p_norm.find("<mode name=").unwrap();
         assert_eq!(&p_norm[..mode_at], &p_rev[..mode_at]);
         assert!(p_rev.contains("<mode name=\"reviewer\">\nAudit only.\n</mode>"));
+    }
+
+    #[test]
+    fn default_builtins_ship_only_normal_mode() {
+        let builtins = ModeSpec::builtins();
+        assert_eq!(builtins.len(), 1);
+        assert_eq!(builtins[0].id, "normal");
     }
 }
 

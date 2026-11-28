@@ -139,7 +139,14 @@ def _default_policy_paths() -> list[Path]:
 
 
 def _default_extension_dirs() -> list[Path]:
-    return [Path.home() / ".le-vibe" / "extensions", Path.cwd() / ".le-vibe" / "extensions"]
+    return [
+        Path.home() / ".le-vibe" / "extension",
+        Path.home() / ".agents" / "extension",
+        Path.cwd() / ".le-vibe" / "extension",
+        Path.cwd() / ".agents" / "extension",
+        Path.home() / ".le-vibe" / "extensions",
+        Path.cwd() / ".le-vibe" / "extensions",
+    ]
 
 
 def _load_configured_extensions(

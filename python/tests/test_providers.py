@@ -1237,3 +1237,78 @@ def test_vibe_per_model_reasoning_effort_clamping(
     else:
         assert payload["reasoning_effort"] == expected
 
+
+@pytest.mark.asyncio
+async def test_all_providers_report_uncached_input_tokens_separately_from_cache_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every provider must report `input_tokens` as uncached input only (`max(0, total - cache_read)`)."""
+    import time
+    from le_vibe.providers import save_oidc_tokens
+
+    auth_file = tmp_path / "auth.json"
+    monkeypatch.setenv("LE_VIBE_AUTH_FILE", str(auth_file))
+    save_oidc_tokens(
+        "vibe",
+        access_token="vibe-access-token-long-enough",
+        id_token="vibe-id-token",
+        expires_at=time.time() + 3600,
+        organization_id="org-1",
+        workspace_id="ws-1",
+        auth_file=auth_file,
+    )
+    save_oidc_tokens(
+        "agy",
+        access_token="ya29.token-long-enough",
+        expires_at=time.time() + 3600,
+        project_id="aicode-consumers",
+        auth_file=auth_file,
+    )
+
+    ctx = TranscriptContext(messages=[Message(role="user", content="hi")])
+
+    # 1) deepseek: prompt_tokens=1000, prompt_cache_hit_tokens=600 -> uncached=400, cache_read=600
+    ds_sse = (
+        'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],'
+        '"usage":{"prompt_tokens":1000,"completion_tokens":20,"prompt_cache_hit_tokens":600}}\n'
+        "data: [DONE]\n"
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, text=ds_sse))
+    ) as client:
+        ds_msg = await DeepSeekProvider(client=client).complete(
+            _deepseek_test_model(), ctx, StreamOptions(api_key="k")
+        )
+    assert ds_msg.usage.input_tokens == 400
+    assert ds_msg.usage.cache_read_tokens == 600
+    assert ds_msg.usage.output_tokens == 20
+
+    # 2) vibe: prompt_tokens=1200, cached_tokens=900 -> uncached=300, cache_read=900
+    vibe_sse = (
+        'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],'
+        '"usage":{"prompt_tokens":1200,"completion_tokens":15,"prompt_tokens_details":{"cached_tokens":900}}}\n'
+        "data: [DONE]\n"
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, text=vibe_sse))
+    ) as client:
+        vibe_msg = await VibeProvider(client=client).complete(_vibe_test_model(), ctx)
+    assert vibe_msg.usage.input_tokens == 300
+    assert vibe_msg.usage.cache_read_tokens == 900
+    assert vibe_msg.usage.output_tokens == 15
+
+    # 3) agy: promptTokenCount=1887, cachedContentTokenCount=1871 -> uncached=16, cache_read=1871
+    agy_sse = (
+        'data: {"response":{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}],'
+        '"usageMetadata":{"promptTokenCount":1887,"candidatesTokenCount":4,"cachedContentTokenCount":1871}}}\n'
+        "data: [DONE]\n"
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, text=agy_sse))
+    ) as client:
+        agy_msg = await AgyProvider(client=client).complete(_grouped_flash_model(), ctx)
+    assert agy_msg.usage.input_tokens == 16
+    assert agy_msg.usage.cache_read_tokens == 1871
+    assert agy_msg.usage.output_tokens == 4
+
+

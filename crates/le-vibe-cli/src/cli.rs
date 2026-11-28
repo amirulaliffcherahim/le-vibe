@@ -43,13 +43,14 @@ pub(crate) fn help_text() -> &'static str {
 
 USAGE:
   le-vibe [OPTIONS] [--] [@files...] [prompt...]
-  le-vibe <login|auth|mcp|config|install|remove|list|update> [OPTIONS]
+  le-vibe <login|auth|mcp|config|usage|install|remove|list|update> [OPTIONS]
 
 SUBCOMMANDS:
   login [--provider ...]       Authenticate provider (OIDC / OAuth / API key)
   auth                         Print JSON auth status for all providers
   mcp list                     List configured MCP servers and status
   config [path|set <k> <v>]    Inspect or update layered settings
+  usage [session-id|path]      Read-only forensic token, cache-hit & anomaly report
   install <file.py|git-url>    Install a Python extension into ~/.le-vibe/extensions/
   remove <name>                Remove an installed extension
   list                         List installed extensions
@@ -95,7 +96,7 @@ pub(crate) fn parse_cli_args(args: &[String]) -> CliAction {
     if let Some(first) = args.first().map(String::as_str)
         && (matches!(
             first,
-            "login" | "auth" | "mcp" | "config" | "install" | "remove" | "list" | "update" | "doctor"
+            "login" | "auth" | "mcp" | "config" | "usage" | "install" | "remove" | "list" | "update" | "doctor"
         ) || (cfg!(feature = "dev-debug") && first == "tui-probe"))
     {
         return CliAction::Subcommand(first.to_string(), args[1..].to_vec());

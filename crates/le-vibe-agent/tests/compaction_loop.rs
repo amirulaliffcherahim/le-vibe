@@ -152,6 +152,7 @@ fn config() -> AgentConfig {
         context_window: 200_000,
         reserve_tokens: compact::DEFAULT_RESERVE_TOKENS,
         verify_edits: false,
+        ..AgentConfig::default()
     }
 }
 

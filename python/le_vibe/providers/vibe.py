@@ -252,12 +252,19 @@ class VibeProvider:
                 in_tok = int(raw_usage.get("prompt_tokens", 0))
                 out_tok = int(raw_usage.get("completion_tokens", 0))
                 cache_read = int(raw_usage.get("prompt_tokens_details", {}).get("cached_tokens", 0) or 0)
+                cache_write = int(
+                    raw_usage.get("cache_creation_input_tokens")
+                    or raw_usage.get("prompt_tokens_details", {}).get("cache_write_tokens", 0)
+                    or 0
+                )
+                uncached_in = max(0, in_tok - cache_read)
                 usage = Usage(
-                    input_tokens=in_tok,
+                    input_tokens=uncached_in,
                     output_tokens=out_tok,
                     cache_read_tokens=cache_read,
+                    cache_write_tokens=cache_write,
                     cost_usd=calculate_cost_usd(
-                        input_tokens=max(0, in_tok - cache_read),
+                        input_tokens=uncached_in,
                         output_tokens=out_tok,
                         cache_read_tokens=cache_read,
                         input_per_m=model.cost.input,

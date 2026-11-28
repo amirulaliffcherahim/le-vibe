@@ -160,6 +160,7 @@ pub(crate) fn run_rpc_mode(
                     codemode: "off".to_string(),
                     steering_queue: None,
                     output_store: Some(std::sync::Arc::clone(&output_store)),
+                    ..AgentConfig::default()
                 };
                 match run_turn_loop_cancellable(
                     bridge,

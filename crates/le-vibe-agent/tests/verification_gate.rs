@@ -275,6 +275,7 @@ mod loop_level {
             context_window: 0,
             reserve_tokens: 0,
             verify_edits,
+            ..AgentConfig::default()
         }
     }
 

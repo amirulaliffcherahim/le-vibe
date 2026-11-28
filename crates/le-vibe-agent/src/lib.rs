@@ -16,6 +16,7 @@ use le_vibe_pybridge::{
     AssistantMessage, BridgeError, ChatMessage, CompletionRequest, ExtensionPort, PolicyPort,
     ProviderPort, ToolCall,
 };
+use le_vibe_telemetry::usage::{UsageEventInput, UsageLogger, default_usage_log_path, fnv1a_hex};
 pub use le_vibe_telemetry::TelemetryRecorder;
 use le_vibe_tools::codemode::run_codemode_script;
 use le_vibe_tools::hooks::HookRegistry;
@@ -26,7 +27,7 @@ use le_vibe_tools::{
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -121,6 +122,19 @@ pub struct AgentConfig {
     pub reserve_tokens: u64,
     /// Refuse a stop that follows an unverified edit (default on; settings opt-out).
     pub verify_edits: bool,
+    /// Hard cap on outbound LLM requests per prompt (including retries, nudges, compactions,
+    /// and subagents). `0` = unlimited.
+    pub max_prompt_requests: usize,
+    /// Hard cap on cumulative uncached input tokens per prompt. `0` = unlimited.
+    pub max_prompt_uncached_tokens: u64,
+    /// Optional per-request forensic usage logger (shared with subagents).
+    pub usage_logger: Option<UsageLogger>,
+    /// Override for the forensic usage log `source` field (`"main"`, `"subagent"`, `"goldfish"`, ...).
+    pub request_source: Option<String>,
+    /// Shared outbound request counter across parent + subagents for `max_prompt_requests`.
+    pub prompt_request_counter: Option<Arc<AtomicUsize>>,
+    /// Shared uncached input token counter across parent + subagents for `max_prompt_uncached_tokens`.
+    pub prompt_uncached_counter: Option<Arc<AtomicU64>>,
 }
 
 /// Classify a successful reply as an overflow, if it is one.
@@ -173,6 +187,12 @@ impl Default for AgentConfig {
             context_window: 0,
             reserve_tokens: crate::compact::DEFAULT_RESERVE_TOKENS,
             verify_edits: true,
+            max_prompt_requests: 0,
+            max_prompt_uncached_tokens: 0,
+            usage_logger: None,
+            request_source: None,
+            prompt_request_counter: None,
+            prompt_uncached_counter: None,
         }
     }
 }
@@ -184,29 +204,53 @@ const MODE_REMINDER_PREFIX: &str = "<system-reminder>Operational mode changed";
 pub const REPEAT_CALL_NOTE: &str = "[Note: this exact tool call already ran in the previous step \
 with the same output; use the result above and try a different step.]";
 
-/// Flags a tool call that repeats the immediately preceding one with an identical result.
+/// Returned as a synthetic tool error on repeat #3+ of the same `(tool, normalized_args)` call
+/// with identical output, making multi-turn repeat spirals impossible.
+pub const REPEAT_CALL_BLOCK_ERROR: &str = "Tool error: loop breaker tripped — this exact tool call \
+already repeated with identical output. Do not call it again; use the result above and try a \
+different step.";
+
+/// Flags a tool call that repeats the immediately preceding one with an identical result, and
+/// escalates to a hard block on repeat #3+.
 ///
 /// Every step re-sends the whole transcript, so a duplicated call is the most expensive kind of
 /// wasted turn. The state is per turn loop: a different tool, different arguments or a changed
 /// output simply becomes the new baseline, so re-running a test after an edit is never flagged.
 #[derive(Default)]
 struct RepeatCallGuard {
-    last: Option<(String, String, String)>,
+    last: Option<(String, String, String, usize)>,
 }
 
 impl RepeatCallGuard {
-    fn notice(&mut self, name: &str, args_json: &str, output: &str) -> Option<&'static str> {
-        let args = serde_json::from_str::<serde_json::Value>(args_json)
+    fn normalize_args(args_json: &str) -> String {
+        serde_json::from_str::<serde_json::Value>(args_json)
             .map(|value| value.to_string())
-            .unwrap_or_else(|_| args_json.trim().to_string());
-        let repeated = self
-            .last
+            .unwrap_or_else(|_| args_json.trim().to_string())
+    }
+
+    /// True on repeat #3+ of the same `(name, normalized_args)` after repeat #2 already produced
+    /// identical output and received the soft nudge.
+    fn should_hard_block(&self, name: &str, args_json: &str) -> bool {
+        let args = Self::normalize_args(args_json);
+        self.last
             .as_ref()
-            .is_some_and(|(prev_name, prev_args, prev_out)| {
-                prev_name == name && prev_args == &args && prev_out == output
-            });
-        self.last = Some((name.to_string(), args, output.to_string()));
-        repeated.then_some(REPEAT_CALL_NOTE)
+            .is_some_and(|(prev_name, prev_args, _, count)| {
+                prev_name == name && prev_args == &args && *count >= 2
+            })
+    }
+
+    fn notice(&mut self, name: &str, args_json: &str, output: &str) -> Option<&'static str> {
+        let args = Self::normalize_args(args_json);
+        if let Some((prev_name, prev_args, prev_out, count)) = self.last.as_mut()
+            && prev_name == name
+            && prev_args == &args
+            && prev_out == output
+        {
+            *count += 1;
+            return Some(REPEAT_CALL_NOTE);
+        }
+        self.last = Some((name.to_string(), args, output.to_string(), 1));
+        None
     }
 }
 
@@ -230,6 +274,24 @@ pub fn mode_transition_reminder(prev: Option<&str>, current: &str) -> Option<Str
         _ => return None,
     };
     Some(msg)
+}
+
+fn extract_http_status(msg: &str) -> Option<u16> {
+    let lower = msg.to_ascii_lowercase();
+    for needle in ["http ", "status ", "status_code="] {
+        if let Some(pos) = lower.find(needle) {
+            let digits: String = lower[pos + needle.len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if digits.len() == 3
+                && let Ok(code) = digits.parse::<u16>()
+            {
+                return Some(code);
+            }
+        }
+    }
+    None
 }
 
 /// Snapshot one turn's provider usage for the session log.
@@ -642,6 +704,7 @@ fn build_branch_messages(session: &SessionStore) -> Vec<ChatMessage> {
 ///
 /// Returns the plan so the caller can report what happened; `Err` means the request should keep
 /// its current (uncompacted) messages.
+#[allow(clippy::too_many_arguments)]
 fn compact_in_loop<B: ProviderPort>(
     bridge: &mut B,
     session: &mut SessionStore,
@@ -649,6 +712,9 @@ fn compact_in_loop<B: ProviderPort>(
     cancel: Option<&AtomicBool>,
     reason: &str,
     before_tokens: u64,
+    usage_logger: Option<&UsageLogger>,
+    req_counter: &AtomicUsize,
+    turn_idx: usize,
     on_event: &mut dyn FnMut(AgentEvent),
 ) -> Option<Vec<ChatMessage>> {
     // Summarize the compaction-aware context, so a previous compaction's kept tail is included
@@ -671,9 +737,40 @@ fn compact_in_loop<B: ProviderPort>(
             });
         },
     };
+    req_counter.fetch_add(1, Ordering::Relaxed);
+    let compact_started = std::time::Instant::now();
     let plan = match crate::compact::summarize(bridge, &branch, &mut options) {
-        Ok(plan) => plan,
+        Ok(plan) => {
+            if let Some(logger) = usage_logger {
+                logger.record_request(UsageEventInput {
+                    turn_idx,
+                    source: "compact".to_string(),
+                    provider: config.provider.clone(),
+                    model: config.model.clone(),
+                    http_status: 200,
+                    stop_reason: "stop".to_string(),
+                    wall_ms: compact_started.elapsed().as_millis() as u64,
+                    in_uncached: before_tokens,
+                    compaction_occurred: true,
+                    ..Default::default()
+                });
+            }
+            plan
+        }
         Err(err) => {
+            if let Some(logger) = usage_logger {
+                logger.record_request(UsageEventInput {
+                    turn_idx,
+                    source: "compact".to_string(),
+                    provider: config.provider.clone(),
+                    model: config.model.clone(),
+                    http_status: 500,
+                    stop_reason: "error".to_string(),
+                    wall_ms: compact_started.elapsed().as_millis() as u64,
+                    compaction_occurred: true,
+                    ..Default::default()
+                });
+            }
             on_event(AgentEvent::Status {
                 text: format!("Compaction failed: {err}"),
             });
@@ -763,24 +860,56 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
         })
         .collect();
     if config.allowed_tools.is_none() {
+        let mut extra_tools = Vec::new();
         for ext in ext_tools {
-            if !tools.iter().any(|t| t.name == ext.name) {
-                tools.push(ext);
+            if !tools.iter().any(|t| t.name == ext.name)
+                && !extra_tools.iter().any(|t: &le_vibe_pybridge::ToolDefinition| t.name == ext.name)
+            {
+                extra_tools.push(ext);
             }
         }
         if let Some(mgr) = mcp.as_deref() {
             for m_tool in mgr.tool_definitions() {
-                if !tools.iter().any(|t| t.name == m_tool.name) {
-                    tools.push(m_tool);
+                if !tools.iter().any(|t| t.name == m_tool.name)
+                    && !extra_tools.iter().any(|t| t.name == m_tool.name)
+                {
+                    extra_tools.push(m_tool);
                 }
             }
         }
+        // Builtins already have fixed source order; sort extension + MCP tools by name so
+        // `tools_hash` and the KV-cache prefix never drift across map insertion orders.
+        extra_tools.sort_by(|a, b| a.name.cmp(&b.name));
+        tools.extend(extra_tools);
     }
 
     let cwd_for_hooks = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let hooks = HookRegistry::load_default(&cwd_for_hooks, true);
     let mut last_partial_text = String::new();
     let mut repeat_guard = RepeatCallGuard::default();
+    let active_logger: Option<UsageLogger> = config.usage_logger.clone().or_else(|| {
+        session.path().map(|p| {
+            let sid = p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("session")
+                .to_string();
+            UsageLogger::new(sid.clone(), default_usage_log_path(&sid))
+        })
+    });
+    let req_counter = config
+        .prompt_request_counter
+        .clone()
+        .unwrap_or_else(|| Arc::new(AtomicUsize::new(0)));
+    let uncached_counter = config
+        .prompt_uncached_counter
+        .clone()
+        .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
+    let system_text_for_hash = config.system_prompt.clone().unwrap_or_default();
+    let tools_text_for_hash = serde_json::to_string(&tools).unwrap_or_default();
+    let mut pending_anomalies: Vec<String> = Vec::new();
+    let mut next_is_verification_nudge = false;
+    let mut compaction_just_ran = false;
     let mut cumulative_usage = le_vibe_pybridge::Usage {
         input_tokens: 0,
         output_tokens: 0,
@@ -824,12 +953,16 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                 cancel,
                 "threshold",
                 last_context_tokens,
+                active_logger.as_ref(),
+                &req_counter,
+                turn + 1,
                 on_event,
             )
         {
             messages = rebuilt;
             last_context_tokens = 0;
             threshold_compactions += 1;
+            compaction_just_ran = true;
             sanitize_messages_for_provider(&config.provider, &mut messages);
         }
 
@@ -845,7 +978,95 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                 let _ = session.append("assistant", &note);
                 return Err(AgentError::Cancelled);
             }
-            match bridge.stream_complete(
+            let used_reqs = req_counter.load(Ordering::Relaxed);
+            let used_uncached = uncached_counter.load(Ordering::Relaxed);
+            let budget_msg = if config.max_prompt_requests > 0
+                && used_reqs >= config.max_prompt_requests
+            {
+                Some(format!(
+                    "Prompt request budget reached ({used_reqs}/{} outbound requests). Stopping cleanly.",
+                    config.max_prompt_requests
+                ))
+            } else if config.max_prompt_uncached_tokens > 0
+                && used_uncached >= config.max_prompt_uncached_tokens
+            {
+                Some(format!(
+                    "Prompt uncached token budget reached ({used_uncached}/{} tokens). Stopping cleanly.",
+                    config.max_prompt_uncached_tokens
+                ))
+            } else {
+                None
+            };
+            if let Some(msg) = budget_msg {
+                telemetry.finish_span(span);
+                on_event(AgentEvent::Status { text: msg.clone() });
+                if let Some(logger) = &active_logger {
+                    let mut anoms = std::mem::take(&mut pending_anomalies);
+                    anoms.push("BUDGET_STOP".to_string());
+                    let history_hashes: Vec<String> = messages
+                        .iter()
+                        .map(|m| fnv1a_hex(serde_json::to_string(m).unwrap_or_default().as_bytes()))
+                        .collect();
+                    logger.record_request(UsageEventInput {
+                        turn_idx: turn + 1,
+                        source: config
+                            .request_source
+                            .clone()
+                            .unwrap_or_else(|| "main".to_string()),
+                        provider: config.provider.clone(),
+                        model: config.model.clone(),
+                        http_status: 0,
+                        stop_reason: "budget_limit".to_string(),
+                        wall_ms: 0,
+                        system_text: system_text_for_hash.clone(),
+                        tools_text: tools_text_for_hash.clone(),
+                        history_entry_hashes: history_hashes,
+                        extra_anomalies: anoms,
+                        ..Default::default()
+                    });
+                }
+                let _ = session.append_with_usage(
+                    "assistant",
+                    &msg,
+                    entry_usage(&cumulative_usage),
+                );
+                on_event(AgentEvent::TurnEnd {
+                    stop_reason: "budget_limit".to_string(),
+                });
+                hooks.run_stop();
+                return Ok(AssistantMessage {
+                    provider: config.provider.clone(),
+                    model: config.model.clone(),
+                    content: msg,
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    stop_reason: "budget_limit".to_string(),
+                    usage: cumulative_usage,
+                });
+            }
+
+            req_counter.fetch_add(1, Ordering::Relaxed);
+            let req_started = std::time::Instant::now();
+            let req_source = if attempt > 0 {
+                "retry".to_string()
+            } else if next_is_verification_nudge {
+                next_is_verification_nudge = false;
+                "verification_nudge".to_string()
+            } else {
+                config
+                    .request_source
+                    .clone()
+                    .unwrap_or_else(|| "main".to_string())
+            };
+            let history_hashes: Vec<String> = if active_logger.is_some() {
+                messages
+                    .iter()
+                    .map(|m| fnv1a_hex(serde_json::to_string(m).unwrap_or_default().as_bytes()))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let stream_result = bridge.stream_complete(
                 CompletionRequest {
                     provider: config.provider.clone(),
                     model: config.model.clone(),
@@ -865,7 +1086,58 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                     }
                     _ => {}
                 },
-            ) {
+            );
+            let req_wall_ms = req_started.elapsed().as_millis() as u64;
+            match &stream_result {
+                Ok(r) => {
+                    uncached_counter.fetch_add(r.usage.input_tokens, Ordering::Relaxed);
+                    if let Some(logger) = &active_logger {
+                        logger.record_request(UsageEventInput {
+                            turn_idx: turn + 1,
+                            source: req_source,
+                            provider: config.provider.clone(),
+                            model: config.model.clone(),
+                            http_status: 200,
+                            stop_reason: r.stop_reason.clone(),
+                            wall_ms: req_wall_ms,
+                            in_uncached: r.usage.input_tokens,
+                            cache_read: r.usage.cache_read_tokens,
+                            cache_write: r.usage.cache_write_tokens,
+                            out: r.usage.output_tokens,
+                            cost_usd: r.usage.cost_usd,
+                            system_text: system_text_for_hash.clone(),
+                            tools_text: tools_text_for_hash.clone(),
+                            history_entry_hashes: history_hashes,
+                            compaction_occurred: compaction_just_ran,
+                            extra_anomalies: std::mem::take(&mut pending_anomalies),
+                            ..Default::default()
+                        });
+                        compaction_just_ran = false;
+                    }
+                }
+                Err(err) => {
+                    if let Some(logger) = &active_logger {
+                        let status = extract_http_status(&err.to_string()).unwrap_or(500);
+                        logger.record_request(UsageEventInput {
+                            turn_idx: turn + 1,
+                            source: req_source,
+                            provider: config.provider.clone(),
+                            model: config.model.clone(),
+                            http_status: status,
+                            stop_reason: "error".to_string(),
+                            wall_ms: req_wall_ms,
+                            system_text: system_text_for_hash.clone(),
+                            tools_text: tools_text_for_hash.clone(),
+                            history_entry_hashes: history_hashes,
+                            compaction_occurred: compaction_just_ran,
+                            extra_anomalies: std::mem::take(&mut pending_anomalies),
+                            ..Default::default()
+                        });
+                        compaction_just_ran = false;
+                    }
+                }
+            }
+            match stream_result {
                 // A successful reply can still be a context overflow: silent overflow (usage past
                 // the window) or a length stop with no output (the input filled the window). This
                 // must run *before* the empty-response guard, since that reply has no content.
@@ -893,11 +1165,15 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                         cancel,
                         "overflow",
                         last_context_tokens,
+                        active_logger.as_ref(),
+                        &req_counter,
+                        turn + 1,
                         on_event,
                     ) {
                         Some(rebuilt) => {
                             messages = rebuilt;
                             last_context_tokens = 0;
+                            compaction_just_ran = true;
                             continue;
                         }
                         None => {
@@ -991,12 +1267,16 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                         cancel,
                         "overflow",
                         last_context_tokens,
+                        active_logger.as_ref(),
+                        &req_counter,
+                        turn + 1,
                         on_event,
                     );
                     match recovered {
                         Some(rebuilt) => {
                             messages = rebuilt;
                             last_context_tokens = 0;
+                            compaction_just_ran = true;
                             continue;
                         }
                         None => {
@@ -1088,6 +1368,7 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                 on_event(AgentEvent::Status {
                     text: "Verification gate: edits are unverified, asking for evidence…".to_string(),
                 });
+                next_is_verification_nudge = true;
                 continue;
             }
             let mut final_reply = reply;
@@ -1173,7 +1454,12 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                         serde_json::json!({ "tool": tc.name, "arguments": tc.arguments }),
                     )
                     .unwrap_or(Value::Null);
-                let mut blocked = if hook_res.get("blocked").and_then(Value::as_bool) == Some(true)
+                let mut blocked = if repeat_guard.should_hard_block(&tc.name, &args_json_str) {
+                    if !pending_anomalies.iter().any(|a| a == "REPEAT_TOOL_CALL") {
+                        pending_anomalies.push("REPEAT_TOOL_CALL".to_string());
+                    }
+                    Some(REPEAT_CALL_BLOCK_ERROR.to_string())
+                } else if hook_res.get("blocked").and_then(Value::as_bool) == Some(true)
                 {
                     Some(
                         hook_res
@@ -1275,7 +1561,12 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                         compress_tool_output(&tc.name, &output, &mut local)
                     }
                 };
-                if let Some(note) = repeat_guard.notice(&tc.name, &args_json_str, &output) {
+                if output != REPEAT_CALL_BLOCK_ERROR
+                    && let Some(note) = repeat_guard.notice(&tc.name, &args_json_str, &output)
+                {
+                    if !pending_anomalies.iter().any(|a| a == "REPEAT_TOOL_CALL") {
+                        pending_anomalies.push("REPEAT_TOOL_CALL".to_string());
+                    }
                     capped_output.push('\n');
                     capped_output.push_str(note);
                 }
@@ -1319,7 +1610,12 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                     serde_json::json!({ "tool": tc.name, "arguments": tc.arguments }),
                 )
                 .unwrap_or(Value::Null);
-            let blocked_reason = if hook_res.get("blocked").and_then(Value::as_bool) == Some(true) {
+            let blocked_reason = if repeat_guard.should_hard_block(&tc.name, &args_json_str) {
+                if !pending_anomalies.iter().any(|a| a == "REPEAT_TOOL_CALL") {
+                    pending_anomalies.push("REPEAT_TOOL_CALL".to_string());
+                }
+                Some(REPEAT_CALL_BLOCK_ERROR.to_string())
+            } else if hook_res.get("blocked").and_then(Value::as_bool) == Some(true) {
                 Some(
                     hook_res
                         .get("reason")
@@ -1471,6 +1767,12 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                         context_window: config.context_window,
                         reserve_tokens: config.reserve_tokens,
                         verify_edits: config.verify_edits,
+                        max_prompt_requests: config.max_prompt_requests,
+                        max_prompt_uncached_tokens: config.max_prompt_uncached_tokens,
+                        usage_logger: active_logger.clone(),
+                        request_source: Some("subagent".to_string()),
+                        prompt_request_counter: Some(Arc::clone(&req_counter)),
+                        prompt_uncached_counter: Some(Arc::clone(&uncached_counter)),
                     };
                     let mut noop_ev = |_: AgentEvent| {};
                     let mut deny_all = |_: ApprovalRequest| ApprovalChoice::Deny;
@@ -1745,7 +2047,12 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                     compress_tool_output(route_tool, &output, &mut local)
                 }
             };
-            if let Some(note) = repeat_guard.notice(&tc.name, &tc.arguments.to_string(), &output) {
+            if output != REPEAT_CALL_BLOCK_ERROR
+                && let Some(note) = repeat_guard.notice(&tc.name, &tc.arguments.to_string(), &output)
+            {
+                if !pending_anomalies.iter().any(|a| a == "REPEAT_TOOL_CALL") {
+                    pending_anomalies.push("REPEAT_TOOL_CALL".to_string());
+                }
                 capped_output.push('\n');
                 capped_output.push_str(note);
             }
@@ -2656,5 +2963,234 @@ mod repeat_call_guard_tests {
                 "earlier messages mutated between turns (KV cache busted)"
             );
         }
+    }
+
+    #[test]
+    fn repeat_call_guard_hard_blocks_on_third_identical_call() {
+        use super::REPEAT_CALL_BLOCK_ERROR;
+        use crate::{AgentConfig, run_turn_loop};
+        use le_vibe_durable::SessionStore;
+        use le_vibe_pybridge::{
+            AssistantMessage, BridgeError, CompletionRequest, ExtensionPort, ModelSpec,
+            PolicyDecision, PolicyPort, ProviderPort, ToolCall, Usage,
+        };
+        use le_vibe_telemetry::TelemetryRecorder;
+        use serde_json::{Value, json};
+
+        struct LoopBridge {
+            step: usize,
+            exec_count: usize,
+            last_tool_msg: String,
+        }
+        impl ProviderPort for LoopBridge {
+            fn list_providers(&mut self) -> Result<Vec<String>, BridgeError> {
+                Ok(vec!["deepseek".into()])
+            }
+            fn list_models(&mut self, _p: Option<&str>) -> Result<Vec<ModelSpec>, BridgeError> {
+                Ok(vec![])
+            }
+            fn complete(&mut self, req: CompletionRequest) -> Result<AssistantMessage, BridgeError> {
+                if let Some(m) = req.messages.last()
+                    && m.role == "tool"
+                {
+                    self.last_tool_msg = m.content.clone();
+                }
+                self.step += 1;
+                let tool_calls = if self.step <= 3 {
+                    vec![ToolCall {
+                        id: format!("tc_{}", self.step),
+                        name: "ext_ping".into(),
+                        arguments: json!({"k": "same"}),
+                        thought_signature: None,
+                    }]
+                } else {
+                    vec![]
+                };
+                Ok(AssistantMessage {
+                    provider: "deepseek".into(),
+                    model: "deepseek-v4-pro".into(),
+                    content: if tool_calls.is_empty() { "stopped".into() } else { String::new() },
+                    reasoning_content: None,
+                    tool_calls,
+                    stop_reason: if self.step <= 3 { "tool_calls" } else { "stop" }.into(),
+                    usage: Usage {
+                        input_tokens: 50,
+                        output_tokens: 10,
+                        cache_read_tokens: 0,
+                        cache_write_tokens: 0,
+                        cost_usd: 0.0,
+                    },
+                })
+            }
+        }
+        impl PolicyPort for LoopBridge {
+            fn evaluate_tool_call(
+                &mut self,
+                _t: &str,
+                _c: Option<&str>,
+                _p: Option<&str>,
+            ) -> Result<PolicyDecision, BridgeError> {
+                Ok(PolicyDecision {
+                    action: "allow".into(),
+                    reason: "ok".into(),
+                })
+            }
+        }
+        impl ExtensionPort for LoopBridge {
+            fn list_extension_tools(
+                &mut self,
+            ) -> Result<Vec<le_vibe_pybridge::ToolDefinition>, BridgeError> {
+                Ok(vec![le_vibe_pybridge::ToolDefinition {
+                    name: "ext_ping".into(),
+                    description: "ping".into(),
+                    parameters: json!({"type": "object"}),
+                }])
+            }
+            fn execute_extension_tool(
+                &mut self,
+                _name: &str,
+                _args: Value,
+            ) -> Result<Value, BridgeError> {
+                self.exec_count += 1;
+                Ok(Value::String("identical".into()))
+            }
+            fn invoke_hook(&mut self, _e: &str, _p: Value) -> Result<Value, BridgeError> {
+                Ok(json!({}))
+            }
+        }
+
+        let mut bridge = LoopBridge {
+            step: 0,
+            exec_count: 0,
+            last_tool_msg: String::new(),
+        };
+        let mut session = SessionStore::in_memory();
+        let telemetry = TelemetryRecorder::new();
+        let cfg = AgentConfig {
+            verify_edits: false,
+            ..AgentConfig::default()
+        };
+        run_turn_loop(&mut bridge, &mut session, &telemetry, &cfg, "loop").unwrap();
+        assert_eq!(bridge.exec_count, 2, "3rd identical call must be hard-blocked before execution");
+        assert_eq!(bridge.last_tool_msg, REPEAT_CALL_BLOCK_ERROR);
+    }
+
+    #[test]
+    fn hard_prompt_budgets_halt_runaway_loop_and_log_forensic_records() {
+        use crate::{AgentConfig, run_turn_loop};
+        use le_vibe_durable::SessionStore;
+        use le_vibe_pybridge::{
+            AssistantMessage, BridgeError, CompletionRequest, ExtensionPort, ModelSpec,
+            PolicyDecision, PolicyPort, ProviderPort, ToolCall, Usage,
+        };
+        use le_vibe_telemetry::TelemetryRecorder;
+        use le_vibe_telemetry::usage::{UsageLogger, read_usage_log};
+        use serde_json::{Value, json};
+
+        struct RetryThenLoopBridge {
+            calls: usize,
+        }
+        impl ProviderPort for RetryThenLoopBridge {
+            fn list_providers(&mut self) -> Result<Vec<String>, BridgeError> {
+                Ok(vec!["deepseek".into()])
+            }
+            fn list_models(&mut self, _p: Option<&str>) -> Result<Vec<ModelSpec>, BridgeError> {
+                Ok(vec![])
+            }
+            fn complete(&mut self, _req: CompletionRequest) -> Result<AssistantMessage, BridgeError> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    return Err(BridgeError::Remote {
+                        kind: "ProviderHTTPStatusError".into(),
+                        message: "HTTP 503 service unavailable".into(),
+                    });
+                }
+                Ok(AssistantMessage {
+                    provider: "deepseek".into(),
+                    model: "deepseek-v4-pro".into(),
+                    content: String::new(),
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCall {
+                        id: format!("tc_{}", self.calls),
+                        name: "ext_noop".into(),
+                        arguments: json!({"n": self.calls}),
+                        thought_signature: None,
+                    }],
+                    stop_reason: "tool_calls".into(),
+                    usage: Usage {
+                        input_tokens: 500,
+                        output_tokens: 10,
+                        cache_read_tokens: 0,
+                        cache_write_tokens: 0,
+                        cost_usd: 0.001,
+                    },
+                })
+            }
+        }
+        impl PolicyPort for RetryThenLoopBridge {
+            fn evaluate_tool_call(
+                &mut self,
+                _t: &str,
+                _c: Option<&str>,
+                _p: Option<&str>,
+            ) -> Result<PolicyDecision, BridgeError> {
+                Ok(PolicyDecision {
+                    action: "allow".into(),
+                    reason: "ok".into(),
+                })
+            }
+        }
+        impl ExtensionPort for RetryThenLoopBridge {
+            fn list_extension_tools(
+                &mut self,
+            ) -> Result<Vec<le_vibe_pybridge::ToolDefinition>, BridgeError> {
+                Ok(vec![le_vibe_pybridge::ToolDefinition {
+                    name: "ext_noop".into(),
+                    description: "noop".into(),
+                    parameters: json!({"type": "object"}),
+                }])
+            }
+            fn execute_extension_tool(
+                &mut self,
+                _name: &str,
+                args: Value,
+            ) -> Result<Value, BridgeError> {
+                Ok(Value::String(format!("ok {}", args["n"])))
+            }
+            fn invoke_hook(&mut self, _e: &str, _p: Value) -> Result<Value, BridgeError> {
+                Ok(json!({}))
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("le_vibe_budget_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("usage-budget.jsonl");
+        let logger = UsageLogger::with_debug_cache("budget", log_path.clone(), false);
+
+        let mut bridge = RetryThenLoopBridge { calls: 0 };
+        let mut session = SessionStore::in_memory();
+        let telemetry = TelemetryRecorder::new();
+        let cfg = AgentConfig {
+            verify_edits: false,
+            base_delay_ms: 1,
+            max_delay_ms: 2,
+            max_prompt_requests: 2, // 1 failed 503 + 1 retry -> 3rd attempt halted by budget
+            usage_logger: Some(logger),
+            ..AgentConfig::default()
+        };
+        let reply = run_turn_loop(&mut bridge, &mut session, &telemetry, &cfg, "go").unwrap();
+        assert_eq!(reply.stop_reason, "budget_limit");
+        assert_eq!(bridge.calls, 2);
+
+        let recs = read_usage_log(&log_path).unwrap();
+        assert_eq!(recs.len(), 3);
+        assert_eq!(recs[0].http_status, 503);
+        assert_eq!(recs[1].source, "retry");
+        assert!(recs[1].anomalies.contains(&"RETRY_BURN".to_string()));
+        assert_eq!(recs[2].stop_reason, "budget_limit");
+        assert!(recs[2].anomalies.contains(&"BUDGET_STOP".to_string()));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

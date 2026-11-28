@@ -551,6 +551,106 @@ pub(crate) fn open_session_with_opts(opts: &crate::cli::CliOptions) -> SessionSt
 }
 
 
+pub(crate) fn models_cache_file() -> PathBuf {
+    settings_file()
+        .parent()
+        .map(|p| p.join("models-cache.json"))
+        .unwrap_or_else(|| PathBuf::from(".le-vibe").join("models-cache.json"))
+}
+
+pub(crate) fn resolve_initial_model_offline(
+    provider_flag: Option<&str>,
+    model_flag: Option<&str>,
+    layered: &BTreeMap<String, String>,
+) -> (String, String) {
+    resolve_initial_model_offline_from_cache(
+        provider_flag,
+        model_flag,
+        layered,
+        &models_cache_file(),
+    )
+}
+
+pub(crate) fn resolve_initial_model_offline_from_cache(
+    provider_flag: Option<&str>,
+    model_flag: Option<&str>,
+    layered: &BTreeMap<String, String>,
+    cache_path: &Path,
+) -> (String, String) {
+    let strip_thinking = |raw: &str| -> String {
+        if let Some((base, suffix)) = raw.rsplit_once(':')
+            && matches!(
+                suffix,
+                "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+            )
+        {
+            return base.to_string();
+        }
+        raw.to_string()
+    };
+
+    if let Some(m) = model_flag.map(str::trim).filter(|s| !s.is_empty()) {
+        let clean = strip_thinking(m);
+        if let Some((p, id)) = clean.split_once('/') {
+            return (p.trim().to_string(), id.trim().to_string());
+        }
+        let prov = provider_flag
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| layered.get("provider").map(String::as_str))
+            .unwrap_or("vibe")
+            .to_string();
+        return (prov, clean);
+    }
+
+    let provider = provider_flag
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| layered.get("provider").map(String::as_str))
+        .unwrap_or("vibe")
+        .to_string();
+
+    if let Some(saved_m) = layered.get("model").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let clean = strip_thinking(saved_m);
+        if let Some((p, id)) = clean.split_once('/') {
+            if p.eq_ignore_ascii_case(&provider) || provider_flag.is_none() {
+                return (p.trim().to_string(), id.trim().to_string());
+            }
+        } else {
+            return (provider, clean);
+        }
+    }
+
+    if let Ok(raw) = fs::read_to_string(cache_path)
+        && let Ok(val) = serde_json::from_str::<Value>(&raw)
+        && let Some(arr) = val
+            .get("models")
+            .and_then(|m| m.get(&provider))
+            .and_then(Value::as_array)
+    {
+        if let Some(rec) = arr
+            .iter()
+            .find(|item| item.get("recommended").and_then(Value::as_bool) == Some(true))
+            .and_then(|item| item.get("id").and_then(Value::as_str))
+        {
+            return (provider, rec.to_string());
+        }
+        if let Some(first) = arr
+            .first()
+            .and_then(|item| item.get("id").and_then(Value::as_str))
+        {
+            return (provider, first.to_string());
+        }
+    }
+
+    let fallback = match provider.as_str() {
+        "deepseek" => "deepseek-flash",
+        "agy" => "gemini-4-neon",
+        _ => "deepseek-v4-1-flash-1017",
+    };
+    (provider, fallback.to_string())
+}
+
 pub(crate) fn discover_modes() -> Vec<le_vibe_tui::ModeSpec> {
     let mut dirs = Vec::new();
     let user_modes = settings_file()
@@ -670,5 +770,39 @@ mod pinned_tools_tests {
         assert!(personas.iter().any(|p| p.id == "reviewer"));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_initial_model_offline_reads_models_cache_without_python() {
+        let dir = std::env::temp_dir().join(format!("le_vibe_cache_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = dir.join("models-cache.json");
+        std::fs::write(
+            &cache,
+            r#"{"models":{"vibe":[{"id":"deepseek-v4-1-flash-1017","recommended":true},{"id":"mistral-large-4-0"}]}}"#,
+        )
+        .unwrap();
+
+        let (prov, model) = super::resolve_initial_model_offline_from_cache(
+            Some("vibe"),
+            None,
+            &std::collections::BTreeMap::new(),
+            &cache,
+        );
+        assert_eq!(prov, "vibe");
+        assert_eq!(model, "deepseek-v4-1-flash-1017");
+
+        // Explicit --model flag wins over cache.
+        let (prov2, model2) = super::resolve_initial_model_offline_from_cache(
+            None,
+            Some("agy/gemini-4-neon"),
+            &std::collections::BTreeMap::new(),
+            &cache,
+        );
+        assert_eq!(prov2, "agy");
+        assert_eq!(model2, "gemini-4-neon");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

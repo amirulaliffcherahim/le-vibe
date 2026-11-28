@@ -111,6 +111,12 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandSpec] = &[
         picker_on_bare: false,
     },
     SlashCommandSpec {
+        name: "/ext",
+        hint: "load <name>",
+        description: "Activate a lazy extension on demand (e.g. /ext load web)",
+        picker_on_bare: false,
+    },
+    SlashCommandSpec {
         name: "/auth",
         hint: "",
         description: "View provider authentication status & sign in",

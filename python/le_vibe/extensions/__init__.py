@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 import importlib.util
 from pathlib import Path
+import re
 import sys
 from typing import Any
 
@@ -131,7 +132,78 @@ class ExtensionHost:
         return result
 
 
-def load_extensions_from_dirs(host: ExtensionHost, dirs: Sequence[Path]) -> list[str]:
+def _detect_lifecycle_and_desc(py_file: Path) -> tuple[str, str]:
+    """Inspect a Python extension file without importing it to read LIFECYCLE / DESCRIPTION."""
+    try:
+        head = py_file.read_text(encoding="utf-8", errors="replace")[:4096]
+    except OSError:
+        return "lazy", ""
+    lifecycle = ""
+    if m := re.search(r"""^\s*LIFECYCLE\s*=\s*["'](lazy|eager)["']""", head, re.MULTILINE):
+        lifecycle = m.group(1).lower()
+    if not lifecycle:
+        # Tool-providing extensions default to lazy; pure hook/policy extensions stay eager.
+        lifecycle = "lazy" if "register_tool" in head else "eager"
+    desc = ""
+    if m := re.search(r"""^\s*DESCRIPTION\s*=\s*["']([^"'\n]*)["']""", head, re.MULTILINE):
+        desc = m.group(1).strip()
+    return lifecycle, desc
+
+
+@dataclass(frozen=True, slots=True)
+class ExtensionManifest:
+    name: str
+    path: Path
+    lifecycle: str
+    description: str = ""
+
+
+def _builtin_extension_dir() -> Path:
+    return Path(__file__).resolve().parent / "builtin"
+
+
+def discover_extension_manifests(dirs: Sequence[Path]) -> list[ExtensionManifest]:
+    manifests: list[ExtensionManifest] = []
+    seen: set[str] = set()
+    search_dirs = [*dirs, _builtin_extension_dir()]
+    for directory in search_dirs:
+        if not directory.exists() or not directory.is_dir():
+            continue
+        for py_file in sorted(directory.glob("*.py")):
+            if py_file.name.startswith("_"):
+                continue
+            name = py_file.stem
+            if name in seen:
+                continue
+            seen.add(name)
+            lifecycle, desc = _detect_lifecycle_and_desc(py_file)
+            manifests.append(
+                ExtensionManifest(name=name, path=py_file, lifecycle=lifecycle, description=desc)
+            )
+    return manifests
+
+
+def load_extension_file(host: ExtensionHost, py_file: Path) -> str | None:
+    mod_name = f"le_vibe_ext_{py_file.stem}_{abs(hash(str(py_file.resolve())))}"
+    try:
+        spec = importlib.util.spec_from_file_location(mod_name, py_file)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[mod_name] = module
+        spec.loader.exec_module(module)
+        register_fn = getattr(module, "register", None)
+        if callable(register_fn):
+            register_fn(host)
+            return str(py_file)
+    except Exception as exc:
+        host.load_errors.append(f"{py_file}: {exc}")
+    return None
+
+
+def load_extensions_from_dirs(
+    host: ExtensionHost, dirs: Sequence[Path], *, eager_only: bool = False
+) -> list[str]:
     loaded: list[str] = []
     for directory in dirs:
         if not directory.exists() or not directory.is_dir():
@@ -139,30 +211,25 @@ def load_extensions_from_dirs(host: ExtensionHost, dirs: Sequence[Path]) -> list
         for py_file in sorted(directory.glob("*.py")):
             if py_file.name.startswith("_"):
                 continue
-            mod_name = f"le_vibe_ext_{py_file.stem}_{abs(hash(str(py_file.resolve())))}"
-            try:
-                spec = importlib.util.spec_from_file_location(mod_name, py_file)
-                if spec is None or spec.loader is None:
+            if eager_only:
+                lifecycle, _ = _detect_lifecycle_and_desc(py_file)
+                if lifecycle != "eager":
                     continue
-                module = importlib.util.module_from_spec(spec)
-                sys.modules[mod_name] = module
-                spec.loader.exec_module(module)
-                register_fn = getattr(module, "register", None)
-                if callable(register_fn):
-                    register_fn(host)
-                    loaded.append(str(py_file))
-            except Exception as exc:
-                host.load_errors.append(f"{py_file}: {exc}")
+            if path_str := load_extension_file(host, py_file):
+                loaded.append(path_str)
     return loaded
 
 
 __all__ = [
     "ExtensionHost",
+    "ExtensionManifest",
     "HookCallback",
     "PythonToolSpec",
     "SkillSpec",
     "ToolHandler",
+    "discover_extension_manifests",
     "discover_skills",
+    "load_extension_file",
     "load_extensions_from_dirs",
     "parse_skill_file",
 ]

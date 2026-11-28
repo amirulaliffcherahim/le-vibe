@@ -402,6 +402,7 @@ pub(crate) enum WorkerCmd {
     PolicyStatus,
     PluginsStatus,
     ReloadPlugins,
+    LoadExtension(String),
     ReloadProjectResources,
     RunPluginCommand {
         name: String,
@@ -696,7 +697,9 @@ fn session_usage_logger(session: &SessionStore) -> Option<le_vibe_telemetry::usa
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_tui_worker(
-    mut bridge: PythonBridge,
+    python_exe: String,
+    python_dir: std::path::PathBuf,
+    initial_yolo: bool,
     mut session: SessionStore,
     telemetry: TelemetryRecorder,
     cancel: Arc<AtomicBool>,
@@ -716,7 +719,15 @@ pub(crate) fn spawn_tui_worker(
     let (question_tx, question_rx) = mpsc::channel::<String>();
 
     std::thread::spawn(move || {
+        let ws_files = scan_workspace_files(std::path::Path::new("."), 1500);
+        let _ = msg_tx.send(WorkerMsg::WorkspaceFilesLoaded(ws_files));
+
+        let mut bridge = PythonBridge::spawn(&python_exe, &python_dir)
+            .expect("failed to start le-vibe Python bridge");
         bridge.set_cancel_token(Arc::clone(&cancel));
+        if initial_yolo {
+            let _ = bridge.set_yolo(true);
+        }
         let mut todos = TodoStore::new();
         let output_store = Arc::new(Mutex::new(OutputStore::new()));
         let mut codemode_setting = "off".to_string();
@@ -739,8 +750,6 @@ pub(crate) fn spawn_tui_worker(
             Some(mcp_started.elapsed().as_millis() as u64),
             format!("servers={}", mcp.status_summary().len()),
         );
-        let ws_files = scan_workspace_files(std::path::Path::new("."), 1500);
-        let _ = msg_tx.send(WorkerMsg::WorkspaceFilesLoaded(ws_files));
         if let Ok(cmds) = bridge.list_extension_commands() {
             let _ = msg_tx.send(WorkerMsg::PluginCommandsLoaded(cmds));
         }
@@ -1623,6 +1632,31 @@ pub(crate) fn spawn_tui_worker(
                     }
                     let _ = msg_tx.send(WorkerMsg::Idle);
                 }
+                WorkerCmd::LoadExtension(name) => {
+                    match bridge.load_extension(&name) {
+                        Ok(res) => {
+                            let tools = res
+                                .get("tools")
+                                .and_then(Value::as_array)
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(Value::as_str)
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                })
+                                .unwrap_or_default();
+                            let _ = msg_tx.send(WorkerMsg::Notice(format!(
+                                "Loaded extension `{name}` (tools: {tools})."
+                            )));
+                        }
+                        Err(err) => {
+                            let _ = msg_tx.send(WorkerMsg::Notice(format!(
+                                "Failed to load extension `{name}`: {err}"
+                            )));
+                        }
+                    }
+                    let _ = msg_tx.send(WorkerMsg::Idle);
+                }
                 WorkerCmd::ReloadProjectResources => {
                     loaded_modes = crate::settings::discover_modes();
                     let mcp_paths = default_mcp_paths();
@@ -1840,6 +1874,10 @@ pub(crate) fn spawn_tui_worker(
                         .unwrap_or_else(|| thinking_level.clone());
                     let eff_max_turns = mode_spec.max_turns.unwrap_or(max_turns);
                     let eff_verify = mode_spec.verify_edits.unwrap_or(verify_edits);
+
+                    for ext_name in &mode_spec.extensions {
+                        let _ = bridge.load_extension(ext_name);
+                    }
 
                     if session.active_branch().is_empty() {
                         let _ = session.append_model_change(format!(

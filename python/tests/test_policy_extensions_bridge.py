@@ -141,3 +141,54 @@ async def test_policy_yolo_and_session_grants() -> None:
         {"id": 15, "method": "policy.evaluate", "params": {"tool_name": "bash", "command": "rm -rf /"}}
     )
     assert blocked["result"]["action"] == "deny"
+
+
+@pytest.mark.asyncio
+async def test_lazy_extensions_skip_startup_and_load_on_demand(tmp_path: Path) -> None:
+    ext_dir = tmp_path / "extensions"
+    ext_dir.mkdir()
+    marker = tmp_path / "lazy_loaded.txt"
+    (ext_dir / "lazy_ext.py").write_text(
+        f"""
+from pathlib import Path
+LIFECYCLE = "lazy"
+DESCRIPTION = "Lazy test tool"
+Path({str(marker)!r}).write_text("imported", encoding="utf-8")
+
+def register(host):
+    from le_vibe.extensions import PythonToolSpec
+    host.register_tool(
+        PythonToolSpec(
+            name="lazy_ping",
+            description="Ping",
+            parameters={{"type": "object"}},
+            handler=lambda _a: "pong",
+        )
+    )
+""",
+        encoding="utf-8",
+    )
+
+    bridge = BridgeRuntime(extension_dirs=[ext_dir])
+    listed = await bridge.handle_request({"id": 20, "method": "extensions.list_tools"})
+    assert listed["result"] == []
+    assert not marker.exists(), "lazy extension must not be imported at startup"
+
+    loaded = await bridge.handle_request(
+        {"id": 21, "method": "extensions.load", "params": {"name": "lazy_ext"}}
+    )
+    assert loaded["result"]["loaded"] == "lazy_ext"
+    assert marker.exists()
+
+    listed_after = await bridge.handle_request({"id": 22, "method": "extensions.list_tools"})
+    assert [t["name"] for t in listed_after["result"]] == ["lazy_ping"]
+
+    # Bundled first-party lazy extensions (`web`, `planning`) are discoverable & loadable on demand.
+    web_loaded = await bridge.handle_request(
+        {"id": 23, "method": "extensions.load", "params": {"name": "web"}}
+    )
+    assert web_loaded["result"]["loaded"] == "web"
+    listed_web = await bridge.handle_request({"id": 24, "method": "extensions.list_tools"})
+    names_web = [t["name"] for t in listed_web["result"]]
+    assert names_web == ["lazy_ping", "web_search", "fetch_content"]
+

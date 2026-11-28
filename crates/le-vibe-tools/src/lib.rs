@@ -38,6 +38,26 @@ pub enum ToolError {
     UnknownTool(String),
 }
 
+pub fn core_tool_definitions(active_shell: &str) -> Vec<ToolDefinition> {
+    let shell_tool = if matches!(
+        active_shell.trim().to_ascii_lowercase().as_str(),
+        "powershell" | "pwsh" | "cmd"
+    ) {
+        "powershell"
+    } else {
+        "bash"
+    };
+    builtin_tool_definitions()
+        .into_iter()
+        .filter(|t| {
+            matches!(
+                t.name.as_str(),
+                "read" | "write" | "edit" | "grep" | "find" | "ls" | "retrieve_output" | "load_skill" | "codemode"
+            ) || t.name == shell_tool
+        })
+        .collect()
+}
+
 pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
@@ -1558,5 +1578,50 @@ mod tests {
         assert!(fail_msg.contains("Command exited with code 3"), "{fail_msg}");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn core_tool_definitions_for_shell_is_minimal_and_under_budget() {
+        let defs = super::core_tool_definitions("powershell");
+        let names: Vec<&str> = defs.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "read",
+                "write",
+                "edit",
+                "grep",
+                "find",
+                "ls",
+                "powershell",
+                "retrieve_output",
+                "load_skill",
+                "codemode",
+            ]
+        );
+        for excluded in [
+            "bash",
+            "web_search",
+            "fetch_content",
+            "todo",
+            "ask_user_question",
+            "memory_search",
+            "memory_write",
+            "memory_read",
+            "memory_delete",
+            "spawn_agent",
+        ] {
+            assert!(!names.contains(&excluded), "core must exclude {excluded}");
+        }
+        let json_bytes = serde_json::to_string(&defs).unwrap().len();
+        assert!(
+            json_bytes < 3_500,
+            "core schema is {json_bytes} bytes, expected well below old 6,238 B"
+        );
+
+        let unix_defs = super::core_tool_definitions("bash");
+        let unix_names: Vec<&str> = unix_defs.iter().map(|t| t.name.as_str()).collect();
+        assert!(unix_names.contains(&"bash"));
+        assert!(!unix_names.contains(&"powershell"));
     }
 }

@@ -9,6 +9,7 @@ description = "Unified Python provider (Vibe + DeepSeek + Antigravity), policy, 
 authors = [{ name = "Amirul Aliff" }]
 requires-python = ">=3.12"
 dependencies = [
+    "cryptography>=44.0.0",
     "httpx>=0.28.0",
     "keyring>=25.5.0",
     "pydantic>=2.10.0",

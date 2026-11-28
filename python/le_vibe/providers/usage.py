@@ -7,12 +7,14 @@ from typing import Any
 import httpx
 
 from le_vibe.providers.auth import (
-    AGY_ENDPOINTS,
-    AGY_USER_AGENT,
+    VIBE_USER_AGENT,
     MissingAPIKeyError,
+    _agy_endpoint_candidates,
+    _agy_headers,
     get_agy_project_id,
     resolve_api_key,
 )
+from le_vibe.providers.transport import request_with_oauth_retry
 
 DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance"
 MISTRAL_API_BASE = "https://api.mistral.ai/v1"
@@ -34,31 +36,44 @@ def _agy_family(model_id: str) -> str:
 async def _agy_usage(client: httpx.AsyncClient) -> dict[str, Any]:
     try:
         cred = resolve_api_key("agy")
-    except MissingAPIKeyError:
+    except (MissingAPIKeyError, RuntimeError):
         return {"authenticated": False, "error": "not logged in"}
 
-    headers = {
-        "Authorization": f"Bearer {cred.token}",
-        "Content-Type": "application/json",
-        "User-Agent": AGY_USER_AGENT,
-    }
     project_id = cred.project_id or get_agy_project_id()
-    for endpoint in AGY_ENDPOINTS:
+    headers = _agy_headers(cred.token, project_id=project_id)
+
+    async def _refresh_agy() -> dict[str, str] | None:
         try:
-            tier_resp = await client.post(
+            refreshed = resolve_api_key("agy", force_refresh=True)
+        except (MissingAPIKeyError, RuntimeError):
+            return None
+        return _agy_headers(refreshed.token, project_id=refreshed.project_id or project_id)
+
+    for endpoint in _agy_endpoint_candidates():
+        try:
+            tier_resp = await request_with_oauth_retry(
+                client,
+                "POST",
                 f"{endpoint}/v1internal:loadCodeAssist",
                 headers=headers,
-                json={"metadata": {"ideType": "ANTIGRAVITY"}},
+                json_body={"metadata": {"ideType": "ANTIGRAVITY"}},
+                on_unauthorized=_refresh_agy,
             )
-            summary_resp = await client.post(
+            summary_resp = await request_with_oauth_retry(
+                client,
+                "POST",
                 f"{endpoint}/v1internal:retrieveUserQuotaSummary",
                 headers=headers,
-                json={},
+                json_body={"project": project_id} if project_id else {},
+                on_unauthorized=_refresh_agy,
             )
-            models_resp = await client.post(
+            models_resp = await request_with_oauth_retry(
+                client,
+                "POST",
                 f"{endpoint}/v1internal:fetchAvailableModels",
                 headers=headers,
-                json={"project": project_id},
+                json_body={"project": project_id},
+                on_unauthorized=_refresh_agy,
             )
         except Exception:
             continue
@@ -178,17 +193,35 @@ async def _agy_usage(client: httpx.AsyncClient) -> dict[str, Any]:
 async def _vibe_usage(client: httpx.AsyncClient) -> dict[str, Any]:
     try:
         cred = resolve_api_key("vibe")
-    except MissingAPIKeyError:
+    except (MissingAPIKeyError, RuntimeError):
         return {"authenticated": False, "error": "not logged in"}
 
     headers = {
         "Authorization": f"Bearer {cred.token}",
-        "User-Agent": "le-vibe/0.1.0",
+        "User-Agent": VIBE_USER_AGENT,
         **cred.extra_headers,
     }
+
+    async def _refresh_vibe() -> dict[str, str] | None:
+        try:
+            refreshed = resolve_api_key("vibe", force_refresh=True)
+        except (MissingAPIKeyError, RuntimeError):
+            return None
+        return {
+            "Authorization": f"Bearer {refreshed.token}",
+            "User-Agent": VIBE_USER_AGENT,
+            **refreshed.extra_headers,
+        }
+
     out: dict[str, Any] = {"authenticated": True}
     try:
-        sub = await client.get(f"{MISTRAL_API_BASE}/billing/subscription", headers=headers)
+        sub = await request_with_oauth_retry(
+            client,
+            "GET",
+            f"{MISTRAL_API_BASE}/billing/subscription",
+            headers=headers,
+            on_unauthorized=_refresh_vibe,
+        )
         if sub.is_success:
             data = sub.json()
             out["plan"] = _safe_str(data.get("plan_name")) or None
@@ -199,7 +232,13 @@ async def _vibe_usage(client: httpx.AsyncClient) -> dict[str, Any]:
         pass
 
     try:
-        budget = await client.get(f"{MISTRAL_API_BASE}/billing/budget", headers=headers)
+        budget = await request_with_oauth_retry(
+            client,
+            "GET",
+            f"{MISTRAL_API_BASE}/billing/budget",
+            headers=headers,
+            on_unauthorized=_refresh_vibe,
+        )
         if budget.is_success:
             b_json = budget.json() or {}
             vibe_budget = b_json.get("vibe_budget")

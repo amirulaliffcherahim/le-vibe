@@ -86,8 +86,10 @@ def test_auth_resolution() -> None:
     assert cred.token == "sk-ds-123"
     assert cred.source == "env"
 
-    assert has_auth("vibe", env={"MISTRAL_API_KEY": "sk-vibe-456"}, auth_file=Path("/nonexistent/auth.json")) is True
+    # vibe and agy are OAuth-only: API key env vars are ignored.
+    assert has_auth("vibe", env={"MISTRAL_API_KEY": "sk-vibe-456"}, auth_file=Path("/nonexistent/auth.json")) is False
     assert has_auth("vibe", env={}, auth_file=Path("/nonexistent/auth.json")) is False
+    assert has_auth("agy", env={"AGY_API_KEY": "sk-agy-789"}, auth_file=Path("/nonexistent/auth.json")) is False
 
     with pytest.raises(MissingAPIKeyError):
         resolve_api_key("deepseek", env={}, auth_file=Path("/nonexistent/auth.json"))
@@ -97,13 +99,19 @@ def test_saved_auth_file_persistence(tmp_path) -> None:
     from le_vibe.providers import auth_status, delete_credential, save_api_key
 
     auth_file = tmp_path / "auth.json"
-    save_api_key("vibe", "sk-vibe-saved", auth_file=auth_file)
-    cred = resolve_api_key("vibe", env={}, auth_file=auth_file)
-    assert cred.token == "sk-vibe-saved"
+    save_api_key("deepseek", "sk-ds-saved", auth_file=auth_file)
+    cred = resolve_api_key("deepseek", env={}, auth_file=auth_file)
+    assert cred.token == "sk-ds-saved"
     assert cred.source == "saved"
-    assert auth_status(env={}, auth_file=auth_file)["vibe"]["authenticated"] is True
-    assert delete_credential("vibe", auth_file=auth_file) is True
-    assert has_auth("vibe", env={}, auth_file=auth_file) is False
+    assert auth_status(env={}, auth_file=auth_file)["deepseek"]["authenticated"] is True
+    assert delete_credential("deepseek", auth_file=auth_file) is True
+    assert has_auth("deepseek", env={}, auth_file=auth_file) is False
+
+    # vibe and agy reject manual API keys.
+    with pytest.raises(ValueError, match="use OAuth"):
+        save_api_key("vibe", "sk-vibe-saved", auth_file=auth_file)
+    with pytest.raises(ValueError, match="use OAuth"):
+        save_api_key("agy", "sk-agy-saved", auth_file=auth_file)
 
 
 def test_oidc_token_persistence(tmp_path) -> None:
@@ -187,7 +195,21 @@ async def test_deepseek_stream_and_complete_with_mock_sse() -> None:
 
 
 @pytest.mark.asyncio
-async def test_vibe_stream_with_mock_sse() -> None:
+async def test_vibe_stream_with_mock_sse(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import time
+    from le_vibe.providers import save_oidc_tokens
+
+    auth_file = tmp_path / "auth.json"
+    monkeypatch.setenv("LE_VIBE_AUTH_FILE", str(auth_file))
+    save_oidc_tokens(
+        "vibe",
+        access_token="vibe-access",
+        id_token="vibe-id-token",
+        expires_at=time.time() + 3600,
+        organization_id="org-1",
+        workspace_id="ws-1",
+        auth_file=auth_file,
+    )
     sse_lines = "\n".join(
         [
             'data: {"choices":[{"delta":{"content":[{"type":"thinking","thinking":[{"text":"Plan "}]},{"type":"text","text":"Done"}]}}]}',
@@ -202,7 +224,7 @@ async def test_vibe_stream_with_mock_sse() -> None:
         msg = await provider.complete(
             model,
             TranscriptContext(messages=[Message(role="user", content="hi")]),
-            StreamOptions(api_key="test-key"),
+            StreamOptions(),
         )
 
     assert msg.provider == "vibe"
@@ -212,7 +234,19 @@ async def test_vibe_stream_with_mock_sse() -> None:
 
 
 @pytest.mark.asyncio
-async def test_agy_stream_with_mock_sse() -> None:
+async def test_agy_stream_with_mock_sse(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import time
+    from le_vibe.providers import save_oidc_tokens
+
+    auth_file = tmp_path / "auth.json"
+    monkeypatch.setenv("LE_VIBE_AUTH_FILE", str(auth_file))
+    save_oidc_tokens(
+        "agy",
+        access_token="ya29.test-token",
+        expires_at=time.time() + 3600,
+        project_id="proj-1",
+        auth_file=auth_file,
+    )
     sse_lines = "\n".join(
         [
             'data: {"response":{"candidates":[{"content":{"parts":[{"thought":true,"text":"Think "},{"text":"Answer"}]}}]}}',
@@ -227,7 +261,7 @@ async def test_agy_stream_with_mock_sse() -> None:
         msg = await provider.complete(
             model,
             TranscriptContext(messages=[Message(role="user", content="hi")]),
-            StreamOptions(api_key="test-token"),
+            StreamOptions(),
         )
 
     assert msg.provider == "agy"
@@ -526,6 +560,7 @@ def test_agy_oauth_loopback_login_uses_ephemeral_port_and_redirects(
     monkeypatch.setattr(auth.webbrowser, "open", fake_open)
 
     exchanged: list[dict[str, str]] = []
+    call_order: list[str] = []
 
     class _FakeClient:
         def __init__(self, *args: object, **kwargs: object) -> None:
@@ -537,18 +572,39 @@ def test_agy_oauth_loopback_login_uses_ephemeral_port_and_redirects(
         def __exit__(self, *args: object) -> None:
             return None
 
-        def post(self, url: str, data: dict[str, str]) -> httpx.Response:
-            exchanged.append(dict(data))
+        def get(self, url: str, **kwargs: object) -> httpx.Response:
+            call_order.append("tokeninfo")
             return httpx.Response(
                 200,
-                request=httpx.Request("POST", url),
-                json={
-                    "access_token": "ya29.fresh",
-                    "refresh_token": "1//ref",
-                    "id_token": "id-jwt-1",
-                    "expires_in": 3600,
-                },
+                request=httpx.Request("GET", url),
+                json={"scope": auth.AGY_OAUTH_SCOPES},
             )
+
+        def post(self, url: str, data: dict[str, str] | None = None, **kwargs: object) -> httpx.Response:
+            if url == auth.AGY_OAUTH_TOKEN_URL:
+                call_order.append("token")
+                exchanged.append(dict(data or {}))
+                return httpx.Response(
+                    200,
+                    request=httpx.Request("POST", url),
+                    json={
+                        "access_token": "ya29.fresh",
+                        "refresh_token": "1//ref",
+                        "id_token": "id-jwt-1",
+                        "expires_in": 3600,
+                    },
+                )
+            if url.endswith(":fetchUserInfo"):
+                call_order.append("fetchUserInfo")
+                return httpx.Response(200, request=httpx.Request("POST", url), json={"email": "u@example.com"})
+            if url.endswith(":loadCodeAssist"):
+                call_order.append("loadCodeAssist")
+                return httpx.Response(
+                    200,
+                    request=httpx.Request("POST", url),
+                    json={"cloudaicompanionProject": "proj-123"},
+                )
+            raise AssertionError(f"Unexpected POST {url}")
 
     monkeypatch.setattr(auth.httpx, "Client", _FakeClient)
 
@@ -557,6 +613,7 @@ def test_agy_oauth_loopback_login_uses_ephemeral_port_and_redirects(
     assert seen_redirect_uri[0].startswith("http://localhost:")
     assert seen_redirect_uri[0].endswith("/auth/callback")
     assert callback_status == [(302, auth.AGY_OAUTH_SUCCESS_URL)]
+    assert call_order == ["token", "fetchUserInfo", "tokeninfo", "loadCodeAssist"]
     assert exchanged[0]["redirect_uri"] == seen_redirect_uri[0]
     assert exchanged[0]["code"] == "code-ok"
 
@@ -627,3 +684,206 @@ def test_agy_refresh_evicts_on_invalid_grant_and_keeps_on_network_error(
     with pytest.raises(MissingAPIKeyError):
         auth.resolve_api_key("agy", env={}, auth_file=auth_file)
     assert "agy" not in json.loads(auth_file.read_text(encoding="utf-8"))
+
+
+@pytest.mark.asyncio
+async def test_agy_claude_tool_call_id_roundtrips_and_headers_match_reference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import time
+    from le_vibe.providers import save_oidc_tokens
+    from le_vibe.providers.types import ModelSpec
+
+    auth_file = tmp_path / "auth.json"
+    monkeypatch.setenv("LE_VIBE_AUTH_FILE", str(auth_file))
+    save_oidc_tokens(
+        "agy",
+        access_token="ya29.tok",
+        expires_at=time.time() + 3600,
+        project_id="aicode-consumers",
+        auth_file=auth_file,
+    )
+    seen_headers: list[list[str]] = []
+    sse_lines = "\n".join(
+        [
+            'data: {"response":{"candidates":[{"content":{"parts":[{"functionCall":{"id":"toolu_vrtx_01ABC","name":"read","args":{"path":"x.py"}}}]},"finishReason":"STOP"}]}}',
+            "data: [DONE]",
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_headers.append(list(request.headers.keys()))
+        return httpx.Response(200, text=sse_lines)
+
+    model = ModelSpec(
+        id="claude-sonnet-4-6",
+        name="Claude Sonnet 4.6",
+        provider="agy",
+        base_url="https://daily-cloudcode-pa.googleapis.com",
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        msg = await AgyProvider(client=client).complete(
+            model,
+            TranscriptContext(messages=[Message(role="user", content="read x.py")]),
+        )
+
+    assert len(msg.tool_calls) == 1
+    assert msg.tool_calls[0].id == "toolu_vrtx_01ABC"
+    # Consumer requests must not send X-Goog-User-Project or X-Le-Vibe headers.
+    lower_keys = [k.lower() for k in seen_headers[0]]
+    assert "x-goog-user-project" not in lower_keys
+    assert not any(k.startswith("x-le-vibe") for k in lower_keys)
+    assert lower_keys.index("user-agent") < lower_keys.index("authorization") < lower_keys.index("content-type")
+
+
+@pytest.mark.asyncio
+async def test_agy_401_triggers_single_refresh_and_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import time
+    from le_vibe.providers import auth, save_oidc_tokens
+
+    auth_file = tmp_path / "auth.json"
+    monkeypatch.setenv("LE_VIBE_AUTH_FILE", str(auth_file))
+    auth._JUST_REFRESHED.pop("agy", None)
+    save_oidc_tokens(
+        "agy",
+        access_token="ya29.revoked",
+        refresh_token="1//ref",
+        expires_at=time.time() + 3600,
+        token_endpoint=auth.AGY_OAUTH_TOKEN_URL,
+        client_id="cid",
+        project_id="proj-1",
+        auth_file=auth_file,
+    )
+
+    refresh_calls = 0
+
+    class _RefreshClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> "_RefreshClient":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def post(self, url: str, data: dict[str, str]) -> httpx.Response:
+            nonlocal refresh_calls
+            refresh_calls += 1
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", url),
+                json={"access_token": "ya29.fresh", "expires_in": 3600},
+            )
+
+    monkeypatch.setattr(auth.httpx, "Client", _RefreshClient)
+
+    seen_auth: list[str] = []
+    sse_ok = 'data: {"response":{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}]}}\ndata: [DONE]\n'
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_auth.append(request.headers["authorization"])
+        if len(seen_auth) == 1:
+            return httpx.Response(401, text="revoked")
+        return httpx.Response(200, text=sse_ok)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        msg = await AgyProvider(client=client).complete(
+            _grouped_flash_model(),
+            TranscriptContext(messages=[Message(role="user", content="hi")]),
+        )
+
+    assert msg.content == "ok"
+    assert refresh_calls == 1
+    assert seen_auth == ["Bearer ya29.revoked", "Bearer ya29.fresh"]
+
+
+def test_retry_info_body_delay_honored_over_retry_after_header() -> None:
+    from le_vibe.providers.transport import resolve_retry_delay_seconds
+
+    body = json.dumps(
+        {
+            "error": {
+                "code": 429,
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                        "retryDelay": "7.5s",
+                    }
+                ],
+            }
+        }
+    )
+    delay, source = resolve_retry_delay_seconds(
+        status_code=429,
+        headers={"retry-after": "60"},
+        body=body,
+    )
+    assert delay == 7.5
+    assert source == "retry_info"
+
+
+def test_vibe_payload_parity_parallel_tools_reasoning_and_tool_sanitizer() -> None:
+    model = _vibe_test_model()
+    ctx = TranscriptContext(
+        messages=[
+            Message(role="user", content="do work"),
+            Message(
+                role="assistant",
+                content="calling",
+                reasoning_content="step 1 thought",
+                tool_calls=(
+                    ToolCall(id="call_long_server_id_12345", name="read", arguments={"path": "a.py"}),
+                    ToolCall(id="call_unanswered_999", name="bash", arguments={"cmd": "ls"}),
+                ),
+            ),
+            Message(role="tool", content="file body", tool_call_id="call_long_server_id_12345", name="read"),
+            Message(role="tool", content="orphan result", tool_call_id="orphan_id_000", name="read"),
+        ]
+    )
+    payload = build_vibe_payload(model, ctx, StreamOptions(thinking_level="medium"))
+    assert payload["parallel_tool_calls"] is True
+    msgs = payload["messages"]
+    assert msgs[1]["reasoning_content"] == "step 1 thought"
+    # Unanswered tool call dropped; matched call preserves full server id (not 9-char hashed).
+    assert [tc["id"] for tc in msgs[1]["tool_calls"]] == ["call_long_server_id_12345"]
+    # Orphan tool result dropped.
+    tool_msgs = [m for m in msgs if m["role"] == "tool"]
+    assert len(tool_msgs) == 1
+    assert tool_msgs[0]["tool_call_id"] == "call_long_server_id_12345"
+
+
+@pytest.mark.asyncio
+async def test_vibe_truncated_or_error_finish_reason_raises_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import time
+    from le_vibe.providers import save_oidc_tokens
+    from le_vibe.providers.transport import IncompleteProviderStream
+
+    auth_file = tmp_path / "auth.json"
+    monkeypatch.setenv("LE_VIBE_AUTH_FILE", str(auth_file))
+    save_oidc_tokens(
+        "vibe",
+        access_token="vibe-access",
+        id_token="vibe-id",
+        expires_at=time.time() + 3600,
+        organization_id="org-1",
+        workspace_id="ws-1",
+        auth_file=auth_file,
+    )
+    for bad_sse in (
+        'data: {"choices":[{"delta":{"content":"partial"}}]}\ndata: [DONE]\n',
+        'data: {"choices":[{"delta":{"content":"err"},"finish_reason":"error"}]}\ndata: [DONE]\n',
+    ):
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda req, body=bad_sse: httpx.Response(200, text=body))
+        ) as client:
+            with pytest.raises(IncompleteProviderStream):
+                await VibeProvider(client=client).complete(
+                    _vibe_test_model(),
+                    TranscriptContext(messages=[Message(role="user", content="hi")]),
+                )
+

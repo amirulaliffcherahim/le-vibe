@@ -1,19 +1,25 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Sequence
-import hashlib
 import json
 import re
 from typing import Any
 
 import httpx
 
-from le_vibe.providers.auth import resolve_api_key
+from le_vibe.providers.auth import VIBE_USER_AGENT, resolve_api_key
 from le_vibe.providers.catalog import list_models
-from le_vibe.providers.transport import calculate_cost_usd, stream_sse_json
+from le_vibe.providers.transport import (
+    FIRST_OUTPUT_WAIT_SECONDS,
+    STREAM_IDLE_SECONDS,
+    IncompleteProviderStream,
+    calculate_cost_usd,
+    stream_sse_json,
+)
 from le_vibe.providers.types import (
     AssistantMessage,
     AuthCredential,
+    Message,
     ModelSpec,
     ProviderId,
     StreamEvent,
@@ -42,11 +48,69 @@ def _split_multimodal_content(content: str) -> str | list[dict[str, Any]]:
     return parts
 
 
-def _normalize_mistral_tool_id(raw_id: str) -> str:
-    """Mistral requires 9-char alphanumeric tool_call IDs; hash non-conforming IDs deterministically."""
-    if len(raw_id) == 9 and raw_id.isascii() and raw_id.isalnum():
-        return raw_id
-    return hashlib.sha256(raw_id.encode("utf-8")).hexdigest()[:9]
+def _sanitize_tool_pairing(messages: Sequence[Message]) -> list[Message]:
+    """Drop/repair tool messages and assistant tool calls that cannot pair."""
+    result_ids = {
+        m.tool_call_id
+        for m in messages
+        if m.role == "tool" and isinstance(m.tool_call_id, str) and m.tool_call_id
+    }
+    out: list[Message] = []
+    pending: dict[str, str] = {}
+    for msg in messages:
+        if msg.role == "assistant":
+            kept: list[ToolCall] = []
+            pending = {}
+            for index, tc in enumerate(msg.tool_calls):
+                call_id = tc.id or f"call_{len(out)}_{index}"
+                if result_ids and call_id not in result_ids:
+                    # Assistant asked for a tool whose result never arrived.
+                    continue
+                if not result_ids:
+                    # No tool results at all in this transcript: keep the call
+                    # only when this is the final assistant message.
+                    continue
+                kept.append(
+                    ToolCall(
+                        id=call_id,
+                        name=tc.name,
+                        arguments=tc.arguments,
+                        thought_signature=tc.thought_signature,
+                    )
+                )
+                pending[call_id] = tc.name
+            if kept or msg.content or msg.reasoning_content:
+                out.append(
+                    Message(
+                        role="assistant",
+                        content=msg.content,
+                        reasoning_content=msg.reasoning_content,
+                        tool_calls=tuple(kept),
+                    )
+                )
+            continue
+        if msg.role == "tool":
+            call_id = msg.tool_call_id
+            if call_id not in pending:
+                if call_id and call_id in result_ids:
+                    # Orphaned result from a dropped assistant call.
+                    continue
+                if not call_id and len(pending) == 1:
+                    call_id = next(iter(pending))
+                else:
+                    continue
+            out.append(
+                Message(
+                    role="tool",
+                    content=msg.content,
+                    tool_call_id=call_id,
+                    name=msg.name or pending.get(call_id or "", None),
+                )
+            )
+            pending.pop(call_id, None)
+            continue
+        out.append(msg)
+    return out
 
 
 def build_vibe_payload(
@@ -58,21 +122,24 @@ def build_vibe_payload(
     if context.system_prompt:
         messages.append({"role": "system", "content": context.system_prompt})
 
-    for msg in context.messages:
+    for msg in _sanitize_tool_pairing(context.messages):
         content: Any = _split_multimodal_content(msg.content) if msg.role == "user" else msg.content
         entry: dict[str, Any] = {"role": msg.role, "content": content}
-        if msg.role == "assistant" and msg.tool_calls:
-            entry["tool_calls"] = [
-                {
-                    "id": _normalize_mistral_tool_id(tc.id),
-                    "type": "function",
-                    "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)},
-                }
-                for tc in msg.tool_calls
-            ]
+        if msg.role == "assistant":
+            if msg.reasoning_content and model.reasoning and options.thinking_level != "off":
+                entry["reasoning_content"] = msg.reasoning_content
+            if msg.tool_calls:
+                entry["tool_calls"] = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)},
+                    }
+                    for tc in msg.tool_calls
+                ]
         elif msg.role == "tool":
             if msg.tool_call_id:
-                entry["tool_call_id"] = _normalize_mistral_tool_id(msg.tool_call_id)
+                entry["tool_call_id"] = msg.tool_call_id
             if msg.name:
                 entry["name"] = msg.name
         messages.append(entry)
@@ -82,6 +149,7 @@ def build_vibe_payload(
         "messages": messages,
         "stream": True,
         "max_tokens": options.max_tokens or model.max_tokens,
+        "parallel_tool_calls": True,
     }
     if options.temperature is not None:
         payload["temperature"] = options.temperature
@@ -104,6 +172,21 @@ def build_vibe_payload(
     return payload
 
 
+def _merge_tool_id(current: str, incoming: str) -> str:
+    """Merge streamed tool-call ids without collapsing server ids to 9 chars."""
+    if not incoming:
+        return current
+    if not current:
+        return incoming
+    if incoming == current or incoming in current:
+        return current
+    if current in incoming:
+        return incoming
+    # Chunked ids normally only arrive once; if a provider repeats a prefix,
+    # keep the longer complete value rather than concatenating duplicates.
+    return incoming if len(incoming) >= len(current) else current
+
+
 class VibeProvider:
     id: ProviderId = "vibe"
     name: str = "Mistral Vibe"
@@ -115,7 +198,16 @@ class VibeProvider:
         return list_models("vibe")
 
     def resolve_auth(self, explicit_key: str | None = None) -> AuthCredential:
-        return resolve_api_key("vibe", explicit_key=explicit_key)
+        return resolve_api_key("vibe")
+
+    async def _refresh_headers(self, force: bool = False) -> dict[str, str]:
+        cred = resolve_api_key("vibe", force_refresh=force)
+        return {
+            "Authorization": f"Bearer {cred.token}",
+            "Content-Type": "application/json",
+            "User-Agent": VIBE_USER_AGENT,
+            **cred.extra_headers,
+        }
 
     async def stream(
         self,
@@ -124,11 +216,11 @@ class VibeProvider:
         options: StreamOptions | None = None,
     ) -> AsyncIterator[StreamEvent]:
         opts = options or StreamOptions()
-        cred = self.resolve_auth(opts.api_key)
+        cred = resolve_api_key("vibe")
         headers = {
             "Authorization": f"Bearer {cred.token}",
             "Content-Type": "application/json",
-            "User-Agent": "le-vibe/0.1.0",
+            "User-Agent": VIBE_USER_AGENT,
             **cred.extra_headers,
             **opts.extra_headers,
         }
@@ -138,11 +230,23 @@ class VibeProvider:
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
         tool_buffers: dict[int, dict[str, str]] = {}
-        stop_reason = "stop"
+        stop_reason: str | None = None
         usage = Usage()
 
+        async def _on_unauthorized() -> dict[str, str] | None:
+            refreshed = await self._refresh_headers(force=True)
+            return {**refreshed, **opts.extra_headers}
+
         async for chunk in stream_sse_json(
-            url, headers=headers, payload=payload, timeout_s=opts.timeout_s, client=self._client
+            url,
+            headers=headers,
+            payload=payload,
+            timeout_s=opts.timeout_s,
+            client=self._client,
+            on_unauthorized=_on_unauthorized,
+            first_output_timeout_s=FIRST_OUTPUT_WAIT_SECONDS,
+            idle_timeout_s=STREAM_IDLE_SECONDS,
+            max_retry_elapsed_s=opts.timeout_s,
         ):
             if raw_usage := chunk.get("usage"):
                 in_tok = int(raw_usage.get("prompt_tokens", 0))
@@ -195,12 +299,17 @@ class VibeProvider:
                 idx = int(tc.get("index", 0))
                 buf = tool_buffers.setdefault(idx, {"id": "", "name": "", "arguments": ""})
                 if tc_id := tc.get("id"):
-                    buf["id"] = tc_id
+                    buf["id"] = _merge_tool_id(buf["id"], str(tc_id))
                 fn = tc.get("function") or {}
                 if fn_name := fn.get("name"):
                     buf["name"] += fn_name
                 if fn_args := fn.get("arguments"):
                     buf["arguments"] += fn_args
+
+        if stop_reason == "error":
+            raise IncompleteProviderStream("Vibe stream finished with finish_reason=error")
+        if stop_reason is None:
+            raise IncompleteProviderStream("Vibe stream ended without a finish_reason")
 
         tool_calls: list[ToolCall] = []
         for idx in sorted(tool_buffers):

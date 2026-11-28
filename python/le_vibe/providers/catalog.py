@@ -12,12 +12,15 @@ import httpx
 
 from le_vibe.providers.auth import (
     AGY_ENDPOINTS,
-    AGY_USER_AGENT,
+    VIBE_USER_AGENT,
     MissingAPIKeyError,
+    _agy_endpoint_candidates,
+    _agy_headers,
     default_auth_file,
     get_agy_project_id,
     resolve_api_key,
 )
+from le_vibe.providers.transport import request_with_oauth_retry
 from le_vibe.providers.types import ModelCompat, ModelCost, ModelSpec, ProviderId
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
@@ -355,14 +358,32 @@ def _agy_group_models(
 async def _fetch_vibe_catalog(client: httpx.AsyncClient) -> list[ModelSpec]:
     try:
         cred = resolve_api_key("vibe")
-    except MissingAPIKeyError:
+    except (MissingAPIKeyError, RuntimeError):
         return []
     headers = {
         "Authorization": f"Bearer {cred.token}",
-        "User-Agent": "le-vibe/0.1.0",
+        "User-Agent": VIBE_USER_AGENT,
         **cred.extra_headers,
     }
-    resp = await client.get(f"{VIBE_BASE_URL}/model-catalog?surface=vibe-code", headers=headers)
+
+    async def _refresh_vibe() -> dict[str, str] | None:
+        try:
+            refreshed = resolve_api_key("vibe", force_refresh=True)
+        except (MissingAPIKeyError, RuntimeError):
+            return None
+        return {
+            "Authorization": f"Bearer {refreshed.token}",
+            "User-Agent": VIBE_USER_AGENT,
+            **refreshed.extra_headers,
+        }
+
+    resp = await request_with_oauth_retry(
+        client,
+        "GET",
+        f"{VIBE_BASE_URL}/model-catalog?surface=vibe-code",
+        headers=headers,
+        on_unauthorized=_refresh_vibe,
+    )
     if not resp.is_success:
         return []
     models_raw = resp.json().get("models") or []
@@ -412,25 +433,32 @@ async def _fetch_vibe_catalog(client: httpx.AsyncClient) -> list[ModelSpec]:
 async def _fetch_agy_catalog(client: httpx.AsyncClient) -> list[ModelSpec]:
     try:
         cred = resolve_api_key("agy")
-    except MissingAPIKeyError:
+    except (MissingAPIKeyError, RuntimeError):
         return []
     project_id = cred.project_id or get_agy_project_id()
-    headers = {
-        "Authorization": f"Bearer {cred.token}",
-        "Content-Type": "application/json",
-        "User-Agent": AGY_USER_AGENT,
-    }
+    headers = _agy_headers(cred.token, project_id=project_id)
+
+    async def _refresh_agy() -> dict[str, str] | None:
+        try:
+            refreshed = resolve_api_key("agy", force_refresh=True)
+        except (MissingAPIKeyError, RuntimeError):
+            return None
+        return _agy_headers(refreshed.token, project_id=refreshed.project_id or project_id)
+
     # The endpoints do not always serve the same set, so merge all of them and keep the
     # first endpoint that names each model.
     merged: dict[str, Any] = {}
     endpoint_of: dict[str, str] = {}
     default_runtime = ""
-    for endpoint in AGY_ENDPOINTS:
+    for endpoint in _agy_endpoint_candidates():
         try:
-            resp = await client.post(
+            resp = await request_with_oauth_retry(
+                client,
+                "POST",
                 f"{endpoint}/v1internal:fetchAvailableModels",
                 headers=headers,
-                json={"project": project_id},
+                json_body={"project": project_id},
+                on_unauthorized=_refresh_agy,
             )
             if not resp.is_success:
                 continue

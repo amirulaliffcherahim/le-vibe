@@ -24,7 +24,13 @@ def test_auth_status_and_catalog_never_leak_secrets(tmp_path: Path, monkeypatch:
     secret_agy_refresh = "1//super-secret-agy-refresh-666"
 
     save_api_key("deepseek", secret_ds, auth_file=auth_file)
-    save_api_key("vibe", secret_vibe, auth_file=auth_file)
+    save_oidc_tokens(
+        "vibe",
+        access_token=secret_vibe,
+        id_token=secret_vibe,
+        expires_at=9_999_999_999.0,
+        auth_file=auth_file,
+    )
     save_oidc_tokens(
         "agy",
         access_token=secret_agy_access,

@@ -1913,6 +1913,30 @@ fn run_interactive_tui(
                     }
                     continue;
                 }
+                if input == "/thinking" || input.starts_with("/thinking ") {
+                    let arg = input.strip_prefix("/thinking").unwrap_or("").trim();
+                    let next = if arg.is_empty() {
+                        Some(next_thinking_level(&state.thinking_level))
+                    } else {
+                        parse_thinking_level(arg)
+                    };
+                    if let Some(lvl) = next {
+                        state.thinking_level = lvl.to_string();
+                        save_setting("thinking", lvl);
+                        let _ = cmd_tx.send(WorkerCmd::RecordModelChange(format!(
+                            "{}/{}:{lvl}",
+                            state.provider, state.model
+                        )));
+                        state.blocks.push(TranscriptBlock::System(format!(
+                            "Thinking level set to [{lvl}] (saved to ~/.le-vibe/settings.json)."
+                        )));
+                    } else {
+                        state.blocks.push(TranscriptBlock::System(format!(
+                            "Unknown thinking level {arg:?}. Choose: off, minimal, low, medium, high, xhigh, max."
+                        )));
+                    }
+                    continue;
+                }
                 if input == "/theme" {
                     state.modal = ActiveModal::ThemePicker;
                     state.modal_idx = 0;
@@ -2733,6 +2757,30 @@ fn copy_to_clipboard_dual(plain: &str, html: Option<&str>) -> bool {
     write!(out, "\x1b]52;c;{b64}\x07").is_ok() && out.flush().is_ok()
 }
 
+const THINKING_LEVEL_OPTIONS: &[&str] =
+    &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+fn parse_thinking_level(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "off" | "none" => Some("off"),
+        "minimal" => Some("minimal"),
+        "low" => Some("low"),
+        "medium" | "med" => Some("medium"),
+        "high" => Some("high"),
+        "xhigh" => Some("xhigh"),
+        "max" => Some("max"),
+        _ => None,
+    }
+}
+
+fn next_thinking_level(current: &str) -> &'static str {
+    let idx = THINKING_LEVEL_OPTIONS
+        .iter()
+        .position(|l| l.eq_ignore_ascii_case(current.trim()))
+        .unwrap_or(3);
+    THINKING_LEVEL_OPTIONS[(idx + 1) % THINKING_LEVEL_OPTIONS.len()]
+}
+
 fn encode_base64(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -2780,5 +2828,15 @@ mod tests {
         assert_eq!(resets_in(None), "");
         // A time in the past reads as due now rather than a negative countdown.
         assert_eq!(resets_in(Some("1970-01-01T00:00:00Z")), "resets now");
+    }
+
+    #[test]
+    fn thinking_command_parses_aliases_and_cycles_levels() {
+        assert_eq!(super::parse_thinking_level("none"), Some("off"));
+        assert_eq!(super::parse_thinking_level("HIGH"), Some("high"));
+        assert_eq!(super::parse_thinking_level("med"), Some("medium"));
+        assert_eq!(super::parse_thinking_level("bogus"), None);
+        assert_eq!(super::next_thinking_level("medium"), "high");
+        assert_eq!(super::next_thinking_level("max"), "off");
     }
 }

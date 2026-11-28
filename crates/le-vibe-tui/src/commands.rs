@@ -46,8 +46,8 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "/thinking",
-        hint: "",
-        description: "Set reasoning effort level",
+        hint: "[off|minimal|low|medium|high|xhigh|max]",
+        description: "Set or cycle reasoning effort level",
         picker_on_bare: false,
     },
     SlashCommandSpec {

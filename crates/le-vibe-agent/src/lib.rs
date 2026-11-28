@@ -1088,9 +1088,12 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                 continue;
             }
             let mut final_reply = reply;
-            let turn_usage = entry_usage(&final_reply.usage);
+            // Cumulative, not this turn: intermediate tool-calling turns are recorded as
+            // `tool_call` entries, so the closing assistant message is the one place that can
+            // state what the whole prompt actually cost.
+            let session_usage = entry_usage(&cumulative_usage);
             final_reply.usage = cumulative_usage;
-            session.append_with_usage("assistant", &final_reply.content, turn_usage)?;
+            session.append_with_usage("assistant", &final_reply.content, session_usage)?;
             on_event(AgentEvent::TurnEnd {
                 stop_reason: final_reply.stop_reason.clone(),
             });
@@ -1291,7 +1294,7 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                 });
             }
         } else {
-        for tc in &reply.tool_calls {
+        for (call_idx, tc) in reply.tool_calls.iter().enumerate() {
             if is_cancelled(cancel) {
                 let note = if last_partial_text.trim().is_empty() {
                     "[Interrupted by user]".to_string()
@@ -1701,10 +1704,13 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                     "output": preview,
                 }),
             );
-            let _ = session.append_tool_call(
+            // The turn's usage rides on its first tool call: a tool-calling turn has no
+            // assistant message entry, so without this its tokens were never recorded.
+            let _ = session.append_tool_call_with_usage(
                 &tc.id,
                 &tc.name,
                 serde_json::to_string(&tc.arguments).unwrap_or_else(|_| "{}".to_string()),
+                (call_idx == 0).then(|| entry_usage(&reply.usage)),
             );
             if !is_error
                 && let Some(post_note) = hooks.run_post_tool(&tc.name, &args_json_str)

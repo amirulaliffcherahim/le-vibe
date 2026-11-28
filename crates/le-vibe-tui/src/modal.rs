@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Padding, Paragraph, Wrap};
 
 use crate::commands::SlashCommandItem;
-use crate::mode::{ALL_MODES, ALL_SHELLS};
+use crate::mode::ALL_SHELLS;
 use crate::state::{ActiveModal, TuiState};
 use crate::theme::{ALL_THEMES, ThemeId};
 
@@ -255,9 +255,10 @@ pub(crate) fn draw_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                 crate::keyhint::key_text(crate::keyhint::KeyAction::CycleMode),
                 crate::keyhint::key_text(crate::keyhint::KeyAction::OpenWorkflows)
             ),
-            ALL_MODES
-                .iter()
-                .map(|m| (m.name().to_string(), String::new(), m.description().to_string()))
+            state
+                .primary_modes()
+                .into_iter()
+                .map(|m| (m.id.clone(), String::new(), m.description.clone()))
                 .collect(),
         ),
         ActiveModal::WorkflowPicker => (

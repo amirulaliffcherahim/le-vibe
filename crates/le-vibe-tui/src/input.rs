@@ -161,7 +161,7 @@ fn try_coalesce_unbracketed_paste(first_ch: char) -> Option<String> {
 
 use crate::commands::filter_slash_commands_with_dynamic;
 use crate::editor::{next_char_boundary, prev_char_boundary};
-use crate::mode::{ALL_MODES, ALL_SHELLS};
+use crate::mode::ALL_SHELLS;
 use crate::state::{ActiveModal, TuiAction, TuiState, keep_vt_input_off};
 use crate::theme::ALL_THEMES;
 
@@ -175,7 +175,7 @@ fn modal_len(state: &TuiState) -> usize {
         | ActiveModal::InfoModal => 0,
         ActiveModal::ModelPicker => state.picker_rows().len(),
         ActiveModal::LoginPicker | ActiveModal::LogoutPicker => 3,
-        ActiveModal::ModePicker => ALL_MODES.len(),
+        ActiveModal::ModePicker => state.primary_modes().len().max(1),
         ActiveModal::WorkflowPicker => state.mode.workflows().len(),
         ActiveModal::TermPicker => ALL_SHELLS.len(),
         ActiveModal::ConfigModal => state.config_rows().len().max(1),
@@ -721,8 +721,10 @@ pub fn handle_key_event(state: &mut TuiState, key: crossterm::event::KeyEvent) -
                         return Ok(TuiAction::Submit(format!("/theme {}", theme.name())));
                     }
                     ActiveModal::ModePicker => {
-                        let mode = ALL_MODES[idx.min(ALL_MODES.len() - 1)];
-                        return Ok(TuiAction::Submit(format!("/mode {}", mode.name())));
+                        let modes = state.primary_modes();
+                        if let Some(spec) = modes.get(idx.min(modes.len().saturating_sub(1))) {
+                            return Ok(TuiAction::Submit(format!("/mode {}", spec.id)));
+                        }
                     }
                     ActiveModal::WorkflowPicker => {
                         let wfs = state.mode.workflows();
@@ -866,7 +868,7 @@ pub fn handle_key_event(state: &mut TuiState, key: crossterm::event::KeyEvent) -
     };
     match key.code {
         KeyCode::BackTab => {
-            state.mode = state.mode.next();
+            state.cycle_mode();
             return Ok(TuiAction::None);
         }
         KeyCode::Char('w') | KeyCode::Char('W') if key.modifiers.contains(KeyModifiers::ALT) => {

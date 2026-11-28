@@ -295,7 +295,8 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "required": ["task"],
                 "properties": {
-                    "task": { "type": "string", "description": "Focused research or analysis task for the isolated subagent" }
+                    "task": { "type": "string", "description": "Focused research or analysis task for the isolated subagent" },
+                    "mode": { "type": "string", "description": "Optional persona/mode id (e.g. reviewer, researcher)" }
                 }
             }),
         },

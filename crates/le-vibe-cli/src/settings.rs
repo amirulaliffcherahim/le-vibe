@@ -551,6 +551,67 @@ pub(crate) fn open_session_with_opts(opts: &crate::cli::CliOptions) -> SessionSt
 }
 
 
+pub(crate) fn discover_modes() -> Vec<le_vibe_tui::ModeSpec> {
+    let mut dirs = Vec::new();
+    let user_modes = settings_file()
+        .parent()
+        .map(|p| p.join("modes"))
+        .unwrap_or_else(|| PathBuf::from(".le-vibe").join("modes"));
+    dirs.push(user_modes);
+    dirs.push(PathBuf::from(".le-vibe").join("modes"));
+    discover_modes_from_dirs(&dirs)
+}
+
+pub(crate) fn discover_modes_from_dirs(dirs: &[PathBuf]) -> Vec<le_vibe_tui::ModeSpec> {
+    let mut specs = le_vibe_tui::ModeSpec::builtins();
+    for dir in dirs {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        let mut files: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok().map(|x| x.path()))
+            .filter(|p| p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("md"))
+            .collect();
+        files.sort();
+        for path in files {
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Ok(raw) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let parsed = le_vibe_tui::parse_mode_markdown(stem, &raw);
+            if let Some(existing) = specs
+                .iter_mut()
+                .find(|m| m.id.eq_ignore_ascii_case(&parsed.id))
+            {
+                *existing = parsed;
+            } else {
+                specs.push(parsed);
+            }
+        }
+    }
+    specs
+}
+
+pub(crate) fn subagent_personas_from_modes(
+    specs: &[le_vibe_tui::ModeSpec],
+) -> Vec<le_vibe_agent::SubagentPersona> {
+    specs
+        .iter()
+        .filter(|m| m.scope.is_subagent())
+        .map(|m| le_vibe_agent::SubagentPersona {
+            id: m.id.clone(),
+            system_prompt: m.body.clone(),
+            allowed_tools: m.resolve_allowed_tools(),
+            model: m.model.clone(),
+            thinking: m.thinking.clone(),
+            max_turns: m.max_turns,
+            verify_edits: m.verify_edits,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod pinned_tools_tests {
     use super::parse_tool_list;
@@ -568,5 +629,46 @@ mod pinned_tools_tests {
     fn empty_or_blank_pins_nothing() {
         assert_eq!(parse_tool_list(""), None);
         assert_eq!(parse_tool_list("  ,  "), None);
+    }
+
+    #[test]
+    fn mode_discovery_precedence_project_overrides_global_and_builtin() {
+        let root = std::env::temp_dir().join(format!("le_vibe_modes_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let global = root.join("global");
+        let project = root.join("project");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+
+        std::fs::write(
+            global.join("plan.md"),
+            "---\ndescription: Global plan\n---\nGlobal body.",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("plan.md"),
+            "---\ndescription: Project plan\nmodel: vibe/mistral-large-4-0\n---\nProject body.",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("reviewer.md"),
+            "---\ndescription: Reviewer\nscope: subagent\ncan_write: false\n---\nAudit diff.",
+        )
+        .unwrap();
+
+        let specs = super::discover_modes_from_dirs(&[global, project]);
+        let plan = specs.iter().find(|m| m.id == "plan").unwrap();
+        assert_eq!(plan.description, "Project plan");
+        assert_eq!(plan.model.as_deref(), Some("vibe/mistral-large-4-0"));
+        assert_eq!(plan.body, "Project body.");
+
+        let rev = specs.iter().find(|m| m.id == "reviewer").unwrap();
+        assert_eq!(rev.scope, le_vibe_tui::ModeScope::Subagent);
+        assert!(!rev.can_write);
+
+        let personas = super::subagent_personas_from_modes(&specs);
+        assert!(personas.iter().any(|p| p.id == "reviewer"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -6,6 +6,7 @@ mod rpc;
 mod settings;
 #[cfg(feature = "dev-debug")]
 mod tui_probe;
+mod update;
 mod worker;
 
 use le_vibe_agent::{AgentConfig, AgentEvent, ApprovalChoice};
@@ -107,6 +108,9 @@ fn handle_login(bridge: &mut PythonBridge, args: &[String]) {
 
 
 fn main() {
+    if let Ok(exe) = std::env::current_exe() {
+        update::cleanup_stale_old_binaries(&exe);
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let action = parse_cli_args(&args);
 
@@ -264,25 +268,7 @@ fn main() {
                     return;
                 }
                 "update" => {
-                    let repo = self_repo_path();
-                    println!("Updating le-vibe from {repo}...");
-                    let pull = std::process::Command::new("git")
-                        .args(["pull", "--ff-only"])
-                        .current_dir(&repo)
-                        .status();
-                    if !pull.is_ok_and(|s| s.success()) {
-                        eprintln!("git pull failed (check uncommitted changes in {repo})");
-                        std::process::exit(1);
-                    }
-                    let inst = std::process::Command::new("cargo")
-                        .args(["install", "--path", "crates/le-vibe-cli", "--no-default-features"])
-                        .current_dir(&repo)
-                        .status();
-                    if !inst.is_ok_and(|s| s.success()) {
-                        eprintln!("cargo install failed");
-                        std::process::exit(1);
-                    }
-                    println!("le-vibe updated successfully.");
+                    update::run_update(sub_args);
                 }
                 _ => {}
             }

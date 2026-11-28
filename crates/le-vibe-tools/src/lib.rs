@@ -140,7 +140,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "todo".to_string(),
-            description: "Manage a multi-step task list (rpiv-todo parity). Actions: create (subject or tasks[] batch), update (status/activeForm/addBlockedBy/removeBlockedBy), list (status/includeDeleted), get, delete (tombstone), clear. Status: pending -> in_progress -> completed, plus deleted.".to_string(),
+            description: "Manage a multi-step task list: create/update/list/get/delete/clear. Status: pending -> in_progress -> completed.".to_string(),
             parameters: json!({
                 "type": "object",
                 "required": ["action"],
@@ -161,7 +161,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "ask_user_question".to_string(),
-            description: "Ask the user 1-4 structured clarifying questions (rpiv-ask-user-question parity). Each question has header (<=16 chars), question, optional multiSelect, and 2-4 options ({label, description, preview?}). Do not author 'Other' or 'Type something.' — it is appended automatically.".to_string(),
+            description: "Ask 1-4 structured clarifying questions; each option needs a label and description. Do not author 'Other' or 'Type something.' - it is appended automatically.".to_string(),
             parameters: json!({
                 "type": "object",
                 "required": ["questions"],
@@ -199,7 +199,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "web_search".to_string(),
-            description: "Search the web concurrently (prefer `queries` with 2-4 varied angles, or single `query`). Returns titles, URLs, and snippets.".to_string(),
+            description: "Search the web (prefer `queries` with 2-4 varied angles). Returns titles, URLs, snippets.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -211,7 +211,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "fetch_content".to_string(),
-            description: "Fetch a web page over HTTP(S) and extract clean readable Markdown/text (`mode='readable'`, default) or exact raw body (`mode='raw'`).".to_string(),
+            description: "Fetch a page and extract readable Markdown (default), or the exact body with mode='raw'.".to_string(),
             parameters: json!({
                 "type": "object",
                 "required": ["url"],
@@ -223,7 +223,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "retrieve_output".to_string(),
-            description: "Retrieve exact lines from a previously compressed tool output by ref id (e.g. 'out_1'), optionally filtered by substring query or 1-based line offset/limit.".to_string(),
+            description: "Read exact lines from an earlier compressed tool output by ref id (e.g. 'out_1'), by query or offset/limit.".to_string(),
             parameters: json!({
                 "type": "object",
                 "required": ["id"],
@@ -237,7 +237,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "memory_search".to_string(),
-            description: "Hybrid Lucene-BM25 + 512d vector RAG search (default scope='memory'; opt-in scope='repo'). Returns inline text for short entries or compact stubs.".to_string(),
+            description: "Search memory (default scope='memory') or the repo, BM25 + vector. Returns inline text or compact stubs.".to_string(),
             parameters: json!({
                 "type": "object",
                 "required": ["query"],
@@ -250,7 +250,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "memory_write".to_string(),
-            description: "Save or upsert a durable fact/decision to project or global MEMORY.md / daily log. Include 3-6 synonym keywords for semantic recall and optional stable key for upsert.".to_string(),
+            description: "Upsert a durable decision/constraint/preference: 3-6 synonym keywords, stable key for upsert.".to_string(),
             parameters: json!({
                 "type": "object",
                 "required": ["content"],
@@ -290,7 +290,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "spawn_agent".to_string(),
-            description: "Spawn an isolated read-only subagent with its own clean context window to research or inspect code and return a concise summary.".to_string(),
+            description: "Run an isolated read-only subagent with a clean context window; returns a concise summary.".to_string(),
             parameters: json!({
                 "type": "object",
                 "required": ["task"],
@@ -301,7 +301,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "load_skill".to_string(),
-            description: "Load the full SKILL.md instructions for an on-demand skill by name only when relevant to the current task.".to_string(),
+            description: "Load a skill's full SKILL.md by name when it is relevant to the task.".to_string(),
             parameters: json!({
                 "type": "object",
                 "required": ["name"],
@@ -312,7 +312,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "codemode".to_string(),
-            description: "Run one Python script that batches tools.<name>(**kwargs) (read, grep, find, ls, write, edit, bash, powershell, todo, retrieve_output, web_search, fetch_content, mcp__*) and filters/aggregates results in Python before printing only the concise answer. Globals: tools, text(v), print(...), store(k,v), load(k), json, re, Path.".to_string(),
+            description: "Run one Python script that batches tools.<name>(**kwargs) and prints only the distilled answer. Globals: tools, text(v), print, store(k,v), load(k), json, re, Path.".to_string(),
             parameters: json!({
                 "type": "object",
                 "required": ["script"],

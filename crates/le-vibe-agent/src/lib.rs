@@ -807,7 +807,7 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                 CompletionRequest {
                     provider: config.provider.clone(),
                     model: config.model.clone(),
-                    messages: messages.clone(),
+                    messages: crate::compress::age_stale_tool_results(&messages),
                     system_prompt: config.system_prompt.clone(),
                     tools: tools.clone(),
                     thinking_level: config.thinking_level.clone(),

@@ -7,8 +7,16 @@
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 
+use le_vibe_pybridge::ChatMessage;
+
 const SHELL_COMPRESS_THRESHOLD: usize = 6 * 1024;
 const READ_COMPRESS_THRESHOLD: usize = 24 * 1024;
+/// Tool results newer than this stay verbatim: the active working set must not churn.
+pub const AGE_KEEP_RECENT_TOOL_RESULTS: usize = 6;
+/// Nothing smaller than this is worth eliding - a stub would not save a full line.
+pub const AGE_MIN_ELIDE_CHARS: usize = 2_000;
+/// Bytes of the original kept in the stub: the command header or first error line.
+const AGE_HEAD_CHARS: usize = 240;
 const RETRIEVE_MAX_BYTES: usize = 4_000;
 const STORE_MAX_ENTRIES: usize = 64;
 const STORE_MAX_BYTES: usize = 16 * 1024 * 1024;
@@ -146,6 +154,57 @@ impl OutputStore {
 
 /// Tool-aware entry point: compresses large tool outputs once at append time and registers raw
 /// text in `store` so the model can recover exact lines via `retrieve_output`.
+/// Elide the bodies of *stale* tool results before a request.
+///
+/// Every step resends the whole transcript, so one 24 KB read kept forever costs ~6k tokens on
+/// every later step. The newest [`AGE_KEEP_RECENT_TOOL_RESULTS`] results are the working set and
+/// stay verbatim; older bulky ones shrink to a stub that keeps the first line (the command,
+/// exit code or headline error) so the model still knows what happened.
+///
+/// This only shapes the outgoing request - the session DAG keeps the full text.
+pub fn age_stale_tool_results(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    let tool_indexes: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == "tool")
+        .map(|(i, _)| i)
+        .collect();
+    if tool_indexes.len() <= AGE_KEEP_RECENT_TOOL_RESULTS {
+        return messages.to_vec();
+    }
+    let stale_until = tool_indexes.len() - AGE_KEEP_RECENT_TOOL_RESULTS;
+    let stale: std::collections::HashSet<usize> = tool_indexes[..stale_until].iter().copied().collect();
+
+    messages
+        .iter()
+        .enumerate()
+        .map(|(i, msg)| {
+            if !stale.contains(&i) || msg.content.len() < AGE_MIN_ELIDE_CHARS {
+                return msg.clone();
+            }
+            let mut aged = msg.clone();
+            aged.content = age_stub(msg);
+            aged
+        })
+        .collect()
+}
+
+fn age_stub(msg: &ChatMessage) -> String {
+    let head: String = msg.content.chars().take(AGE_HEAD_CHARS).collect();
+    let head = head.trim_end();
+    let tool = msg.name.as_deref().unwrap_or("tool");
+    let lines = msg.content.lines().count();
+    let note = format!(
+        "\n[aged out {tool} result: {lines} lines elided to keep context small - re-run the tool \
+if the body is still needed]"
+    );
+    if head.len() < msg.content.len() {
+        format!("{head}{note}")
+    } else {
+        note.trim_start().to_string()
+    }
+}
+
 pub fn compress_tool_output(tool_name: &str, raw: &str, store: &mut OutputStore) -> String {
     if tool_name == "retrieve_output" {
         return raw.to_string();
@@ -486,6 +545,68 @@ fn compress_head_tail_preserve_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tool_msg(name: &str, body: &str) -> ChatMessage {
+        ChatMessage {
+            role: "tool".to_string(),
+            content: body.to_string(),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            tool_call_id: Some(format!("call_{name}")),
+            name: Some(name.to_string()),
+        }
+    }
+
+    #[test]
+    fn aging_keeps_the_recent_working_set_verbatim() {
+        let body = "x".repeat(8_000);
+        let messages: Vec<ChatMessage> = (0..AGE_KEEP_RECENT_TOOL_RESULTS)
+            .map(|i| tool_msg(&format!("read{i}"), &body))
+            .collect();
+        let aged = age_stale_tool_results(&messages);
+        assert_eq!(aged, messages);
+    }
+
+    #[test]
+    fn aging_elides_old_bodies_but_keeps_the_head_and_a_hint() {
+        let old_body = format!("exit_code=0\n{}", "log line\n".repeat(2_000));
+        let recent_body = "y".repeat(8_000);
+        let mut messages = vec![tool_msg("powershell", &old_body)];
+        for i in 0..AGE_KEEP_RECENT_TOOL_RESULTS {
+            messages.push(tool_msg(&format!("read{i}"), &recent_body));
+        }
+
+        let aged = age_stale_tool_results(&messages);
+
+        assert!(aged[0].content.len() < 400, "stale body must shrink");
+        assert!(aged[0].content.starts_with("exit_code=0"), "head is preserved");
+        assert!(aged[0].content.contains("re-run the tool"));
+        assert!(aged[0].content.contains("powershell"));
+        // Identity and ordering are untouched so tool_call pairing still holds.
+        assert_eq!(aged[0].tool_call_id, messages[0].tool_call_id);
+        assert_eq!(aged[1..], messages[1..]);
+    }
+
+    #[test]
+    fn aging_leaves_small_results_and_user_turns_alone() {
+        let small = tool_msg("ls", "src\ncrates");
+        let user = ChatMessage {
+            role: "user".to_string(),
+            content: "z".repeat(9_000),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
+        };
+        let mut messages = vec![small.clone(), user.clone()];
+        for i in 0..AGE_KEEP_RECENT_TOOL_RESULTS {
+            messages.push(tool_msg(&format!("read{i}"), &"y".repeat(4_000)));
+        }
+
+        let aged = age_stale_tool_results(&messages);
+        assert_eq!(aged[0], small);
+        assert_eq!(aged[1], user);
+    }
 
     #[test]
     fn smart_crusher_preserves_buried_json_error_and_allows_retrieve() {

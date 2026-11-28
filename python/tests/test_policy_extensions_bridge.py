@@ -192,3 +192,22 @@ def register(host):
     names_web = [t["name"] for t in listed_web["result"]]
     assert names_web == ["lazy_ping", "web_search", "fetch_content"]
 
+
+def test_discover_skills_supports_flat_and_nested_markdown_layouts(tmp_path: Path) -> None:
+    root = tmp_path / "skill"
+    root.mkdir()
+    (root / "quick.md").write_text("---\ndescription: Flat skill\n---\nBody1.", encoding="utf-8")
+    nested = root / "complex-skill"
+    nested.mkdir()
+    (nested / "multi-skill.md").write_text(
+        "---\ndescription: Nested skill\n---\nBody2.", encoding="utf-8"
+    )
+    (root / "README.md").write_text("Ignored readme", encoding="utf-8")
+
+    skills = discover_skills([root])
+    names = [s.name for s in skills]
+    assert names == ["complex-skill" if False else "multi-skill", "quick"] or set(names) == {
+        "multi-skill",
+        "quick",
+    }
+

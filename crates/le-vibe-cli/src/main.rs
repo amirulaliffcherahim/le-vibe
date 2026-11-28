@@ -207,11 +207,18 @@ fn main() {
                 .or_else(|| std::env::var_os("HOME"))
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| std::path::PathBuf::from("."));
-            let ext_dir = home.join(".le-vibe").join("extensions");
+            let ext_dir = home.join(".le-vibe").join("extension");
             match sub.as_str() {
                 "list" => {
                     let mut found = Vec::new();
-                    for dir in [&ext_dir, &std::path::PathBuf::from(".le-vibe").join("extensions")] {
+                    for dir in [
+                        &ext_dir,
+                        &home.join(".agents").join("extension"),
+                        &std::path::PathBuf::from(".le-vibe").join("extension"),
+                        &std::path::PathBuf::from(".agents").join("extension"),
+                        &home.join(".le-vibe").join("extensions"),
+                        &std::path::PathBuf::from(".le-vibe").join("extensions"),
+                    ] {
                         if let Ok(entries) = fs::read_dir(dir) {
                             for e in entries.flatten() {
                                 let p = e.path();

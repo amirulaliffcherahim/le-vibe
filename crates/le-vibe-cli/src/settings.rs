@@ -359,12 +359,20 @@ pub(crate) fn default_mcp_paths() -> Vec<PathBuf> {
 }
 
 pub(crate) fn default_skill_dirs() -> Vec<String> {
-    let mut dirs = vec![".le-vibe/skills".to_string(), ".pi/skills".to_string()];
+    let mut dirs = vec![
+        ".le-vibe/skill".to_string(),
+        ".le-vibe/skills".to_string(),
+        ".agents/skill".to_string(),
+        ".agents/skills".to_string(),
+        ".pi/skills".to_string(),
+    ];
     if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
         let h = PathBuf::from(home);
+        dirs.push(h.join(".le-vibe").join("skill").display().to_string());
         dirs.push(h.join(".le-vibe").join("skills").display().to_string());
-        dirs.push(h.join(".pi").join("agent").join("skills").display().to_string());
+        dirs.push(h.join(".agents").join("skill").display().to_string());
         dirs.push(h.join(".agents").join("skills").display().to_string());
+        dirs.push(h.join(".pi").join("agent").join("skills").display().to_string());
     }
     dirs
 }
@@ -653,12 +661,21 @@ pub(crate) fn resolve_initial_model_offline_from_cache(
 
 pub(crate) fn discover_modes() -> Vec<le_vibe_tui::ModeSpec> {
     let mut dirs = Vec::new();
-    let user_modes = settings_file()
-        .parent()
-        .map(|p| p.join("modes"))
-        .unwrap_or_else(|| PathBuf::from(".le-vibe").join("modes"));
-    dirs.push(user_modes);
+    if let Some(base) = settings_file().parent() {
+        dirs.push(base.join("modes"));
+        dirs.push(base.join("mode"));
+        if let Some(home) = base.parent() {
+            dirs.push(home.join(".agents").join("modes"));
+            dirs.push(home.join(".agents").join("mode"));
+        }
+    } else {
+        dirs.push(PathBuf::from(".le-vibe").join("modes"));
+        dirs.push(PathBuf::from(".le-vibe").join("mode"));
+    }
+    dirs.push(PathBuf::from(".agents").join("modes"));
+    dirs.push(PathBuf::from(".agents").join("mode"));
     dirs.push(PathBuf::from(".le-vibe").join("modes"));
+    dirs.push(PathBuf::from(".le-vibe").join("mode"));
     discover_modes_from_dirs(&dirs)
 }
 

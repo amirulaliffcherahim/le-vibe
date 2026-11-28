@@ -1055,3 +1055,66 @@ def test_agy_oauth_client_discovery_from_binary_caches_to_json(
     assert cached == {"client_id": fake_cid, "client_secret": fake_csec}
 
 
+def test_stub_in_the_shared_keyring_slot_does_not_force_a_relogin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The shared `ai.mistral.vibe.oidc` slot held a 15-char access token; because the official
+    entry is tried first and wins, a perfectly good credential in le-vibe's own auth store was
+    never reached and every run demanded a fresh login."""
+    import time
+    from le_vibe.providers import auth, save_oidc_tokens
+
+    auth_file = tmp_path / "auth.json"
+    monkeypatch.setenv("LE_VIBE_AUTH_FILE", str(auth_file))
+    monkeypatch.delenv("LE_VIBE_AUTH_FILE", raising=False)  # exercise the official-first path
+    monkeypatch.setattr(
+        auth,
+        "_keyring_get",
+        lambda service, entry: json.dumps(
+            {
+                "version": 1,
+                "issuer": auth.MISTRAL_OIDC_ISSUER,
+                "client_id": auth.MISTRAL_OIDC_CLIENT_ID,
+                "audience": auth.MISTRAL_OIDC_AUDIENCE,
+                "access_token": "short-stub-15ch",
+                "refresh_token": "stub-refresh-16c",
+                "id_token": "",
+                "expires_at": 1.0,
+            }
+        ),
+    )
+    save_oidc_tokens(
+        "vibe",
+        access_token="vibe-access-token-that-is-long-enough",
+        id_token="vibe-id-token",
+        expires_at=time.time() + 3600,
+        organization_id="org-1",
+        workspace_id="ws-1",
+        auth_file=auth_file,
+    )
+
+    assert auth._load_vibe_official_token() is None, "a stub bundle must read as absent"
+    cred = auth.resolve_api_key("vibe", env={}, auth_file=auth_file)
+    assert cred.token == "vibe-id-token"
+    assert cred.extra_headers["x-external-organization-id"] == "org-1"
+
+
+def test_a_stub_bundle_is_never_written_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    from le_vibe.providers import auth
+
+    written: list[str] = []
+    monkeypatch.setattr(auth, "_keyring_set", lambda service, entry, value: written.append(value))
+    monkeypatch.setattr(auth, "_existing_vibe_id_token", lambda: "kept-id-token")
+
+    auth._save_vibe_official_token({"access_token": "too-short", "refresh_token": "r"})
+    assert written == [], "a stub must not shadow the auth store on the next run"
+
+    # A refresh that omits an ID token keeps the one already held instead of blanking it, which
+    # used to force another refresh (and a token rotation) on every call.
+    auth._save_vibe_official_token(
+        {"access_token": "a" * 40, "refresh_token": "r" * 20, "id_token": ""}
+    )
+    assert len(written) == 1
+    assert json.loads(written[0])["id_token"] == "kept-id-token"
+
+

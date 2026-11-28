@@ -330,7 +330,7 @@ for durable decisions, constraints, preferences or bug root causes (stable `key`
 filler or tool narration.\n\
 </tools>\n\n\
 <environment>\n\
-os={os}, active_shell={shell}, cwd={cwd}, workspace={repo_state}\n\
+os={os}, active_shell={shell}\n\
 </environment>\n\n\
 <mode name=\"{}\">\n\
 {}\n{}
@@ -441,6 +441,12 @@ policy, SSE watchdog), tui (keys, layout, modals, markdown, prompts), cli (event
             }
         }
     }
+
+    // Volatile workspace metadata sits after static instructions so a `cd` does not
+    // invalidate `<mode>`, `<skills>`, or static instruction files in the KV cache prefix.
+    prompt.push_str(&format!(
+        "\n\n<workspace>\ncwd={cwd}, workspace={repo_state}\n</workspace>"
+    ));
 
     // Most volatile block last: a memory write mid-session must not invalidate the prefix above it.
     if !memory_toc.trim().is_empty() {

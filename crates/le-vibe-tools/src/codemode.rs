@@ -161,7 +161,7 @@ pub fn run_codemode_script(
             .map_err(|e| format!("Invalid codemode protocol frame: {e}"))?;
 
         if msg.get("done").and_then(Value::as_bool) == Some(true) {
-            let _ = child.wait();
+            let status = child.wait().ok();
             let elapsed = started.elapsed().as_secs_f64();
             let out = msg.get("output").and_then(Value::as_str).unwrap_or("");
             if let Some(err) = msg.get("error").and_then(Value::as_str) {
@@ -174,10 +174,23 @@ pub fn run_codemode_script(
                 combined.push_str(err);
                 return Err(combined);
             }
+            if let Some(st) = status
+                && !st.success()
+            {
+                let code = st.code().unwrap_or(1);
+                return Err(format!(
+                    "Script exited with status {code} ({elapsed:.2}s, {tool_calls_count} tool call(s)):\n{out}"
+                ));
+            }
             if failed_tool_calls > 0 {
                 return Err(format!(
                     "Script ran ({elapsed:.2}s) but {failed_tool_calls} of {tool_calls_count} tool \
 call(s) failed; the output above contains the error:\n{out}"
+                ));
+            }
+            if let Some(exit_code) = find_nonzero_exit_line(out) {
+                return Err(format!(
+                    "Script reported non-zero exit (EXIT: {exit_code}, {elapsed:.2}s, {tool_calls_count} tool call(s)):\n{out}"
                 ));
             }
             return Ok(format!(
@@ -199,6 +212,21 @@ call(s) failed; the output above contains the error:\n{out}"
             let _ = stdin.flush();
         }
     }
+}
+
+fn find_nonzero_exit_line(out: &str) -> Option<i32> {
+    for line in out.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("EXIT:") {
+            let token = rest.split_whitespace().next().unwrap_or("");
+            if let Ok(code) = token.parse::<i32>()
+                && code != 0
+            {
+                return Some(code);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -242,5 +270,24 @@ mod tests {
         let out = run_codemode_script("print('fine')", 10_000, |_n, _a| Ok(String::new()))
             .expect("no sub-tool failures means success");
         assert!(out.contains("Script completed") && out.contains("fine"));
+    }
+
+    #[test]
+    fn explicit_nonzero_exit_line_or_process_status_returns_err() {
+        let err = run_codemode_script("print('EXIT: 1\\nSTDERR: boom')", 10_000, |_n, _a| {
+            Ok(String::new())
+        })
+        .expect_err("explicit EXIT: 1 line must surface as error");
+        assert!(err.contains("EXIT: 1"), "got: {err}");
+
+        let ok = run_codemode_script("print('EXIT: 0\\nok')", 10_000, |_n, _a| Ok(String::new()))
+            .expect("EXIT: 0 must remain success");
+        assert!(ok.contains("Script completed"));
+
+        let exit_err = run_codemode_script("import sys; sys.exit(2)", 10_000, |_n, _a| {
+            Ok(String::new())
+        })
+        .expect_err("non-zero process exit must surface as error");
+        assert!(!exit_err.is_empty());
     }
 }

@@ -215,3 +215,47 @@ fn codemode_rule_directs_localized_work_to_native_tools_first() {
     );
 }
 
+#[test]
+fn workspace_block_sits_after_instructions_so_cd_preserves_cache_prefix() {
+    let skills = vec![("demo-skill".to_string(), "d".to_string(), "p".to_string())];
+    let p1 = build_system_prompt(
+        AgentMode::Normal,
+        "powershell",
+        "C:/work/alpha",
+        "",
+        &skills,
+        "- [a] mem",
+    );
+    let p2 = build_system_prompt(
+        AgentMode::Normal,
+        "powershell",
+        "C:/work/beta",
+        "",
+        &skills,
+        "- [a] mem",
+    );
+
+    let env_start = p1.find("<environment>").unwrap();
+    let env_end = p1.find("</environment>").unwrap();
+    let env_block = &p1[env_start..env_end];
+    assert!(
+        !env_block.contains("cwd=") && !env_block.contains("workspace="),
+        "static <environment> must not contain volatile cwd/workspace: {env_block}"
+    );
+
+    let skills_end = p1.find("</skills>").unwrap() + "</skills>".len();
+    let ws_at = p1.find("<workspace>").expect("volatile <workspace> block");
+    let mem_at = p1.find("<memory_toc>").unwrap();
+    let rem_at = p1.find("<non_negotiables>").unwrap();
+    assert!(skills_end < ws_at, "<workspace> must come after <skills>");
+    assert!(ws_at < rem_at, "<workspace> must come before <non_negotiables>");
+    assert!(mem_at < rem_at);
+
+    // Changing cwd must keep the entire prefix through </skills> byte-identical.
+    assert_eq!(
+        &p1[..skills_end],
+        &p2[..skills_end],
+        "changing cwd mutated the cacheable prefix before </skills>"
+    );
+}
+

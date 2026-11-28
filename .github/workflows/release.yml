@@ -15,19 +15,19 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            bin: le-vibe
+            bin: lazybug
           - os: macos-latest
             target: aarch64-apple-darwin
-            bin: le-vibe
+            bin: lazybug
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            bin: le-vibe.exe
+            bin: lazybug.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Build release binary
-        run: cargo build --release --no-default-features -p le-vibe-cli --target ${{ matrix.target }}
+        run: cargo build --release --no-default-features -p lazybug-cli --target ${{ matrix.target }}
       - name: Package artifact
         shell: bash
         run: |

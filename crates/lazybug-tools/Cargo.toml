@@ -1,0 +1,13 @@
+[package]
+name = "lazybug-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lazybug-pybridge = { path = "../lazybug-pybridge" }
+lazybug-schema = { path = "../lazybug-schema" }
+regex = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

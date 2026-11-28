@@ -1,0 +1,372 @@
+from __future__ import annotations
+
+from collections.abc import AsyncIterator, Sequence
+import json
+import re
+from typing import Any
+
+import httpx
+
+from lazybug.providers.auth import VIBE_USER_AGENT, resolve_api_key
+from lazybug.providers.catalog import list_models, resolve_reasoning_effort
+from lazybug.providers.transport import (
+    FIRST_OUTPUT_WAIT_SECONDS,
+    STREAM_IDLE_SECONDS,
+    IncompleteProviderStream,
+    calculate_cost_usd,
+    stream_sse_json,
+)
+from lazybug.providers.types import (
+    AssistantMessage,
+    AuthCredential,
+    Message,
+    ModelSpec,
+    ProviderId,
+    StreamEvent,
+    StreamOptions,
+    ToolCall,
+    TranscriptContext,
+    Usage,
+)
+
+
+_ATTACHED_IMAGE_RE = re.compile(
+    r'\[attached_image name="[^"]*" mime="([^"]+)" data="(data:[^"]+)"\]'
+)
+
+
+def _split_multimodal_content(content: str) -> str | list[dict[str, Any]]:
+    matches = list(_ATTACHED_IMAGE_RE.finditer(content))
+    if not matches:
+        return content
+    parts: list[dict[str, Any]] = []
+    for m in matches:
+        parts.append({"type": "image_url", "image_url": {"url": m.group(2)}})
+    cleaned = _ATTACHED_IMAGE_RE.sub("", content).strip()
+    if cleaned:
+        parts.append({"type": "text", "text": cleaned})
+    return parts
+
+
+def _sanitize_tool_pairing(messages: Sequence[Message]) -> list[Message]:
+    """Drop/repair tool messages and assistant tool calls that cannot pair."""
+    result_ids = {
+        m.tool_call_id
+        for m in messages
+        if m.role == "tool" and isinstance(m.tool_call_id, str) and m.tool_call_id
+    }
+    out: list[Message] = []
+    pending: dict[str, str] = {}
+    for msg in messages:
+        if msg.role == "assistant":
+            kept: list[ToolCall] = []
+            pending = {}
+            for index, tc in enumerate(msg.tool_calls):
+                call_id = tc.id or f"call_{len(out)}_{index}"
+                if result_ids and call_id not in result_ids:
+                    # Assistant asked for a tool whose result never arrived.
+                    continue
+                if not result_ids:
+                    # No tool results at all in this transcript: keep the call
+                    # only when this is the final assistant message.
+                    continue
+                kept.append(
+                    ToolCall(
+                        id=call_id,
+                        name=tc.name,
+                        arguments=tc.arguments,
+                        thought_signature=tc.thought_signature,
+                    )
+                )
+                pending[call_id] = tc.name
+            if kept or msg.content or msg.reasoning_content:
+                out.append(
+                    Message(
+                        role="assistant",
+                        content=msg.content,
+                        reasoning_content=msg.reasoning_content,
+                        tool_calls=tuple(kept),
+                    )
+                )
+            continue
+        if msg.role == "tool":
+            call_id = msg.tool_call_id
+            if call_id not in pending:
+                if call_id and call_id in result_ids:
+                    # Orphaned result from a dropped assistant call.
+                    continue
+                if not call_id and len(pending) == 1:
+                    call_id = next(iter(pending))
+                else:
+                    continue
+            out.append(
+                Message(
+                    role="tool",
+                    content=msg.content,
+                    tool_call_id=call_id,
+                    name=msg.name or pending.get(call_id or "", None),
+                )
+            )
+            pending.pop(call_id, None)
+            continue
+        out.append(msg)
+    return out
+
+
+def build_vibe_payload(
+    model: ModelSpec,
+    context: TranscriptContext,
+    options: StreamOptions,
+) -> dict[str, Any]:
+    messages: list[dict[str, Any]] = []
+    if context.system_prompt:
+        messages.append({"role": "system", "content": context.system_prompt})
+
+    for msg in _sanitize_tool_pairing(context.messages):
+        content: Any = _split_multimodal_content(msg.content) if msg.role == "user" else msg.content
+        entry: dict[str, Any] = {"role": msg.role, "content": content}
+        if msg.role == "assistant":
+            if msg.reasoning_content and model.reasoning and options.thinking_level != "off":
+                entry["reasoning_content"] = msg.reasoning_content
+            if msg.tool_calls:
+                entry["tool_calls"] = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": json.dumps(tc.arguments, sort_keys=True),
+                        },
+                    }
+                    for tc in msg.tool_calls
+                ]
+        elif msg.role == "tool":
+            if msg.tool_call_id:
+                entry["tool_call_id"] = msg.tool_call_id
+            if msg.name:
+                entry["name"] = msg.name
+        messages.append(entry)
+
+    payload: dict[str, Any] = {
+        "model": model.id,
+        "messages": messages,
+        "stream": True,
+        "max_tokens": options.max_tokens or model.max_tokens,
+        "parallel_tool_calls": True,
+    }
+    if options.temperature is not None:
+        payload["temperature"] = options.temperature
+    if context.tools:
+        payload["tools"] = [
+            {
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                },
+            }
+            for t in context.tools
+        ]
+    if model.reasoning:
+        mapped = resolve_reasoning_effort(model, options.thinking_level)
+        if mapped and mapped != "none":
+            payload["reasoning_effort"] = mapped
+    return payload
+
+
+def _merge_tool_id(current: str, incoming: str) -> str:
+    """Merge streamed tool-call ids without collapsing server ids to 9 chars."""
+    if not incoming:
+        return current
+    if not current:
+        return incoming
+    if incoming == current or incoming in current:
+        return current
+    if current in incoming:
+        return incoming
+    # Chunked ids normally only arrive once; if a provider repeats a prefix,
+    # keep the longer complete value rather than concatenating duplicates.
+    return incoming if len(incoming) >= len(current) else current
+
+
+class VibeProvider:
+    id: ProviderId = "vibe"
+    name: str = "Mistral Vibe"
+
+    def __init__(self, client: httpx.AsyncClient | None = None) -> None:
+        self._client = client
+
+    def list_models(self) -> Sequence[ModelSpec]:
+        return list_models("vibe")
+
+    def resolve_auth(self, explicit_key: str | None = None) -> AuthCredential:
+        return resolve_api_key("vibe")
+
+    async def _refresh_headers(self, force: bool = False) -> dict[str, str]:
+        cred = resolve_api_key("vibe", force_refresh=force)
+        return {
+            "Authorization": f"Bearer {cred.token}",
+            "Content-Type": "application/json",
+            "User-Agent": VIBE_USER_AGENT,
+            **cred.extra_headers,
+        }
+
+    async def stream(
+        self,
+        model: ModelSpec,
+        context: TranscriptContext,
+        options: StreamOptions | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        opts = options or StreamOptions()
+        cred = resolve_api_key("vibe")
+        headers = {
+            "Authorization": f"Bearer {cred.token}",
+            "Content-Type": "application/json",
+            "User-Agent": VIBE_USER_AGENT,
+            **cred.extra_headers,
+            **opts.extra_headers,
+        }
+        url = f"{model.base_url.rstrip('/')}/chat/completions"
+        payload = build_vibe_payload(model, context, opts)
+
+        text_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tool_buffers: dict[int, dict[str, str]] = {}
+        stop_reason: str | None = None
+        usage = Usage()
+
+        async def _on_unauthorized() -> dict[str, str] | None:
+            refreshed = await self._refresh_headers(force=True)
+            return {**refreshed, **opts.extra_headers}
+
+        async for chunk in stream_sse_json(
+            url,
+            headers=headers,
+            payload=payload,
+            timeout_s=opts.timeout_s,
+            client=self._client,
+            on_unauthorized=_on_unauthorized,
+            first_output_timeout_s=FIRST_OUTPUT_WAIT_SECONDS,
+            idle_timeout_s=STREAM_IDLE_SECONDS,
+            # Rust lazybug-agent is the single retry owner so retries are counted & logged once.
+            max_retry_elapsed_s=0.0,
+            provider="vibe",
+            model=model.id,
+        ):
+            if raw_usage := chunk.get("usage"):
+                in_tok = int(raw_usage.get("prompt_tokens", 0))
+                out_tok = int(raw_usage.get("completion_tokens", 0))
+                cache_read = int(raw_usage.get("prompt_tokens_details", {}).get("cached_tokens", 0) or 0)
+                cache_write = int(
+                    raw_usage.get("cache_creation_input_tokens")
+                    or raw_usage.get("prompt_tokens_details", {}).get("cache_write_tokens", 0)
+                    or 0
+                )
+                reasoning_tok = int(
+                    (raw_usage.get("completion_tokens_details") or {}).get("reasoning_tokens", 0)
+                    or 0
+                )
+                uncached_in = max(0, in_tok - cache_read)
+                usage = Usage(
+                    input_tokens=uncached_in,
+                    output_tokens=out_tok,
+                    cache_read_tokens=cache_read,
+                    cache_write_tokens=cache_write,
+                    reasoning_tokens=reasoning_tok,
+                    cost_usd=calculate_cost_usd(
+                        input_tokens=uncached_in,
+                        output_tokens=out_tok,
+                        cache_read_tokens=cache_read,
+                        input_per_m=model.cost.input,
+                        output_per_m=model.cost.output,
+                        cache_read_per_m=model.cost.cache_read,
+                    ),
+                )
+
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            choice = choices[0]
+            if finish := choice.get("finish_reason"):
+                stop_reason = str(finish)
+            delta = choice.get("delta") or {}
+
+            if reasoning := delta.get("reasoning_content"):
+                if isinstance(reasoning, str) and reasoning:
+                    reasoning_parts.append(reasoning)
+                    yield StreamEvent(type="thinking_delta", delta=reasoning)
+
+            content = delta.get("content")
+            if isinstance(content, str) and content:
+                text_parts.append(content)
+                yield StreamEvent(type="text_delta", delta=content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict):
+                        if block.get("type") == "thinking" and (thinking := block.get("thinking")):
+                            for t_part in thinking:
+                                if isinstance(t_part, dict) and (txt := t_part.get("text")):
+                                    reasoning_parts.append(txt)
+                                    yield StreamEvent(type="thinking_delta", delta=txt)
+                        elif block.get("type") == "text" and (txt := block.get("text")):
+                            text_parts.append(txt)
+                            yield StreamEvent(type="text_delta", delta=txt)
+
+            for tc in delta.get("tool_calls") or []:
+                idx = int(tc.get("index", 0))
+                buf = tool_buffers.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                if tc_id := tc.get("id"):
+                    buf["id"] = _merge_tool_id(buf["id"], str(tc_id))
+                fn = tc.get("function") or {}
+                if fn_name := fn.get("name"):
+                    buf["name"] += fn_name
+                if fn_args := fn.get("arguments"):
+                    buf["arguments"] += fn_args
+
+        if stop_reason == "error":
+            raise IncompleteProviderStream("Vibe stream finished with finish_reason=error")
+        if stop_reason is None:
+            raise IncompleteProviderStream("Vibe stream ended without a finish_reason")
+
+        tool_calls: list[ToolCall] = []
+        for idx in sorted(tool_buffers):
+            buf = tool_buffers[idx]
+            raw_args = buf["arguments"].strip()
+            if raw_args:
+                try:
+                    parsed_args = json.loads(raw_args)
+                    if not isinstance(parsed_args, dict):
+                        parsed_args = {"value": parsed_args}
+                except json.JSONDecodeError:
+                    parsed_args = {"_raw_arguments": raw_args}
+            else:
+                parsed_args = {}
+            call = ToolCall(id=buf["id"] or f"call_{idx}", name=buf["name"], arguments=parsed_args)
+            tool_calls.append(call)
+            yield StreamEvent(type="tool_call", tool_call=call)
+
+        message = AssistantMessage(
+            provider="vibe",
+            model=model.id,
+            content="".join(text_parts),
+            reasoning_content="".join(reasoning_parts) if reasoning_parts else None,
+            tool_calls=tuple(tool_calls),
+            stop_reason=stop_reason,
+            usage=usage,
+        )
+        yield StreamEvent(type="done", message=message)
+
+    async def complete(
+        self,
+        model: ModelSpec,
+        context: TranscriptContext,
+        options: StreamOptions | None = None,
+    ) -> AssistantMessage:
+        final: AssistantMessage | None = None
+        async for event in self.stream(model, context, options):
+            if event.type == "done" and event.message is not None:
+                final = event.message
+        if final is None:
+            raise RuntimeError("Vibe stream ended without a final message")
+        return final

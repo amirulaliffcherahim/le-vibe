@@ -1,6 +1,6 @@
 # MCP & Native Rust Tools
 
-## Native Tools (`crates/le-vibe-tools/src/lib.rs`)
+## Native Tools (`crates/lazybug-tools/src/lib.rs`)
 
 | Tool | Capabilities |
 |------|--------------|
@@ -14,8 +14,8 @@
 | `todo` | In-session multi-step task store (`create`, `update`, `list`, `get`, `delete`, `clear`) synced to TUI Todo strip |
 | `ask_user_question` | Interactive modal for 1–4 structured questions |
 
-## Stdio MCP (`crates/le-vibe-mcp/src/lib.rs`)
+## Stdio MCP (`crates/lazybug-mcp/src/lib.rs`)
 
-`McpManager` loads `~/.le-vibe/mcp.json` and `<cwd>/.le-vibe/mcp.json` (`{"mcpServers": {...}}`), spawns each server over stdio JSON-RPC 2.0, exposes tools namespaced as `mcp__<server>__<tool>`, and gates execution through `PolicyPort`.
+`McpManager` loads `~/.lazybug/mcp.json` and `<cwd>/.lazybug/mcp.json` (`{"mcpServers": {...}}`), spawns each server over stdio JSON-RPC 2.0, exposes tools namespaced as `mcp__<server>__<tool>`, and gates execution through `PolicyPort`.
 
-Inspect connected servers with `/mcp` in TUI or `le-vibe mcp list` from the CLI.
+Inspect connected servers with `/mcp` in TUI or `lazybug mcp list` from the CLI.

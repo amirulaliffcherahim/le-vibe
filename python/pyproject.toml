@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "le-vibe"
-version = "0.1.0b1"
-description = "Unified Python provider (Vibe + DeepSeek + Antigravity), policy, and extension runtime for le-vibe"
+name = "lazybug"
+version = "0.1.0"
+description = "Unified Python provider (Vibe + DeepSeek + Antigravity), policy, and extension runtime for lazybug"
 authors = [{ name = "Amirul Aliff" }]
 requires-python = ">=3.12"
 dependencies = [

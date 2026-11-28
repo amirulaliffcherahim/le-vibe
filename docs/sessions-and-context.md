@@ -1,8 +1,8 @@
 # Sessions, Context & Handover
 
-## Storage & DAG Format (`crates/le-vibe-durable/src/lib.rs`)
+## Storage & DAG Format (`crates/lazybug-durable/src/lib.rs`)
 
-Sessions are stored per-project under `~/.le-vibe/sessions/<cwd-slug>/session-<ts>.jsonl`.
+Sessions are stored per-project under `~/.lazybug/sessions/<cwd-slug>/session-<ts>.jsonl`.
 Each line is a `SessionEntry` with `id`, `parent_id`, `kind`, `role`, `content`, and optional `timestamp`, `tool_call_id`, `tool_name`:
 
 - `message` — user or assistant text
@@ -18,15 +18,15 @@ Each line is a `SessionEntry` with `id`, `parent_id`, `kind`, `role`, `content`,
 
 - **Tool-result cap**: `cap_tool_output` caps any single tool output pushed into the LLM message array at 24KB (16KB head + 6KB tail).
 - **`/compact [instructions]`**: calls the active model to summarize the active branch into a `compaction_summary` entry.
-- **Auto-compaction**: run by `le-vibe-agent` **before** a request when the last prompt used more
+- **Auto-compaction**: run by `lazybug-agent` **before** a request when the last prompt used more
   than `context_window - reserve_tokens` (default reserve `16_384`). There is no percentage knob: the
   `auto_compact` setting just passes `context_window: 0` to disable it.
 - **`/context`**: displays estimated token breakdown (system + `AGENTS.md` + `<skills>`, active branch messages, and utilization %).
 
-### Context Lifecycle (`le-vibe-agent`) — live
+### Context Lifecycle (`lazybug-agent`) — live
 
 All three triggers live in the agent loop; the CLI only forwards `context_window` and renders the
-`AgentEvent::Compaction` it receives. Covered by `crates/le-vibe-agent/tests/context_lifecycle.rs`
+`AgentEvent::Compaction` it receives. Covered by `crates/lazybug-agent/tests/context_lifecycle.rs`
 (pure rules) and `tests/compaction_loop.rs` (loop behaviour, with a scripted provider).
 
 - **Threshold** (`compact::should_compact`) — pi's rule is a **token reserve**, not a percentage:
@@ -54,7 +54,7 @@ All three triggers live in the agent loop; the CLI only forwards `context_window
 
 ### Session tree, labels, and branching (Sessions P0–P1)
 
-All DAG/tree/label logic lives in `le-vibe-durable`; the CLI only renders rows.
+All DAG/tree/label logic lives in `lazybug-durable`; the CLI only renders rows.
 
 | API | Behaviour |
 | --- | --- |
@@ -78,7 +78,7 @@ conflating the two sent an empty transcript to the summarizer.
 - **Summarizer** (`compact::summarize`) — moved out of the CLI so it shares one retry policy with
   normal turns; `/compact`, `/handover`, and bug-report generation all call it.
 
-### Retry Policy (`le-vibe-agent`)
+### Retry Policy (`lazybug-agent`)
 
 One schedule for both retry paths: `retry_delay_ms(base, max, attempt) = min(base * 2^(attempt-1), max)`
 with pi's defaults `base = 2000ms`, `max = 60000ms`, `max_retries = 3`. A provider `Retry-After`

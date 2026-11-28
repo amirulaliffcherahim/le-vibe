@@ -1,0 +1,24 @@
+[package]
+name = "lazybug-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "lazybug"
+path = "src/main.rs"
+
+[features]
+default = ["dev-debug"]
+dev-debug = []
+
+[dependencies]
+lazybug-agent = { path = "../lazybug-agent" }
+lazybug-durable = { path = "../lazybug-durable" }
+lazybug-mcp = { path = "../lazybug-mcp" }
+lazybug-pybridge = { path = "../lazybug-pybridge" }
+lazybug-telemetry = { path = "../lazybug-telemetry" }
+lazybug-tools = { path = "../lazybug-tools" }
+lazybug-tui = { path = "../lazybug-tui" }
+serde = { workspace = true }
+serde_json = { workspace = true }

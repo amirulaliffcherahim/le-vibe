@@ -1,6 +1,6 @@
 # Agent cost and output quality
 
-What actually separates a cheap agent run from an expensive one, and what le-vibe does about it.
+What actually separates a cheap agent run from an expensive one, and what lazybug does about it.
 Numbers are from third-party measurements (Nov 2026) plus first-party measurement of this repo.
 
 ## The three cost drivers
@@ -31,9 +31,9 @@ The consistent conclusion across all of them: **harness choice moves cost 2-4x a
 few points; model choice moves accuracy far more.** Optimise the harness for cost, choose the
 model for quality.
 
-## le-vibe's position
+## lazybug's position
 
-Measured on this repo (`cargo test -p le-vibe-tui --test prompt_size_probe`):
+Measured on this repo (`cargo test -p lazybug-tui --test prompt_size_probe`):
 
 | Component | Size | Sent |
 | --- | --- | --- |
@@ -42,7 +42,7 @@ Measured on this repo (`cargo test -p le-vibe-tui --test prompt_size_probe`):
 | Tool schemas, 20 tools | 6,238 bytes (~1,560 tok) | every call |
 | **Fixed prefix** | **~2,800 tok** | **every call** |
 
-Reference points: pi ~1,474 tok, Claude Code ~1,161 tok. le-vibe's prefix is larger mainly because
+Reference points: pi ~1,474 tok, Claude Code ~1,161 tok. lazybug's prefix is larger mainly because
 it carries 20 builtins where stock pi carries 4. That is a deliberate quality trade — memory,
 subagents, codemode, skills and web tools live in the same request.
 
@@ -53,14 +53,14 @@ The honest conclusion is not "fewer features" — it is *pay only for the tools 
 
 Three levers exist, cheapest to most invasive:
 
-1. **`tools` setting** — pin the exposed set in `~/.le-vibe/settings.json`, as an array or a comma
+1. **`tools` setting** — pin the exposed set in `~/.lazybug/settings.json`, as an array or a comma
    string: `"tools": ["read", "write", "edit", "grep", "ls", "bash", "powershell"]`.
    That drops ~2,400 B (~600 tok) per call versus all 20. `--tools a,b,c` overrides it for one run.
 2. **Mode defaults** — `plan`/`ask` send 11, `rea` 14, `normal`/`cyber` all registered tools.
 3. **`codemode`** — batch many tool calls into one Python script: one turn instead of N, and the
    sub-tools' schemas do not have to be in the request at all.
 
-## What le-vibe does to keep cost down
+## What lazybug does to keep cost down
 
 - **Small static prompt, volatile blocks last.** Prefix-stable ordering so KV/prefix caches hit;
   `prompt_contract.rs` asserts this and fails the build if the stable core grows.
@@ -91,7 +91,7 @@ Tokens per solved task for one session:
 
 ```python
 import json, pathlib, sys
-path = pathlib.Path(sys.argv[1])          # or a glob over ~/.le-vibe/sessions/**/*.jsonl
+path = pathlib.Path(sys.argv[1])          # or a glob over ~/.lazybug/sessions/**/*.jsonl
 inp = cache = out = turns = 0
 for line in path.read_text(encoding="utf-8").splitlines():
     e = json.loads(line)
@@ -109,7 +109,7 @@ Compare like with like: same model, same tasks, same 3 runs, one proxy counting 
 A number from a single self-selected task is not a benchmark — the published spread between
 different task sets is larger than the spread between harnesses.
 
-## Rules of thumb when adding to le-vibe
+## Rules of thumb when adding to lazybug
 
 - A new tool costs its schema on **every** call of **every** session. Budget ~300 tok; keep the
   description to the non-obvious contract and let the parameter schema carry the rest.

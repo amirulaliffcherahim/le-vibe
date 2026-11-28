@@ -305,8 +305,8 @@ wheels = [
 ]
 
 [[package]]
-name = "le-vibe"
-version = "0.1.0b1"
+name = "lazybug"
+version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },

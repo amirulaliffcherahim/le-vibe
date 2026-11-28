@@ -1,11 +1,11 @@
 ---
 name: skill-creator
-description: Create or refine a reusable le-vibe skill (on-demand workflow loaded via load_skill) with clean structure, low token footprint, and verification steps.
+description: Create or refine a reusable lazybug skill (on-demand workflow loaded via load_skill) with clean structure, low token footprint, and verification steps.
 ---
 
 # Skill Creator
 
-Build a focused, reusable `le-vibe` skill that stays zero-cost until loaded via `load_skill`.
+Build a focused, reusable `lazybug` skill that stays zero-cost until loaded via `load_skill`.
 
 ## 1. Confirm the Right Extension Axis
 Choose the right layer before writing files:
@@ -15,9 +15,9 @@ Choose the right layer before writing files:
 
 ## 2. Choose Storage Location
 Ask once only if scope is ambiguous; otherwise default to project scope inside a git repo:
-- **Project (le-vibe only):** `.le-vibe/skill/<name>/SKILL.md` (or flat `.le-vibe/skill/<name>.md`)
+- **Project (lazybug only):** `.lazybug/skill/<name>/SKILL.md` (or flat `.lazybug/skill/<name>.md`)
 - **Project (cross-agent):** `.agents/skill/<name>/SKILL.md`
-- **Global (all repos):** `~/.le-vibe/skill/<name>/SKILL.md` (or `~/.agents/skill/<name>/SKILL.md`)
+- **Global (all repos):** `~/.lazybug/skill/<name>/SKILL.md` (or `~/.agents/skill/<name>/SKILL.md`)
 
 Use lowercase kebab-case for `<name>` (e.g., `pr-review`, `db-migration`, `release-check`).
 

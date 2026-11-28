@@ -5,7 +5,7 @@ import json
 import pytest
 import httpx
 
-from le_vibe.providers import (
+from lazybug.providers import (
     Message,
     MissingAPIKeyError,
     StreamOptions,
@@ -21,9 +21,9 @@ from le_vibe.providers import (
     list_providers,
     resolve_api_key,
 )
-from le_vibe.providers.agy import AgyProvider
-from le_vibe.providers.deepseek import DeepSeekProvider, build_deepseek_payload
-from le_vibe.providers.vibe import VibeProvider, build_vibe_payload
+from lazybug.providers.agy import AgyProvider
+from lazybug.providers.deepseek import DeepSeekProvider, build_deepseek_payload
+from lazybug.providers.vibe import VibeProvider, build_vibe_payload
 
 
 def test_only_vibe_deepseek_and_agy_providers_allowed() -> None:
@@ -44,7 +44,7 @@ def test_no_model_list_is_hardcoded() -> None:
 
 
 def _deepseek_test_model() -> "ModelSpec":
-    from le_vibe.providers.types import ModelCompat, ModelCost, ModelSpec
+    from lazybug.providers.types import ModelCompat, ModelCost, ModelSpec
 
     return ModelSpec(
         id="deepseek-v4-pro",
@@ -65,7 +65,7 @@ def _deepseek_test_model() -> "ModelSpec":
 
 
 def _vibe_test_model() -> "ModelSpec":
-    from le_vibe.providers.types import ModelCompat, ModelCost, ModelSpec
+    from lazybug.providers.types import ModelCompat, ModelCost, ModelSpec
 
     return ModelSpec(
         id="mistral-medium-latest",
@@ -96,7 +96,7 @@ def test_auth_resolution() -> None:
 
 
 def test_saved_auth_file_persistence(tmp_path) -> None:
-    from le_vibe.providers import auth_status, delete_credential, save_api_key
+    from lazybug.providers import auth_status, delete_credential, save_api_key
 
     auth_file = tmp_path / "auth.json"
     save_api_key("deepseek", "sk-ds-saved", auth_file=auth_file)
@@ -116,7 +116,7 @@ def test_saved_auth_file_persistence(tmp_path) -> None:
 
 def test_oidc_token_persistence(tmp_path) -> None:
     import time
-    from le_vibe.providers import save_oidc_tokens
+    from lazybug.providers import save_oidc_tokens
 
     auth_file = tmp_path / "auth.json"
     save_oidc_tokens(
@@ -197,10 +197,10 @@ async def test_deepseek_stream_and_complete_with_mock_sse() -> None:
 @pytest.mark.asyncio
 async def test_vibe_stream_with_mock_sse(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import time
-    from le_vibe.providers import save_oidc_tokens
+    from lazybug.providers import save_oidc_tokens
 
     auth_file = tmp_path / "auth.json"
-    monkeypatch.setenv("LE_VIBE_AUTH_FILE", str(auth_file))
+    monkeypatch.setenv("LAZYBUG_AUTH_FILE", str(auth_file))
     save_oidc_tokens(
         "vibe",
         access_token="vibe-access",
@@ -236,10 +236,10 @@ async def test_vibe_stream_with_mock_sse(tmp_path: Path, monkeypatch: pytest.Mon
 @pytest.mark.asyncio
 async def test_agy_stream_with_mock_sse(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import time
-    from le_vibe.providers import save_oidc_tokens
+    from lazybug.providers import save_oidc_tokens
 
     auth_file = tmp_path / "auth.json"
-    monkeypatch.setenv("LE_VIBE_AUTH_FILE", str(auth_file))
+    monkeypatch.setenv("LAZYBUG_AUTH_FILE", str(auth_file))
     save_oidc_tokens(
         "agy",
         access_token="ya29.test-token",
@@ -272,7 +272,7 @@ async def test_agy_stream_with_mock_sse(tmp_path: Path, monkeypatch: pytest.Monk
 
 
 def test_agy_thinking_variants_collapse_into_base_models() -> None:
-    from le_vibe.providers.catalog import _agy_group_models
+    from lazybug.providers.catalog import _agy_group_models
 
     raw = {
         "gemini-3.8-flash-low": {"displayName": "Gemini 3.8 Flash (Low)", "supportsThinking": True},
@@ -295,7 +295,7 @@ def test_agy_thinking_variants_collapse_into_base_models() -> None:
 
 
 def _grouped_flash_model():
-    from le_vibe.providers.catalog import _agy_group_models
+    from lazybug.providers.catalog import _agy_group_models
 
     raw = {
         "gemini-3.8-flash-low": {"displayName": "Gemini 3.8 Flash (Low)"},
@@ -308,7 +308,7 @@ def _grouped_flash_model():
 
 
 def test_agy_payload_routes_the_thinking_level() -> None:
-    from le_vibe.providers.agy import build_agy_payload
+    from lazybug.providers.agy import build_agy_payload
 
     model = _grouped_flash_model()
     ctx = TranscriptContext(messages=[Message(role="user", content="hi")])
@@ -323,7 +323,7 @@ def test_agy_payload_routes_the_thinking_level() -> None:
 
 
 def test_default_model_id_prefers_what_the_provider_recommends() -> None:
-    from le_vibe.providers import catalog, default_model_id
+    from lazybug.providers import catalog, default_model_id
 
     catalog._DYNAMIC_MODELS["agy"] = (
         _mini_spec("agy", "gemini-old", recommended=False),
@@ -337,7 +337,7 @@ def test_default_model_id_prefers_what_the_provider_recommends() -> None:
 
 
 def _mini_spec(provider: str, model_id: str, *, recommended: bool = False):
-    from le_vibe.providers.types import ModelSpec
+    from lazybug.providers.types import ModelSpec
 
     return ModelSpec(
         id=model_id,
@@ -349,7 +349,7 @@ def _mini_spec(provider: str, model_id: str, *, recommended: bool = False):
 
 
 def test_distinct_base_ids_are_kept_even_when_display_names_collide() -> None:
-    from le_vibe.providers.catalog import _agy_group_models
+    from lazybug.providers.catalog import _agy_group_models
 
     raw = {
         "gemini-2.5-flash": {"displayName": "Gemini 3.5 Flash Lite"},
@@ -363,7 +363,7 @@ def test_distinct_base_ids_are_kept_even_when_display_names_collide() -> None:
 
 
 def test_ids_without_a_display_name_are_humanized() -> None:
-    from le_vibe.providers.catalog import _agy_group_models
+    from lazybug.providers.catalog import _agy_group_models
 
     models = _agy_group_models(
         {"gemini-4-hydrogen-sonar": {}, "gemini-4-neon-lite": {}},
@@ -375,7 +375,7 @@ def test_ids_without_a_display_name_are_humanized() -> None:
 
 
 def test_agy_auto_discovers_future_model_families_without_allowlist() -> None:
-    from le_vibe.providers.catalog import _agy_group_models
+    from lazybug.providers.catalog import _agy_group_models
 
     raw = {
         "helium-1-pro-low": {"displayName": "Helium 1 Pro (Low)", "supportsThinking": True},
@@ -395,8 +395,8 @@ def test_agy_auto_discovers_future_model_families_without_allowlist() -> None:
 
 
 def test_agy_keeps_stable_session_and_trajectory_ids_across_turns() -> None:
-    from le_vibe.providers.agy import build_agy_payload
-    from le_vibe.providers.types import Message, ModelSpec, StreamOptions, TranscriptContext
+    from lazybug.providers.agy import build_agy_payload
+    from lazybug.providers.types import Message, ModelSpec, StreamOptions, TranscriptContext
 
     model = ModelSpec(
         id="gemini-4-neon",
@@ -426,7 +426,7 @@ def test_agy_keeps_stable_session_and_trajectory_ids_across_turns() -> None:
 def test_catalog_reports_freshness_and_can_skip_a_fresh_refresh() -> None:
     import asyncio
 
-    from le_vibe.providers import catalog
+    from lazybug.providers import catalog
 
     catalog._LAST_REFRESH = 0.0
     assert catalog.catalog_age_seconds() is None
@@ -441,7 +441,7 @@ def test_catalog_reports_freshness_and_can_skip_a_fresh_refresh() -> None:
 
 
 def test_exhausted_models_carry_the_flag() -> None:
-    from le_vibe.providers.catalog import _agy_group_models
+    from lazybug.providers.catalog import _agy_group_models
 
     raw = {
         "gemini-4-argon-high": {
@@ -458,7 +458,7 @@ def test_exhausted_models_carry_the_flag() -> None:
 
 
 def test_each_model_keeps_the_endpoint_that_advertised_it() -> None:
-    from le_vibe.providers.catalog import _agy_group_models
+    from lazybug.providers.catalog import _agy_group_models
 
     raw = {"gemini-3.8-flash-high": {}, "claude-opus-5-5-high": {}}
     models = _agy_group_models(
@@ -475,8 +475,8 @@ def test_each_model_keeps_the_endpoint_that_advertised_it() -> None:
 
 
 def test_default_thinking_prefers_medium_or_high_when_no_medium() -> None:
-    from le_vibe.providers import default_thinking_for_model
-    from le_vibe.providers.types import ModelSpec
+    from lazybug.providers import default_thinking_for_model
+    from lazybug.providers.types import ModelSpec
 
     with_med = ModelSpec(
         id="m1",
@@ -502,7 +502,7 @@ def test_default_thinking_prefers_medium_or_high_when_no_medium() -> None:
 def test_vibe_account_context_uses_the_console_gateway_and_stays_advisory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from le_vibe.providers import auth
+    from lazybug.providers import auth
 
     seen: list[str] = []
 
@@ -530,7 +530,7 @@ def test_vibe_account_context_uses_the_console_gateway_and_stays_advisory(
 
 
 def test_agy_oauth_oob_detection_and_code_extraction() -> None:
-    from le_vibe.providers.auth import _extract_agy_auth_code, _should_use_agy_oob_auth
+    from lazybug.providers.auth import _extract_agy_auth_code, _should_use_agy_oob_auth
 
     assert _should_use_agy_oob_auth({}) is False
     assert _should_use_agy_oob_auth({"SSH_CONNECTION": "1.2.3.4 1234 5.6.7.8 22"}) is True
@@ -562,7 +562,7 @@ def test_agy_oauth_loopback_login_uses_ephemeral_port_and_redirects(
 ) -> None:
     import threading
     from urllib.parse import parse_qs, urlsplit
-    from le_vibe.providers import auth
+    from lazybug.providers import auth
 
     auth_file = tmp_path / "auth.json"
     monkeypatch.setenv("AGY_OAUTH_CLIENT_ID", "test-cid")
@@ -656,7 +656,7 @@ def test_agy_oauth_loopback_login_uses_ephemeral_port_and_redirects(
 def test_agy_refresh_evicts_on_invalid_grant_and_keeps_on_network_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from le_vibe.providers import auth, save_oidc_tokens
+    from lazybug.providers import auth, save_oidc_tokens
 
     auth_file = tmp_path / "auth.json"
     monkeypatch.setenv("AGY_OAUTH_CLIENT_ID", "test-cid")
@@ -721,11 +721,11 @@ def test_vibe_dead_grant_is_reported_as_a_relogin_not_an_http_code(
 ) -> None:
     """A revoked/expired refresh token used to surface as `HTTP 400`, with no hint of the fix."""
     import time
-    from le_vibe.providers import auth, save_oidc_tokens
-    from le_vibe.providers.auth import MissingAPIKeyError
+    from lazybug.providers import auth, save_oidc_tokens
+    from lazybug.providers.auth import MissingAPIKeyError
 
     auth_file = tmp_path / "auth.json"
-    monkeypatch.setenv("LE_VIBE_AUTH_FILE", str(auth_file))
+    monkeypatch.setenv("LAZYBUG_AUTH_FILE", str(auth_file))
     auth._JUST_REFRESHED.pop("vibe", None)
     save_oidc_tokens(
         "vibe",
@@ -757,7 +757,7 @@ def test_vibe_dead_grant_is_reported_as_a_relogin_not_an_http_code(
 
     monkeypatch.setattr(auth.httpx, "Client", _Revoked)
 
-    with pytest.raises(MissingAPIKeyError, match="le-vibe login --provider vibe"):
+    with pytest.raises(MissingAPIKeyError, match="lazybug login --provider vibe"):
         auth.resolve_api_key("vibe", env={}, auth_file=auth_file)
     # Reported, not evicted: the keyring slot is shared with mistral-vibe.
     assert json.loads(auth_file.read_text(encoding="utf-8"))["vibe"]["refresh_token"] == "rt-dead"
@@ -770,10 +770,10 @@ async def test_agy_synthesized_tool_call_ids_are_unique_across_turns(
     """A per-response counter restarted at 1 every turn, so long sessions ended up with
     dozens of tool results sharing `agy_call_1` and id-based pairing became ambiguous."""
     import time
-    from le_vibe.providers import save_oidc_tokens
+    from lazybug.providers import save_oidc_tokens
 
     auth_file = tmp_path / "auth.json"
-    monkeypatch.setenv("LE_VIBE_AUTH_FILE", str(auth_file))
+    monkeypatch.setenv("LAZYBUG_AUTH_FILE", str(auth_file))
     save_oidc_tokens(
         "agy",
         access_token="ya29.tok",
@@ -806,11 +806,11 @@ async def test_agy_claude_tool_call_id_roundtrips_and_headers_match_reference(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import time
-    from le_vibe.providers import save_oidc_tokens
-    from le_vibe.providers.types import ModelSpec
+    from lazybug.providers import save_oidc_tokens
+    from lazybug.providers.types import ModelSpec
 
     auth_file = tmp_path / "auth.json"
-    monkeypatch.setenv("LE_VIBE_AUTH_FILE", str(auth_file))
+    monkeypatch.setenv("LAZYBUG_AUTH_FILE", str(auth_file))
     save_oidc_tokens(
         "agy",
         access_token="ya29.tok",
@@ -844,10 +844,10 @@ async def test_agy_claude_tool_call_id_roundtrips_and_headers_match_reference(
 
     assert len(msg.tool_calls) == 1
     assert msg.tool_calls[0].id == "toolu_vrtx_01ABC"
-    # Consumer requests must not send X-Goog-User-Project or X-Le-Vibe headers.
+    # Consumer requests must not send X-Goog-User-Project or X-Lazybug headers.
     lower_keys = [k.lower() for k in seen_headers[0]]
     assert "x-goog-user-project" not in lower_keys
-    assert not any(k.startswith("x-le-vibe") for k in lower_keys)
+    assert not any(k.startswith("x-lazybug") for k in lower_keys)
     assert lower_keys.index("user-agent") < lower_keys.index("authorization") < lower_keys.index("content-type")
 
 
@@ -856,10 +856,10 @@ async def test_agy_401_triggers_single_refresh_and_replay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import time
-    from le_vibe.providers import auth, save_oidc_tokens
+    from lazybug.providers import auth, save_oidc_tokens
 
     auth_file = tmp_path / "auth.json"
-    monkeypatch.setenv("LE_VIBE_AUTH_FILE", str(auth_file))
+    monkeypatch.setenv("LAZYBUG_AUTH_FILE", str(auth_file))
     auth._JUST_REFRESHED.pop("agy", None)
     save_oidc_tokens(
         "agy",
@@ -916,7 +916,7 @@ async def test_agy_401_triggers_single_refresh_and_replay(
 
 
 def test_retry_info_body_delay_honored_over_retry_after_header() -> None:
-    from le_vibe.providers.transport import resolve_retry_delay_seconds
+    from lazybug.providers.transport import resolve_retry_delay_seconds
 
     body = json.dumps(
         {
@@ -975,11 +975,11 @@ async def test_vibe_truncated_or_error_finish_reason_raises_incomplete(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import time
-    from le_vibe.providers import save_oidc_tokens
-    from le_vibe.providers.transport import IncompleteProviderStream
+    from lazybug.providers import save_oidc_tokens
+    from lazybug.providers.transport import IncompleteProviderStream
 
     auth_file = tmp_path / "auth.json"
-    monkeypatch.setenv("LE_VIBE_AUTH_FILE", str(auth_file))
+    monkeypatch.setenv("LAZYBUG_AUTH_FILE", str(auth_file))
     save_oidc_tokens(
         "vibe",
         access_token="vibe-access",
@@ -1006,10 +1006,10 @@ async def test_vibe_truncated_or_error_finish_reason_raises_incomplete(
 def test_agy_refresh_missing_oauth_client_raises_instead_of_returning_expired(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from le_vibe.providers import auth, save_oidc_tokens
+    from lazybug.providers import auth, save_oidc_tokens
 
     auth_file = tmp_path / "auth.json"
-    monkeypatch.setenv("LE_VIBE_AUTH_FILE", str(auth_file))
+    monkeypatch.setenv("LAZYBUG_AUTH_FILE", str(auth_file))
     monkeypatch.delenv("AGY_OAUTH_CLIENT_ID", raising=False)
     monkeypatch.delenv("AGY_OAUTH_CLIENT_SECRET", raising=False)
     monkeypatch.setattr(auth, "AGY_DEFAULT_CLIENT_ID", "")
@@ -1033,14 +1033,14 @@ def test_agy_refresh_missing_oauth_client_raises_instead_of_returning_expired(
 def test_agy_oauth_client_discovery_from_binary_caches_to_json(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from le_vibe.providers import auth
+    from lazybug.providers import auth
 
     fake_cid = "123456789012-abcdefghijklmnopqrstuvwx.apps.googleusercontent.com"
     fake_csec = "GOCSPX" + "-" + ("A" * 28)
     fake_bin = tmp_path / "agy"
     fake_bin.write_bytes(b"ELF\x00" + fake_cid.encode() + b"\x00" + fake_csec.encode() + b"\x00")
 
-    monkeypatch.delenv("LE_VIBE_AUTH_FILE", raising=False)
+    monkeypatch.delenv("LAZYBUG_AUTH_FILE", raising=False)
     monkeypatch.delenv("AGY_OAUTH_CLIENT_ID", raising=False)
     monkeypatch.delenv("AGY_OAUTH_CLIENT_SECRET", raising=False)
     monkeypatch.setattr(auth, "AGY_DEFAULT_CLIENT_ID", "")
@@ -1059,14 +1059,14 @@ def test_stub_in_the_shared_keyring_slot_does_not_force_a_relogin(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The shared `ai.mistral.vibe.oidc` slot held a 15-char access token; because the official
-    entry is tried first and wins, a perfectly good credential in le-vibe's own auth store was
+    entry is tried first and wins, a perfectly good credential in lazybug's own auth store was
     never reached and every run demanded a fresh login."""
     import time
-    from le_vibe.providers import auth, save_oidc_tokens
+    from lazybug.providers import auth, save_oidc_tokens
 
     auth_file = tmp_path / "auth.json"
-    monkeypatch.setenv("LE_VIBE_AUTH_FILE", str(auth_file))
-    monkeypatch.delenv("LE_VIBE_AUTH_FILE", raising=False)  # exercise the official-first path
+    monkeypatch.setenv("LAZYBUG_AUTH_FILE", str(auth_file))
+    monkeypatch.delenv("LAZYBUG_AUTH_FILE", raising=False)  # exercise the official-first path
     monkeypatch.setattr(
         auth,
         "_keyring_get",
@@ -1100,7 +1100,7 @@ def test_stub_in_the_shared_keyring_slot_does_not_force_a_relogin(
 
 
 def test_a_stub_bundle_is_never_written_back(monkeypatch: pytest.MonkeyPatch) -> None:
-    from le_vibe.providers import auth
+    from lazybug.providers import auth
 
     written: list[str] = []
     monkeypatch.setattr(auth, "_keyring_set", lambda service, entry, value: written.append(value))
@@ -1123,13 +1123,13 @@ def test_a_stub_bundle_is_never_written_back(monkeypatch: pytest.MonkeyPatch) ->
 def test_other_clis_credential_stores_are_untouched_by_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """le-vibe signs in as itself: no reading and no writing of the shared slots, so an actual
+    """lazybug signs in as itself: no reading and no writing of the shared slots, so an actual
     `mistral-vibe` / `agy-cli` sign-in is neither borrowed nor rotated."""
     import time
-    from le_vibe.providers import auth
+    from lazybug.providers import auth
 
-    monkeypatch.delenv("LE_VIBE_SHARE_CLI_CREDENTIALS", raising=False)
-    monkeypatch.delenv("LE_VIBE_AUTH_FILE", raising=False)
+    monkeypatch.delenv("LAZYBUG_SHARE_CLI_CREDENTIALS", raising=False)
+    monkeypatch.delenv("LAZYBUG_AUTH_FILE", raising=False)
     monkeypatch.setattr(auth, "default_auth_file", lambda: tmp_path / "auth.json")
 
     reads: list[str] = []
@@ -1164,13 +1164,13 @@ def test_other_clis_credential_stores_are_untouched_by_default(
 
 
 def test_sharing_is_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
-    from le_vibe.providers import auth
+    from lazybug.providers import auth
 
-    monkeypatch.setenv("LE_VIBE_SHARE_CLI_CREDENTIALS", "1")
+    monkeypatch.setenv("LAZYBUG_SHARE_CLI_CREDENTIALS", "1")
     assert auth.shared_cli_stores_enabled() is True
-    monkeypatch.setenv("LE_VIBE_SHARE_CLI_CREDENTIALS", "0")
+    monkeypatch.setenv("LAZYBUG_SHARE_CLI_CREDENTIALS", "0")
     assert auth.shared_cli_stores_enabled() is False
-    monkeypatch.delenv("LE_VIBE_SHARE_CLI_CREDENTIALS")
+    monkeypatch.delenv("LAZYBUG_SHARE_CLI_CREDENTIALS")
     assert auth.shared_cli_stores_enabled({}) is False
 
 
@@ -1218,8 +1218,8 @@ def test_sharing_is_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_vibe_per_model_reasoning_effort_clamping(
     model_id: str, requested: str, expected: str
 ) -> None:
-    from le_vibe.providers.catalog import resolve_reasoning_effort
-    from le_vibe.providers.types import ModelSpec
+    from lazybug.providers.catalog import resolve_reasoning_effort
+    from lazybug.providers.types import ModelSpec
 
     model = ModelSpec(
         id=model_id,
@@ -1244,10 +1244,10 @@ async def test_all_providers_report_uncached_input_tokens_separately_from_cache_
 ) -> None:
     """Every provider must report `input_tokens` as uncached input only (`max(0, total - cache_read)`)."""
     import time
-    from le_vibe.providers import save_oidc_tokens
+    from lazybug.providers import save_oidc_tokens
 
     auth_file = tmp_path / "auth.json"
-    monkeypatch.setenv("LE_VIBE_AUTH_FILE", str(auth_file))
+    monkeypatch.setenv("LAZYBUG_AUTH_FILE", str(auth_file))
     save_oidc_tokens(
         "vibe",
         access_token="vibe-access-token-long-enough",
@@ -1316,16 +1316,16 @@ async def test_all_providers_report_uncached_input_tokens_separately_from_cache_
 async def test_transport_fails_fast_on_503_and_429_in_one_http_attempt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Rust le-vibe-agent owns retries: Python transport must fail fast in 1 HTTP POST."""
+    """Rust lazybug-agent owns retries: Python transport must fail fast in 1 HTTP POST."""
     import time
-    from le_vibe.providers import save_oidc_tokens
-    from le_vibe.providers.transport import ProviderHTTPStatusError
+    from lazybug.providers import save_oidc_tokens
+    from lazybug.providers.transport import ProviderHTTPStatusError
 
     auth_file = tmp_path / "auth.json"
     wire_log = tmp_path / "wire-http.jsonl"
-    monkeypatch.setenv("LE_VIBE_AUTH_FILE", str(auth_file))
-    monkeypatch.setenv("LE_VIBE_WIRE_LOG", "1")
-    monkeypatch.setenv("LE_VIBE_WIRE_LOG_PATH", str(wire_log))
+    monkeypatch.setenv("LAZYBUG_AUTH_FILE", str(auth_file))
+    monkeypatch.setenv("LAZYBUG_WIRE_LOG", "1")
+    monkeypatch.setenv("LAZYBUG_WIRE_LOG_PATH", str(wire_log))
     save_oidc_tokens(
         "vibe",
         access_token="vibe-access-token-long-enough",
@@ -1382,10 +1382,10 @@ async def test_reasoning_tokens_accounted_without_double_counting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import time
-    from le_vibe.providers import save_oidc_tokens
+    from lazybug.providers import save_oidc_tokens
 
     auth_file = tmp_path / "auth.json"
-    monkeypatch.setenv("LE_VIBE_AUTH_FILE", str(auth_file))
+    monkeypatch.setenv("LAZYBUG_AUTH_FILE", str(auth_file))
     save_oidc_tokens(
         "vibe",
         access_token="vibe-access-token-long-enough",

@@ -915,6 +915,7 @@ fn run_interactive_tui(
                     output_tokens,
                     cache_read_tokens,
                     cache_write_tokens,
+                    reasoning_tokens,
                     cost_usd,
                     tps,
                     git_badges,
@@ -934,6 +935,7 @@ fn run_interactive_tui(
                     if context_tokens > 0 {
                         state.context_tokens = context_tokens;
                     }
+                    state.reasoning_tokens = state.reasoning_tokens.saturating_add(reasoning_tokens);
                     state.record_usage(
                         &provider,
                         input_tokens,

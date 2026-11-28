@@ -73,6 +73,7 @@ fn reply(text: &str, input_tokens: u64, output_tokens: u64, stop_reason: &str) -
             output_tokens,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            reasoning_tokens: 0,
             cost_usd: 0.0,
         },
     }

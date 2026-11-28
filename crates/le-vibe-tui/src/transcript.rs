@@ -1589,6 +1589,12 @@ pub(crate) fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     if state.output_tokens > 0 {
         stats.push((format!("↓ {}", format_tokens(state.output_tokens)), c_output));
     }
+    if state.reasoning_tokens > 0 {
+        stats.push((
+            format!("T {}", format_tokens(state.reasoning_tokens)),
+            c_output,
+        ));
+    }
     if state.cache_read_tokens > 0 {
         stats.push((
             format!("R {}", format_tokens(state.cache_read_tokens)),

@@ -54,7 +54,7 @@ pub struct ToolDefinition {
     pub parameters: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Usage {
     #[serde(default)]
     pub input_tokens: u64,
@@ -64,6 +64,8 @@ pub struct Usage {
     pub cache_read_tokens: u64,
     #[serde(default)]
     pub cache_write_tokens: u64,
+    #[serde(default)]
+    pub reasoning_tokens: u64,
     #[serde(default)]
     pub cost_usd: f64,
 }

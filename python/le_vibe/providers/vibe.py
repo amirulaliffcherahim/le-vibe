@@ -133,7 +133,10 @@ def build_vibe_payload(
                     {
                         "id": tc.id,
                         "type": "function",
-                        "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)},
+                        "function": {
+                            "name": tc.name,
+                            "arguments": json.dumps(tc.arguments, sort_keys=True),
+                        },
                     }
                     for tc in msg.tool_calls
                 ]
@@ -246,7 +249,10 @@ class VibeProvider:
             on_unauthorized=_on_unauthorized,
             first_output_timeout_s=FIRST_OUTPUT_WAIT_SECONDS,
             idle_timeout_s=STREAM_IDLE_SECONDS,
-            max_retry_elapsed_s=opts.timeout_s,
+            # Rust le-vibe-agent is the single retry owner so retries are counted & logged once.
+            max_retry_elapsed_s=0.0,
+            provider="vibe",
+            model=model.id,
         ):
             if raw_usage := chunk.get("usage"):
                 in_tok = int(raw_usage.get("prompt_tokens", 0))
@@ -257,12 +263,17 @@ class VibeProvider:
                     or raw_usage.get("prompt_tokens_details", {}).get("cache_write_tokens", 0)
                     or 0
                 )
+                reasoning_tok = int(
+                    (raw_usage.get("completion_tokens_details") or {}).get("reasoning_tokens", 0)
+                    or 0
+                )
                 uncached_in = max(0, in_tok - cache_read)
                 usage = Usage(
                     input_tokens=uncached_in,
                     output_tokens=out_tok,
                     cache_read_tokens=cache_read,
                     cache_write_tokens=cache_write,
+                    reasoning_tokens=reasoning_tok,
                     cost_usd=calculate_cost_usd(
                         input_tokens=uncached_in,
                         output_tokens=out_tok,

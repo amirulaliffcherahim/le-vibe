@@ -36,6 +36,8 @@ pub struct UsageLogRecord {
     pub cache_read: u64,
     pub cache_write: u64,
     pub out: u64,
+    #[serde(default)]
+    pub reasoning_tokens: u64,
     pub cache_hit_pct: f64,
     pub cost_usd: f64,
     pub prefix: PrefixHashes,
@@ -57,6 +59,7 @@ pub struct UsageEventInput {
     pub cache_read: u64,
     pub cache_write: u64,
     pub out: u64,
+    pub reasoning_tokens: u64,
     pub cost_usd: f64,
     pub system_text: String,
     pub tools_text: String,
@@ -213,6 +216,7 @@ impl UsageLogger {
             cache_read: input.cache_read,
             cache_write: input.cache_write,
             out: input.out,
+            reasoning_tokens: input.reasoning_tokens,
             cache_hit_pct,
             cost_usd: input.cost_usd,
             prefix: PrefixHashes {
@@ -377,6 +381,7 @@ pub fn format_usage_report(records: &[UsageLogRecord]) -> String {
     let mut cache_read = 0u64;
     let mut cache_write = 0u64;
     let mut out_tok = 0u64;
+    let mut reasoning_tok = 0u64;
     let mut cost_usd = 0.0f64;
 
     // source -> (count, in_uncached, cache_read, out, cost_usd)
@@ -389,6 +394,7 @@ pub fn format_usage_report(records: &[UsageLogRecord]) -> String {
         cache_read = cache_read.saturating_add(r.cache_read);
         cache_write = cache_write.saturating_add(r.cache_write);
         out_tok = out_tok.saturating_add(r.out);
+        reasoning_tok = reasoning_tok.saturating_add(r.reasoning_tokens);
         cost_usd += r.cost_usd;
 
         let e = by_source.entry(r.source.as_str()).or_default();
@@ -437,8 +443,13 @@ pub fn format_usage_report(records: &[UsageLogRecord]) -> String {
         records[0].session_id,
         records.len()
     ));
+    let reasoning_part = if reasoning_tok > 0 {
+        format!("  reasoning={reasoning_tok}")
+    } else {
+        String::new()
+    };
     s.push_str(&format!(
-        "Totals: in_uncached={in_uncached}  cache_read={cache_read}  cache_write={cache_write}  out={out_tok}  cache_hit={hit_pct:.1}%  cost=${cost_usd:.4}  est_cache_savings=${est_savings_usd:.4}\n"
+        "Totals: in_uncached={in_uncached}  cache_read={cache_read}  cache_write={cache_write}  out={out_tok}{reasoning_part}  cache_hit={hit_pct:.1}%  cost=${cost_usd:.4}  est_cache_savings=${est_savings_usd:.4}\n"
     ));
 
     s.push_str("\nBy source:\n");
@@ -673,6 +684,43 @@ mod tests {
         });
         assert_eq!(miss.cache_bust_reason, "provider_or_wire_miss");
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auxiliary_sources_and_reasoning_tokens_appear_in_cost_report() {
+        let dir = temp_dir("aux_sources");
+        let log_path = dir.join("usage-aux.jsonl");
+        let logger = UsageLogger::with_debug_cache("aux", log_path.clone(), false);
+
+        for (i, src) in ["wrap_reply", "goldfish", "compact", "handover", "branch_summary"]
+            .iter()
+            .enumerate()
+        {
+            logger.record_request(UsageEventInput {
+                turn_idx: i + 1,
+                source: (*src).to_string(),
+                provider: "agy".into(),
+                model: "gemini-4-neon".into(),
+                http_status: 200,
+                stop_reason: "stop".into(),
+                wall_ms: 100,
+                in_uncached: 200,
+                out: 150,
+                reasoning_tokens: 40,
+                cost_usd: 0.001,
+                now_secs_override: Some(1_700_000_000 + (i as u64) * 5),
+                ..Default::default()
+            });
+        }
+
+        let recs = read_usage_log(&log_path).unwrap();
+        assert_eq!(recs.len(), 5);
+        let report = format_usage_report(&recs);
+        for src in ["wrap_reply", "goldfish", "compact", "handover", "branch_summary"] {
+            assert!(report.contains(src), "missing source {src} in report:\n{report}");
+        }
+        assert!(report.contains("reasoning=200"), "missing reasoning sum:\n{report}");
         let _ = fs::remove_dir_all(&dir);
     }
 }

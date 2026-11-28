@@ -1312,3 +1312,171 @@ async def test_all_providers_report_uncached_input_tokens_separately_from_cache_
     assert agy_msg.usage.output_tokens == 4
 
 
+@pytest.mark.asyncio
+async def test_transport_fails_fast_on_503_and_429_in_one_http_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rust le-vibe-agent owns retries: Python transport must fail fast in 1 HTTP POST."""
+    import time
+    from le_vibe.providers import save_oidc_tokens
+    from le_vibe.providers.transport import ProviderHTTPStatusError
+
+    auth_file = tmp_path / "auth.json"
+    wire_log = tmp_path / "wire-http.jsonl"
+    monkeypatch.setenv("LE_VIBE_AUTH_FILE", str(auth_file))
+    monkeypatch.setenv("LE_VIBE_WIRE_LOG", "1")
+    monkeypatch.setenv("LE_VIBE_WIRE_LOG_PATH", str(wire_log))
+    save_oidc_tokens(
+        "vibe",
+        access_token="vibe-access-token-long-enough",
+        id_token="vibe-id-token",
+        expires_at=time.time() + 3600,
+        organization_id="org-1",
+        workspace_id="ws-1",
+        auth_file=auth_file,
+    )
+    save_oidc_tokens(
+        "agy",
+        access_token="ya29.token-long-enough",
+        expires_at=time.time() + 3600,
+        project_id="aicode-consumers",
+        auth_file=auth_file,
+    )
+
+    ctx = TranscriptContext(messages=[Message(role="user", content="hi")])
+
+    vibe_hits = 0
+
+    def vibe_503(req: httpx.Request) -> httpx.Response:
+        nonlocal vibe_hits
+        vibe_hits += 1
+        return httpx.Response(503, text="overloaded")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(vibe_503)) as client:
+        with pytest.raises(ProviderHTTPStatusError) as exc_info:
+            await VibeProvider(client=client).complete(_vibe_test_model(), ctx)
+    assert exc_info.value.status_code == 503
+    assert vibe_hits == 1, f"expected 1 HTTP attempt, got {vibe_hits}"
+
+    agy_hits = 0
+
+    def agy_429(req: httpx.Request) -> httpx.Response:
+        nonlocal agy_hits
+        agy_hits += 1
+        return httpx.Response(429, text='{"error":{"code":429,"message":"rate limit"}}')
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(agy_429)) as client:
+        with pytest.raises(ProviderHTTPStatusError) as exc_info:
+            await AgyProvider(client=client).complete(_grouped_flash_model(), ctx)
+    assert exc_info.value.status_code == 429
+    assert agy_hits == 1, f"expected 1 HTTP attempt, got {agy_hits}"
+
+    lines = [json.loads(l) for l in wire_log.read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert len(lines) == 2
+    assert [l["http_status"] for l in lines] == [503, 429]
+    assert all("ts" in l and "wall_ms" in l and "provider" in l and "model" in l for l in lines)
+
+
+@pytest.mark.asyncio
+async def test_reasoning_tokens_accounted_without_double_counting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import time
+    from le_vibe.providers import save_oidc_tokens
+
+    auth_file = tmp_path / "auth.json"
+    monkeypatch.setenv("LE_VIBE_AUTH_FILE", str(auth_file))
+    save_oidc_tokens(
+        "vibe",
+        access_token="vibe-access-token-long-enough",
+        id_token="vibe-id-token",
+        expires_at=time.time() + 3600,
+        organization_id="org-1",
+        workspace_id="ws-1",
+        auth_file=auth_file,
+    )
+    save_oidc_tokens(
+        "agy",
+        access_token="ya29.token-long-enough",
+        expires_at=time.time() + 3600,
+        project_id="aicode-consumers",
+        auth_file=auth_file,
+    )
+    ctx = TranscriptContext(messages=[Message(role="user", content="hi")])
+
+    # agy (Gemini): thoughtsTokenCount is separate from candidatesTokenCount -> output = 40 + 160 = 200
+    agy_sse = (
+        'data: {"response":{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}],'
+        '"usageMetadata":{"promptTokenCount":500,"candidatesTokenCount":40,"thoughtsTokenCount":160,"cachedContentTokenCount":300}}}\n'
+        "data: [DONE]\n"
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, text=agy_sse))
+    ) as client:
+        agy_msg = await AgyProvider(client=client).complete(_grouped_flash_model(), ctx)
+    assert agy_msg.usage.reasoning_tokens == 160
+    assert agy_msg.usage.output_tokens == 200
+    assert agy_msg.usage.input_tokens == 200
+    assert agy_msg.usage.cache_read_tokens == 300
+
+    # vibe (OpenAI/Mistral): completion_tokens already includes reasoning_tokens -> no double-add
+    vibe_sse = (
+        'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],'
+        '"usage":{"prompt_tokens":400,"completion_tokens":200,"completion_tokens_details":{"reasoning_tokens":150}}}\n'
+        "data: [DONE]\n"
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, text=vibe_sse))
+    ) as client:
+        vibe_msg = await VibeProvider(client=client).complete(_vibe_test_model(), ctx)
+    assert vibe_msg.usage.reasoning_tokens == 150
+    assert vibe_msg.usage.output_tokens == 200
+
+    # deepseek: completion_tokens already includes reasoning_tokens -> no double-add
+    ds_sse = (
+        'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],'
+        '"usage":{"prompt_tokens":400,"completion_tokens":180,"completion_tokens_details":{"reasoning_tokens":120}}}\n'
+        "data: [DONE]\n"
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, text=ds_sse))
+    ) as client:
+        ds_msg = await DeepSeekProvider(client=client).complete(
+            _deepseek_test_model(), ctx, StreamOptions(api_key="k")
+        )
+    assert ds_msg.usage.reasoning_tokens == 120
+    assert ds_msg.usage.output_tokens == 180
+
+
+def test_vibe_serializes_tool_call_arguments_deterministically() -> None:
+    model = _vibe_test_model()
+    ctx1 = TranscriptContext(
+        messages=[
+            Message(role="user", content="go"),
+            Message(
+                role="assistant",
+                content="",
+                tool_calls=(ToolCall(id="c1", name="edit", arguments={"b": 1, "a": 2}),),
+            ),
+            Message(role="tool", content="ok", tool_call_id="c1", name="edit"),
+        ]
+    )
+    ctx2 = TranscriptContext(
+        messages=[
+            Message(role="user", content="go"),
+            Message(
+                role="assistant",
+                content="",
+                tool_calls=(ToolCall(id="c1", name="edit", arguments={"a": 2, "b": 1}),),
+            ),
+            Message(role="tool", content="ok", tool_call_id="c1", name="edit"),
+        ]
+    )
+    p1 = build_vibe_payload(model, ctx1, StreamOptions(thinking_level="medium"))
+    p2 = build_vibe_payload(model, ctx2, StreamOptions(thinking_level="medium"))
+    args1 = p1["messages"][1]["tool_calls"][0]["function"]["arguments"]
+    args2 = p2["messages"][1]["tool_calls"][0]["function"]["arguments"]
+    assert args1 == args2 == '{"a": 2, "b": 1}'
+
+
+

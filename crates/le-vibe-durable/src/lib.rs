@@ -112,6 +112,10 @@ fn default_kind() -> EntryKind {
 /// any cost comparison between harnesses needs to read input / cache / output per turn out of the
 /// session log. Optional and skipped when absent, so older logs still load and unknown fields are
 /// ignored by readers that predate it.
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EntryUsage {
     #[serde(default)]
@@ -122,6 +126,8 @@ pub struct EntryUsage {
     pub cache_write_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub reasoning_tokens: u64,
 }
 
 /// Everything needed to append one entry, including the pi-specific boundary metadata.

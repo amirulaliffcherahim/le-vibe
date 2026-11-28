@@ -324,6 +324,7 @@ pub struct TuiState {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    pub reasoning_tokens: u64,
     pub last_cache_rate: Option<f64>,
     pub last_tps: Option<f64>,
     pub cost_usd: f64,
@@ -440,6 +441,7 @@ impl TuiState {
             output_tokens: 0,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            reasoning_tokens: 0,
             last_cache_rate: None,
             last_tps: None,
             cost_usd: 0.0,
@@ -770,9 +772,8 @@ impl TuiState {
         self.cache_read_tokens += cache_tok;
         self.cache_write_tokens += cache_write_tok;
         self.cost_usd += cost;
-        // All 3 providers (agy, vibe, deepseek) report total prompt tokens in `in_tok`
-        // (already including `cache_tok`), so never add `cache_tok` a second time.
-        let prompt = in_tok.max(cache_tok);
+        // All 3 providers report `in_tok` as uncached input only, separate from `cache_tok`.
+        let prompt = in_tok.saturating_add(cache_tok);
         if prompt > 0 {
             self.last_cache_rate = Some(((cache_tok as f64 / prompt as f64) * 100.0).min(100.0));
         }

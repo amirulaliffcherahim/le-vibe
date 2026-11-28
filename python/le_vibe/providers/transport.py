@@ -5,6 +5,8 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 import json
+import os
+from pathlib import Path
 import random
 import re
 import time
@@ -296,6 +298,27 @@ async def _iter_sse_json_events(
 RefreshHeadersCallback = Callable[[], Awaitable[Mapping[str, str] | None]]
 
 
+def _wire_log_record(provider: str, model: str, http_status: int, wall_ms: int) -> None:
+    """Append one compact wire-level HTTP POST record when `LE_VIBE_WIRE_LOG=1`."""
+    if os.environ.get("LE_VIBE_WIRE_LOG", "").strip().lower() not in {"1", "true", "yes"}:
+        return
+    override = os.environ.get("LE_VIBE_WIRE_LOG_PATH", "").strip()
+    path = Path(override) if override else (Path.home() / ".le-vibe" / "logs" / "wire-http.jsonl")
+    entry = {
+        "ts": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "provider": provider,
+        "model": model,
+        "http_status": http_status,
+        "wall_ms": wall_ms,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, separators=(",", ":")) + "\n")
+    except OSError:
+        pass
+
+
 async def stream_sse_json(
     url: str,
     *,
@@ -307,6 +330,8 @@ async def stream_sse_json(
     first_output_timeout_s: float | None = None,
     idle_timeout_s: float | None = None,
     max_retry_elapsed_s: float = 0.0,
+    provider: str = "",
+    model: str = "",
 ) -> AsyncIterator[dict[str, Any]]:
     """POST JSON and yield parsed SSE `data:` payloads until `[DONE]`.
 
@@ -328,6 +353,7 @@ async def stream_sse_json(
             if (first_output_timeout_s or idle_timeout_s)
             else timeout_s
         )
+        req_started = time.monotonic()
         try:
             async with active_client.stream(
                 "POST",
@@ -338,6 +364,12 @@ async def stream_sse_json(
                     timeout_s, connect=15.0, read=read_timeout, write=30.0, pool=15.0
                 ),
             ) as response:
+                _wire_log_record(
+                    provider,
+                    model,
+                    response.status_code,
+                    int((time.monotonic() - req_started) * 1000),
+                )
                 if response.status_code == 401 and on_unauthorized is not None and not replayed_401:
                     await response.aread()
                     replayed_401 = True

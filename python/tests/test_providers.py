@@ -499,6 +499,36 @@ def test_default_thinking_prefers_medium_or_high_when_no_medium() -> None:
     assert default_thinking_for_model(only_high) == "high"
 
 
+def test_vibe_account_context_uses_the_console_gateway_and_stays_advisory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from le_vibe.providers import auth
+
+    seen: list[str] = []
+
+    class _Client:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> "_Client":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def get(self, url: str, **kwargs: object) -> httpx.Response:
+            seen.append(url)
+            return httpx.Response(
+                404, request=httpx.Request("GET", url), json={"message": "no Route matched"}
+            )
+
+    monkeypatch.setattr(auth.httpx, "Client", _Client)
+
+    # The inference host answers 404 for this route; the console gateway is the one that serves it.
+    assert auth._vibe_account_context("id-token", audience=auth.MISTRAL_OIDC_AUDIENCE) is None
+    assert seen == ["https://console.mistral.ai/api/vibe/account-context"]
+
+
 def test_agy_oauth_oob_detection_and_code_extraction() -> None:
     from le_vibe.providers.auth import _extract_agy_auth_code, _should_use_agy_oob_auth
 

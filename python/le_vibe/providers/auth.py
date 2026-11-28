@@ -1652,10 +1652,17 @@ def _discover_vibe_tenant(id_token: str, *, workspace_id: str | None = None) -> 
 
 
 def _vibe_account_context(id_token: str, *, audience: str) -> dict[str, Any] | None:
+    """Console-host account context for a freshly minted ID token.
+
+    This route lives on the console gateway, not on the inference host: the same path under
+    `api.mistral.ai` answers `404 no Route matched`, which used to fail every Vibe sign-in.
+    The payload is advisory, so callers must tolerate `None`.
+    """
+    del audience  # Kept for call-site parity with the reference client.
     try:
         with httpx.Client(timeout=20.0, follow_redirects=False) as client:
             resp = client.get(
-                f"{audience.rstrip('/')}/api/vibe/account-context",
+                f"{MISTRAL_CONSOLE_API_BASE.rstrip('/')}/vibe/account-context",
                 headers={"Authorization": f"Bearer {id_token}"},
             )
             if not resp.is_success:
@@ -1783,15 +1790,23 @@ def login_vibe_oidc(
         nonce=nonce,
         jwks=_fetch_jwks(jwks_uri),
     )
-    context = _vibe_account_context(id_token, audience=MISTRAL_OIDC_AUDIENCE)
-    if context is None:
-        raise RuntimeError("Mistral account lookup failed after OIDC sign-in")
+    # Advisory enrichment, never a gate: if this route moves again, sign-in must still work as
+    # long as the account can reach a workspace. The ID token is already verified above.
+    if _vibe_account_context(id_token, audience=MISTRAL_OIDC_AUDIENCE) is None:
+        print(
+            "note: Mistral account context unavailable; continuing with workspace discovery",
+            file=sys.stderr,
+        )
     org_id, ws_id = _discover_vibe_tenant(
         id_token,
         workspace_id=os.environ.get("VIBE_CLI_OIDC_WORKSPACE_ID", ""),
     )
     if not org_id:
-        raise RuntimeError("No accessible Mistral workspace found for this account")
+        raise RuntimeError(
+            "No accessible Mistral workspace found for this account: "
+            f"GET {MISTRAL_OIDC_AUDIENCE.rstrip('/')}/v1/users/me/workspaces returned no usable "
+            "workspace. Set VIBE_CLI_OIDC_WORKSPACE_ID to pick one explicitly."
+        )
     refresh_token = tok_data.get("refresh_token")
     expires_in = float(tok_data.get("expires_in", 3600))
     return save_oidc_tokens(

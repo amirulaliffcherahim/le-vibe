@@ -716,6 +716,53 @@ def test_agy_refresh_evicts_on_invalid_grant_and_keeps_on_network_error(
     assert "agy" not in json.loads(auth_file.read_text(encoding="utf-8"))
 
 
+def test_vibe_dead_grant_is_reported_as_a_relogin_not_an_http_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A revoked/expired refresh token used to surface as `HTTP 400`, with no hint of the fix."""
+    import time
+    from le_vibe.providers import auth, save_oidc_tokens
+    from le_vibe.providers.auth import MissingAPIKeyError
+
+    auth_file = tmp_path / "auth.json"
+    monkeypatch.setenv("LE_VIBE_AUTH_FILE", str(auth_file))
+    auth._JUST_REFRESHED.pop("vibe", None)
+    save_oidc_tokens(
+        "vibe",
+        access_token="vibe-stale",
+        refresh_token="rt-dead",
+        expires_at=time.time() - 60,
+        token_endpoint=auth.MISTRAL_OIDC_ISSUER + "/oauth2/token",
+        client_id=auth.MISTRAL_OIDC_CLIENT_ID,
+        organization_id="org-1",
+        auth_file=auth_file,
+    )
+
+    class _Revoked:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> "_Revoked":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def post(self, url: str, data: dict[str, str]) -> httpx.Response:
+            return httpx.Response(
+                400,
+                request=httpx.Request("POST", url),
+                json={"error": "invalid_grant", "error_description": "revoked"},
+            )
+
+    monkeypatch.setattr(auth.httpx, "Client", _Revoked)
+
+    with pytest.raises(MissingAPIKeyError, match="le-vibe login --provider vibe"):
+        auth.resolve_api_key("vibe", env={}, auth_file=auth_file)
+    # Reported, not evicted: the keyring slot is shared with mistral-vibe.
+    assert json.loads(auth_file.read_text(encoding="utf-8"))["vibe"]["refresh_token"] == "rt-dead"
+
+
 @pytest.mark.asyncio
 async def test_agy_synthesized_tool_call_ids_are_unique_across_turns(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

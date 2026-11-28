@@ -6,7 +6,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from le_vibe.extensions import ExtensionHost, PythonToolSpec
+from lazybug.extensions import ExtensionHost, PythonToolSpec
 
 _SKIP_DIRS = {".git", "target", "node_modules", ".venv", "__pycache__", "dist", "build"}
 

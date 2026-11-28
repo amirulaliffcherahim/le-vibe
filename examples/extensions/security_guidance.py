@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from le_vibe.extensions import ExtensionHost
+from lazybug.extensions import ExtensionHost
 
 _CODE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bpickle\.loads?\s*\("), "Unsafe deserialization via pickle.load(s)"),

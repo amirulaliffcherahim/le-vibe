@@ -1,4 +1,4 @@
-"""Example extension: append timestamped tool call audit records to ~/.le-vibe/tool-audit.jsonl."""
+"""Example extension: append timestamped tool call audit records to ~/.lazybug/tool-audit.jsonl."""
 
 from __future__ import annotations
 
@@ -7,11 +7,11 @@ from pathlib import Path
 import time
 from typing import Any
 
-from le_vibe.extensions import ExtensionHost
+from lazybug.extensions import ExtensionHost
 
 
 def _audit_path() -> Path:
-    return Path.home() / ".le-vibe" / "tool-audit.jsonl"
+    return Path.home() / ".lazybug" / "tool-audit.jsonl"
 
 
 def _write_record(record: dict[str, Any]) -> None:

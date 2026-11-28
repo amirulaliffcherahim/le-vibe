@@ -1,16 +1,16 @@
-# le-vibe Windows Installer
-# Usage: irm https://raw.githubusercontent.com/amirulaliffcherahim/le-vibe/main/scripts/install.ps1 | iex
+# lazybug Windows Installer
+# Usage: irm https://raw.githubusercontent.com/amirulaliffcherahim/lazybug/main/scripts/install.ps1 | iex
 $ErrorActionPreference = "Stop"
 
-$Repo = "amirulaliffcherahim/le-vibe"
-$InstallDir = Join-Path $env:USERPROFILE ".le-vibe\bin"
-$ExePath = Join-Path $InstallDir "le-vibe.exe"
+$Repo = "amirulaliffcherahim/lazybug"
+$InstallDir = Join-Path $env:USERPROFILE ".lazybug\bin"
+$ExePath = Join-Path $InstallDir "lazybug.exe"
 
-Write-Host "Fetching latest le-vibe release from GitHub..." -ForegroundColor Cyan
+Write-Host "Fetching latest lazybug release from GitHub..." -ForegroundColor Cyan
 $Release = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases/latest"
-$Asset = $Release.assets | Where-Object { $_.name -eq "le-vibe.exe" } | Select-Object -First 1
+$Asset = $Release.assets | Where-Object { $_.name -eq "lazybug.exe" } | Select-Object -First 1
 if (-not $Asset) {
-    throw "No le-vibe.exe asset found on release $($Release.tag_name)."
+    throw "No lazybug.exe asset found on release $($Release.tag_name)."
 }
 
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
@@ -24,5 +24,5 @@ if ($UserPath -notlike "*$InstallDir*") {
     Write-Host "Added $InstallDir to User PATH." -ForegroundColor Green
 }
 
-Write-Host "Installed le-vibe $($Release.tag_name)!" -ForegroundColor Green
+Write-Host "Installed lazybug $($Release.tag_name)!" -ForegroundColor Green
 & $ExePath --version

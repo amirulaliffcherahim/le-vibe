@@ -1,23 +1,23 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/le-vibe-schema",
-    "crates/le-vibe-telemetry",
-    "crates/le-vibe-pybridge",
-    "crates/le-vibe-durable",
-    "crates/le-vibe-tools",
-    "crates/le-vibe-mcp",
-    "crates/le-vibe-agent",
-    "crates/le-vibe-tui",
-    "crates/le-vibe-cli",
+    "crates/lazybug-schema",
+    "crates/lazybug-telemetry",
+    "crates/lazybug-pybridge",
+    "crates/lazybug-durable",
+    "crates/lazybug-tools",
+    "crates/lazybug-mcp",
+    "crates/lazybug-agent",
+    "crates/lazybug-tui",
+    "crates/lazybug-cli",
 ]
 
 [workspace.package]
-version = "0.7.0-beta.1"
+version = "0.1.0"
 edition = "2024"
 license = "MIT"
 authors = ["Amirul Aliff"]
-repository = "https://github.com/amirulaliffcherahim/le-vibe"
+repository = "https://github.com/amirulaliffcherahim/lazybug"
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }

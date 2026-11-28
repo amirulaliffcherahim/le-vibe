@@ -1,10 +1,10 @@
-# Contributing to le-vibe
+# Contributing to lazybug
 
-Contributions to **le-vibe** are welcome.
+Contributions to **lazybug** are welcome.
 
 ## Architecture
 - **Rust Harness (`crates/*`)**: `schema`, `telemetry`, `pybridge`, `durable`, `tools`, `mcp`, `agent`, `tui`, `cli`.
-- **Python Engine (`python/le_vibe/*`)**: `providers` (`vibe`, `deepseek`, `agy`), `policy`, `extensions`, and `bridge.py`.
+- **Python Engine (`python/lazybug/*`)**: `providers` (`vibe`, `deepseek`, `agy`), `policy`, `extensions`, and `bridge.py`.
 
 ## Before Opening a PR
 1. Run Python tests:

@@ -1,9 +1,9 @@
-# TUI Internals (`crates/le-vibe-tui`)
+# TUI Internals (`crates/lazybug-tui`)
 
 ## Pi Parity Contract (P0)
 
-`le-vibe-tui` is a strict leaf crate: it owns every user-visible string, layout rule and colour.
-`le-vibe-agent` and `le-vibe-cli` only forward plain values, so a formatting change never touches
+`lazybug-tui` is a strict leaf crate: it owns every user-visible string, layout rule and colour.
+`lazybug-agent` and `lazybug-cli` only forward plain values, so a formatting change never touches
 the agent loop.
 
 | Concern | Owner | Parity rule |
@@ -17,7 +17,7 @@ the agent loop.
 | Generic tool args | `tool_call_header` | Collapsed `name key=JSON ...` cut to 100 chars; expanded puts each `key: value` on its own two-space-indented header row. Deviation: `serde_json` sorts keys, so pairs are alphabetical rather than in the model's argument order |
 | Edit preview | `diff::word_diff` + `edit_diff_rows` | Pre-execution two-row (`-` then `+`) word diff with changed spans reversed; common indentation is excluded from the comparison so a leading insertion cannot swallow it |
 
-`le-vibe-agent` emits `ToolCallStart { args_json }`, `ToolCallEnd { duration_ms }` and
+`lazybug-agent` emits `ToolCallStart { args_json }`, `ToolCallEnd { duration_ms }` and
 `Retry { attempt, max_attempts, delay_ms }`; nothing in the agent layer formats them. The status
 strip's row is always allocated, so idle → busy never reflows the editor or footer
 (`idle_status_reserves_height` in `tests/render_tests.rs`).
@@ -32,26 +32,26 @@ strip's row is always allocated, so idle → busy never reflows the editor or fo
 - `editor.rs` — auto-wrapping 1–5 line editor (`wrap_editor_lines`) with UTF-8 char-boundary cursor movement
 - `transcript.rs` — sleepy owl header, Pi-style full-width tinted user turns (`ThemeId::user_surface`), dim italic thinking, tinted tool cards keyed by status (pending/success/error), live Todo strip, 3-line `pi-footer` with context pressure colors at 70%/90%
 - `modal.rs` — scroll-windowed, width-clamped modals (`/model` live type-to-filter, colored diff preview in `ApprovalModal`, `HelpModal`, `ChangelogModal`, `TreePicker`, `SessionPicker`, `UsageModal`)
-- `input.rs` — keyboard, mouse wheel scroll, bracketed paste, and persistent prompt history (`~/.le-vibe/history.txt`)
+- `input.rs` — keyboard, mouse wheel scroll, bracketed paste, and persistent prompt history (`~/.lazybug/history.txt`)
 - `export.rs` — `export_session_markdown` and self-contained dark-theme `export_session_html`
-- `probe.rs` — headless rendering (`render_frame`) and key-spec parsing (`key_from_spec`) for `le-vibe tui-probe`
+- `probe.rs` — headless rendering (`render_frame`) and key-spec parsing (`key_from_spec`) for `lazybug tui-probe`
 
-## Event Loop & Smoothness (`crates/le-vibe-cli/src/main.rs`)
+## Event Loop & Smoothness (`crates/lazybug-cli/src/main.rs`)
 
 - **Dirty-driven redraw**: `terminal.draw` only runs when worker events arrive, input events occur, or the spinner/scroll animation is active.
 - **Non-blocking worker**: all LLM streaming, catalog sync, usage queries, shell commands, and MCP calls run on `spawn_tui_worker`.
 - **Steering & Cancel**: `Esc` triggers `Arc<AtomicBool>` cancellation mid-turn; typing + `Enter` while busy queues follow-up prompts (`queued_prompts`).
 
-## Headless Probe (`le-vibe tui-probe`)
+## Headless Probe (`lazybug tui-probe`)
 
 Agents and tests cannot attach to a real terminal, so the probe drives the same `handle_key_event` /
 `draw_frame` code paths against a ratatui `TestBackend` and prints the result as plain text.
 
 ```bash
-le-vibe tui-probe --demo --size 100x30                            # one frame of seeded content
-printf 'type /mo\nframe\n' | le-vibe tui-probe --demo --script -   # slash popup after typing
-printf 'modal approval\nframe\n' | le-vibe tui-probe --demo --script -
-le-vibe tui-probe --demo --key Enter --key Up --json              # NDJSON frames + state
+lazybug tui-probe --demo --size 100x30                            # one frame of seeded content
+printf 'type /mo\nframe\n' | lazybug tui-probe --demo --script -   # slash popup after typing
+printf 'modal approval\nframe\n' | lazybug tui-probe --demo --script -
+lazybug tui-probe --demo --key Enter --key Up --json              # NDJSON frames + state
 ```
 
 Script verbs: `type <text>`, `key <spec>` (`Enter`, `Esc`, `Tab`, `Ctrl+G`, `Alt+Up`, `F12`, `a`),

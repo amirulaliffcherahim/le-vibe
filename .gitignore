@@ -47,7 +47,7 @@ plans/
 collect.sh
 packages/agent/docs/extensions/pi-server-artifact/index.md
 
-# Rust & Python le-vibe artifacts
+# Rust & Python lazybug artifacts
 /target/
 python/.venv/
 python/.pytest_cache/

@@ -1,16 +1,16 @@
-# le-vibe Examples & Configuration Guide
+# lazybug Examples & Configuration Guide
 
-Quickstart, extensions, permission policies, MCP servers, skills, and prompt templates for `le-vibe`.
+Quickstart, extensions, permission policies, MCP servers, skills, and prompt templates for `lazybug`.
 
 ## Quickstart
 
 ```sh
-le-vibe                              # Launch interactive TUI
-le-vibe --yolo                       # Auto-approve non-blocked tools
-le-vibe --print "Summarize repo"     # One-shot non-interactive run
-le-vibe --continue                   # Resume latest session
-le-vibe --resume <session-id>        # Resume a specific session
-le-vibe --mode rpc                   # JSONL stdin/stdout RPC mode
+lazybug                              # Launch interactive TUI
+lazybug --yolo                       # Auto-approve non-blocked tools
+lazybug --print "Summarize repo"     # One-shot non-interactive run
+lazybug --continue                   # Resume latest session
+lazybug --resume <session-id>        # Resume a specific session
+lazybug --mode rpc                   # JSONL stdin/stdout RPC mode
 ```
 
 ## Agent Modes (`Shift+Tab` or `/mode <name>`)
@@ -23,29 +23,29 @@ le-vibe --mode rpc                   # JSONL stdin/stdout RPC mode
 | `ask` | `read`, `grep`, `find`, `ls` | Read-only Q&A |
 | `rea` | `read`, `grep`, `find`, `ls`, `bash`, `powershell` | Reverse-engineering & inspection |
 
-Customize user-level instructions in `~/.le-vibe/SYSTEM.md` and project instructions in `<cwd>/AGENTS.md`.
+Customize user-level instructions in `~/.lazybug/SYSTEM.md` and project instructions in `<cwd>/AGENTS.md`.
 
 ## Installing & Testing Extensions
 
-Copy any `.py` extension from `examples/extensions/` to `~/.le-vibe/extensions/` (global) or `.le-vibe/extensions/` (project):
+Copy any `.py` extension from `examples/extensions/` to `~/.lazybug/extensions/` (global) or `.lazybug/extensions/` (project):
 
 ```sh
-mkdir -p ~/.le-vibe/extensions
-cp examples/extensions/secret_guard.py ~/.le-vibe/extensions/
+mkdir -p ~/.lazybug/extensions
+cp examples/extensions/secret_guard.py ~/.lazybug/extensions/
 ```
 
 Each extension defines `def register(host: ExtensionHost) -> None:` and can register:
 - **Lifecycle hooks**: `host.on("before_tool_call", cb)` / `host.on("after_tool_call", cb)`
 - **Custom Python tools**: `host.register_tool(PythonToolSpec(name=..., description=..., parameters=..., handler=...))`
 
-Run `/reload` inside `le-vibe` to hot-reload extensions without restarting.
+Run `/reload` inside `lazybug` to hot-reload extensions without restarting.
 
 ## Installing & Testing Policies
 
-Copy a profile from `examples/policies/` to `~/.le-vibe/policy.json` or `.le-vibe/policy.json`:
+Copy a profile from `examples/policies/` to `~/.lazybug/policy.json` or `.lazybug/policy.json`:
 
 ```sh
-cp examples/policies/balanced.json ~/.le-vibe/policy.json
+cp examples/policies/balanced.json ~/.lazybug/policy.json
 ```
 
 ### Policy JSON Schema
@@ -70,7 +70,7 @@ Hardcoded dangerous shell patterns (`rm -rf /`, `mkfs`, `dd if=`, etc.) are alwa
 
 ## Adding an MCP Server
 
-Create `~/.le-vibe/mcp.json` or `.le-vibe/mcp.json`:
+Create `~/.lazybug/mcp.json` or `.lazybug/mcp.json`:
 
 ```json
 {
@@ -85,7 +85,7 @@ Create `~/.le-vibe/mcp.json` or `.le-vibe/mcp.json`:
 
 ## Adding a Skill (`SKILL.md`)
 
-Place a `SKILL.md` under `.le-vibe/skills/<name>/SKILL.md` or `~/.le-vibe/skills/<name>/SKILL.md`:
+Place a `SKILL.md` under `.lazybug/skills/<name>/SKILL.md` or `~/.lazybug/skills/<name>/SKILL.md`:
 
 ```markdown
 ---
@@ -98,4 +98,4 @@ Step-by-step instructions loaded when invoked.
 
 ## Adding a Prompt Template
 
-Place `<name>.md` under `.le-vibe/prompts/` or `~/.le-vibe/prompts/`. Invoke with `/<name> [arguments]` (`$ARGUMENTS` is replaced with your arguments).
+Place `<name>.md` under `.lazybug/prompts/` or `~/.lazybug/prompts/`. Invoke with `/<name> [arguments]` (`$ARGUMENTS` is replaced with your arguments).

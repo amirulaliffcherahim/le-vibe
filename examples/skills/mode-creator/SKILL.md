@@ -1,21 +1,21 @@
 ---
 name: mode-creator
-description: Create or customize a le-vibe Markdown mode (persona) with validated ModeSpec YAML frontmatter, least-privilege tools, and cache-safe instructions.
+description: Create or customize a lazybug Markdown mode (persona) with validated ModeSpec YAML frontmatter, least-privilege tools, and cache-safe instructions.
 ---
 
 # Mode Creator
 
-Create an editable, OpenCode-style Markdown persona for `le-vibe` (`Tab` / `/mode <name>` / `spawn_agent(mode="...")`).
+Create an editable, OpenCode-style Markdown persona for `lazybug` (`Tab` / `/mode <name>` / `spawn_agent(mode="...")`).
 
 ## 1. Confirm Scope & Precedence
 Discovery precedence (later overrides earlier; matching a built-in name like `normal` overrides it):
 1. Built-in `normal`
-2. `~/.le-vibe/mode/<name>.md` (global)
+2. `~/.lazybug/mode/<name>.md` (global)
 3. `~/.agents/mode/<name>.md` (global cross-agent)
 4. `.agents/mode/<name>.md` (project cross-agent)
-5. `.le-vibe/mode/<name>.md` (project override)
+5. `.lazybug/mode/<name>.md` (project override)
 
-Default to `.le-vibe/mode/<name>.md` for repo-specific roles and `~/.le-vibe/mode/<name>.md` for personal daily-drive personas.
+Default to `.lazybug/mode/<name>.md` for repo-specific roles and `~/.lazybug/mode/<name>.md` for personal daily-drive personas.
 
 ## 2. Supported Frontmatter (`ModeSpec`)
 Include only the fields the persona actually overrides:

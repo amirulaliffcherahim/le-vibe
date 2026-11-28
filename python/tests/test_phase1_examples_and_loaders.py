@@ -3,8 +3,8 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from le_vibe.extensions import ExtensionHost, load_extensions_from_dirs
-from le_vibe.policy import PermissionStore, ToolPermission
+from lazybug.extensions import ExtensionHost, load_extensions_from_dirs
+from lazybug.policy import PermissionStore, ToolPermission
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -93,14 +93,14 @@ def test_read_before_edit_and_dirty_repo_policy(monkeypatch) -> None:
     assert store.evaluate_tool_call("edit", target_path="README.md").action == "allow"
 
     # Dirty repo blocks destructive git even in yolo
-    monkeypatch.setattr("le_vibe.policy.is_dirty_git_repo", lambda: True)
+    monkeypatch.setattr("lazybug.policy.is_dirty_git_repo", lambda: True)
     assert store.evaluate_tool_call("bash", command="git checkout .").action == "deny"
-    monkeypatch.setattr("le_vibe.policy.is_dirty_git_repo", lambda: False)
+    monkeypatch.setattr("lazybug.policy.is_dirty_git_repo", lambda: False)
     assert store.evaluate_tool_call("bash", command="git checkout .").action == "allow"
 
 
 def test_shipped_creator_skills_are_lean_and_valid() -> None:
-    from le_vibe.extensions import discover_skills
+    from lazybug.extensions import discover_skills
 
     skills_root = Path(__file__).resolve().parents[2] / "examples" / "skills"
     skills = discover_skills([skills_root])

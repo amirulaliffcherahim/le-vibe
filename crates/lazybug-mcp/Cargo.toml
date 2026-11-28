@@ -1,0 +1,11 @@
+[package]
+name = "lazybug-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lazybug-pybridge = { path = "../lazybug-pybridge" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

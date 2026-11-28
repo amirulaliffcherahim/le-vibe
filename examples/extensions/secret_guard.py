@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from le_vibe.extensions import ExtensionHost
+from lazybug.extensions import ExtensionHost
 
 _SENSITIVE_NAMES = {".env", ".env.local", ".env.production", "auth.json", "agy_oauth.json"}
 _SENSITIVE_SUFFIXES = (".pem", ".key", ".p12", ".pfx")

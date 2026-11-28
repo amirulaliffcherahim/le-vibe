@@ -1,31 +1,31 @@
-# Pi → le-vibe Knowledge & Session Transfer Guide
+# Pi → lazybug Knowledge & Session Transfer Guide
 
-How to migrate your Pi system prompt, skills, long-term memory, and past sessions into `le-vibe`'s pure-Rust Hybrid RAG Memory (`~/.le-vibe/memory/`).
+How to migrate your Pi system prompt, skills, long-term memory, and past sessions into `lazybug`'s pure-Rust Hybrid RAG Memory (`~/.lazybug/memory/`).
 
 ## 1. System Prompt & Standards
-`le-vibe` automatically loads both files on every turn (hot-reloadable via `/reload`):
-- `~/.le-vibe/SYSTEM.md` — base user instructions
-- `~/.le-vibe/APPEND_SYSTEM.md` — appended hard rules (copied from `~/.pi/agent/APPEND_SYSTEM.md`, with `STANDARDS.md` and `RULES_EXTRA.md` alongside)
+`lazybug` automatically loads both files on every turn (hot-reloadable via `/reload`):
+- `~/.lazybug/SYSTEM.md` — base user instructions
+- `~/.lazybug/APPEND_SYSTEM.md` — appended hard rules (copied from `~/.pi/agent/APPEND_SYSTEM.md`, with `STANDARDS.md` and `RULES_EXTRA.md` alongside)
 
 ## 2. Skills (On-Demand, ~65 tok Startup Cost)
-- Copy skill folders (`<name>/SKILL.md`) into `~/.le-vibe/skills/` (or leave them in `~/.pi/agent/skills/` and `~/.agents/skills/` — `le-vibe` discovers all three).
-- At startup `le-vibe` injects only a 1-line name index; full `SKILL.md` files load on demand via the built-in `load_skill(name)` tool.
+- Copy skill folders (`<name>/SKILL.md`) into `~/.lazybug/skills/` (or leave them in `~/.pi/agent/skills/` and `~/.agents/skills/` — `lazybug` discovers all three).
+- At startup `lazybug` injects only a 1-line name index; full `SKILL.md` files load on demand via the built-in `load_skill(name)` tool.
 
 ## 3. Long-Term Memory (Hybrid BM25 + Cosine RAG)
-- Global memory lives in **`~/.le-vibe/memory/MEMORY.md`** (indexed automatically by `MemoryRagStore` into `rag-cache.bin`).
-- Project-scoped memory lives centrally in **`~/.le-vibe/projects/<git-root-hash>/memory/MEMORY.md`** (zero `git status` noise).
+- Global memory lives in **`~/.lazybug/memory/MEMORY.md`** (indexed automatically by `MemoryRagStore` into `rag-cache.bin`).
+- Project-scoped memory lives centrally in **`~/.lazybug/projects/<git-root-hash>/memory/MEMORY.md`** (zero `git status` noise).
 - Structure each durable fact as a `### [key:slug] Title #tag1 #tag2` section with a `keywords: ...` line for high-recall `memory_search` hits.
 - Use `memory_write(content, key=..., keywords=[...], scope="global"|"project")` during sessions to upsert new facts, or `/memory` to inspect stored memories.
 
 ## 4. Searching Past Sessions
-- Run `/search <query>` inside `le-vibe` to run pure-Rust BM25 search across all saved JSONL sessions in `~/.le-vibe/sessions/` and `~/.le-vibe/projects/*/sessions/`.
-- To index older Pi JSONL sessions too, copy desired `.jsonl` files into `~/.le-vibe/sessions/`.
+- Run `/search <query>` inside `lazybug` to run pure-Rust BM25 search across all saved JSONL sessions in `~/.lazybug/sessions/` and `~/.lazybug/projects/*/sessions/`.
+- To index older Pi JSONL sessions too, copy desired `.jsonl` files into `~/.lazybug/sessions/`.
 
 ## 5. TUI Parity with Pi (P0–P2, complete)
 
-All user-visible strings, layout rules and colours live in `le-vibe-tui` (a strict leaf crate).
-`le-vibe-agent` forwards plain values (`args_json`, `duration_ms`, `Retry`) and formats nothing;
-`crates/le-vibe-cli/src/main.rs` only wires state. The read-only Pi oracle sits in the git-ignored
+All user-visible strings, layout rules and colours live in `lazybug-tui` (a strict leaf crate).
+`lazybug-agent` forwards plain values (`args_json`, `duration_ms`, `Retry`) and formats nothing;
+`crates/lazybug-cli/src/main.rs` only wires state. The read-only Pi oracle sits in the git-ignored
 `reference/pi-src`.
 
 ### P0 — tool cards, status strip, footer
@@ -55,7 +55,7 @@ All user-visible strings, layout rules and colours live in `le-vibe-tui` (a stri
 
 ## 6. Agent Loop & Compaction Parity (P0–P1, complete)
 
-All context-lifecycle logic lives in `le-vibe-agent`; `main.rs`/`worker.rs` only pass plain values
+All context-lifecycle logic lives in `lazybug-agent`; `main.rs`/`worker.rs` only pass plain values
 (`context_window`, `reserve_tokens`, retry budget) and render the events they receive.
 
 | Item | Rule |
@@ -66,9 +66,9 @@ All context-lifecycle logic lives in `le-vibe-agent`; `main.rs`/`worker.rs` only
 | Overflow recovery | Compact once → retry the turn once (`overflow_recovery_attempted` latch, per prompt). Second overflow hard-fails with pi's text: *“Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.”* |
 | Retry schedule | `min(base * 2^(attempt-1), max)` with `base = 2000ms`, `max = 60000ms`, `max_retries = 3`; a provider `Retry-After` wins. |
 | Failed-attempt handling | The partial stream of a failed attempt is cleared before the retry, so it cannot be replayed twice (pi durably omits the attempt). |
-| Summarizer | `compact::summarize` (in `le-vibe-agent`) with the same retry policy; used by the loop, `/compact`, `/handover`, and bug reports. |
+| Summarizer | `compact::summarize` (in `lazybug-agent`) with the same retry policy; used by the loop, `/compact`, `/handover`, and bug reports. |
 | Events | `AgentEvent::Compaction { reason, summarized, kept, before_tokens }` → CLI maps `reason` onto `CompactionReason`; `TurnStart` clears the status strip. |
-| Verification gate | `le-vibe-agent::verification::VerificationGate` refuses a stop after an unverified edit (one nudge per prompt, then latches). pi has no equivalent — it relies on the Proof Loop prompt text. `settings.json` → `verify_edits` (default on) disables it. |
+| Verification gate | `lazybug-agent::verification::VerificationGate` refuses a stop after an unverified edit (one nudge per prompt, then latches). pi has no equivalent — it relies on the Proof Loop prompt text. `settings.json` → `verify_edits` (default on) disables it. |
 
 ## 7. Sessions Parity (P0–P1, complete)
 
@@ -77,7 +77,7 @@ All context-lifecycle logic lives in `le-vibe-agent`; `main.rs`/`worker.rs` only
 | Compaction boundary | `first_kept_entry_id` + `tokens_before` on the compaction entry; `context_entries()` = pi's `buildContextEntries` (summary once, then the kept window, then everything after). |
 | Branch summaries | `branch_with_summary(from_id, summary)` stores pi's `fromId` (the abandoned leaf); rewind summarizes the abandoned path, tree navigation does not. |
 | Labels | `EntryKind::Label` with `target_id`; last write wins, empty content clears. Labels never move the active leaf. |
-| Tree | `tree_nodes()` (nested, active flags, state-only entries re-parented) and `tree_rows()` (connectors + labels) live in `le-vibe-durable`; the CLI renders. |
+| Tree | `tree_nodes()` (nested, active flags, state-only entries re-parented) and `tree_rows()` (connectors + labels) live in `lazybug-durable`; the CLI renders. |
 | Fork | `/fork` and `/clone` both route to `fork_from`, writing a new session file and leaving the original alone. |
 | Legacy files | The three new fields are `Option` with `serde(default)`; pre-P0 JSONL loads unchanged and normal entries serialise without them. |
 
@@ -85,7 +85,7 @@ All context-lifecycle logic lives in `le-vibe-agent`; `main.rs`/`worker.rs` only
 
 | Item | Rule |
 | --- | --- |
-| Truncation | `le-vibe-tools::truncate` — 2000 lines / 50 KB, first limit hit wins, `TruncationResult { truncated_by, total_lines, output_lines, first_line_exceeds_limit, last_line_partial }`. `read` truncates the head (never a partial line); shells truncate the tail (may clip the final line) and spill the full output to a temp file named in the notice. |
+| Truncation | `lazybug-tools::truncate` — 2000 lines / 50 KB, first limit hit wins, `TruncationResult { truncated_by, total_lines, output_lines, first_line_exceeds_limit, last_line_partial }`. `read` truncates the head (never a partial line); shells truncate the tail (may clip the final line) and spill the full output to a temp file named in the notice. |
 | `read` | Offset past EOF is an **error**, not an empty result. Truncation emits `[Showing lines A-B of T. Use offset=N to continue.]`; a single over-limit line points at `sed -n 'Np' <path>`. |
 | Shell exit codes | A non-zero exit is a **tool error** whose body still starts with the verbatim `exit_code=N` line, so the UI renders an error card while `VerificationGate` keeps parsing `exit_code=0` as the only success signal. |
 | Shell timeout | Kills the whole **process tree** (`taskkill /T /F`, `kill -TERM -pid`), not just the shell. |
@@ -99,10 +99,10 @@ All context-lifecycle logic lives in `le-vibe-agent`; `main.rs`/`worker.rs` only
 | MCP progress | Any notification received restarts the request deadline — a slow job that reports progress is not a timeout (pi: “Progress notifications reset it”). |
 
 ### Intentional deviations
-- **OSC 133 is dormant.** Pi renders inline, so its prompt zones sit in scrollback. `le-vibe` draws an
+- **OSC 133 is dormant.** Pi renders inline, so its prompt zones sit in scrollback. `lazybug` draws an
 alternate buffer, which has no scrollback, so the marks would be invisible. Writing escape bytes into
 cell symbols would corrupt `unicode-width` math and the `ResyncBackend` diff path, so the sequences
-are exposed as a tested capability (`LE_VIBE_OSC133=1` gate ready) and wiring them stays deferred
+are exposed as a tested capability (`LAZYBUG_OSC133=1` gate ready) and wiring them stays deferred
 until an inline renderer exists.
 - **Generic arg order is alphabetical.** `serde_json` sorts object keys, so pairs come out
 `amount=5 private=true title="Thanks!"` rather than pi's model-argument order. Fixing it needs the
@@ -110,21 +110,21 @@ workspace-wide `preserve_order` feature; deterministic ordering is the better tr
 - **OSC 133 + tool calls.** Pi skips the zone when a message has tool calls; `prompt_zone_for()`
 encodes that rule so a future inline renderer inherits it for free.
 - **"Recoverable length" needs a configured output cap.** Pi compares `usage.output` against the
-model's `maxTokens`; `le-vibe` has no per-model output cap in the agent, so only the unambiguous
+model's `maxTokens`; `lazybug` has no per-model output cap in the agent, so only the unambiguous
 signature (a `length` stop with **zero** output) triggers overflow recovery. A genuinely truncated
 answer keeps the existing truncated-tool-call guidance instead.
-- **`active_branch()` still short-circuits at compaction.** Pi has one walk; `le-vibe` keeps two so
+- **`active_branch()` still short-circuits at compaction.** Pi has one walk; `lazybug` keeps two so
   existing UI listings and resume previews don't suddenly grow. `context_entries()` is the pi-exact
   compaction-aware walk and is what the agent sends to the model. Sessions P0 removed the earlier
   re-append workaround — the boundary now lives on the compaction entry as `first_kept_entry_id`.
-- **Tree flattening lives in `le-vibe-durable`, not the UI.** Pi's `tree-selector.ts` builds the
-  connector rows in the component; `le-vibe` has no session-aware UI crate, so `tree_rows()` owns the
+- **Tree flattening lives in `lazybug-durable`, not the UI.** Pi's `tree-selector.ts` builds the
+  connector rows in the component; `lazybug` has no session-aware UI crate, so `tree_rows()` owns the
   projection and the CLI only decorates it. It keeps ~86 lines of graph walking out of `worker.rs`.
-- **The verification gate is le-vibe-only.** pi enforces "prove it works" through prose in the Proof
-  Loop prompt; a long turn erodes that, so `le-vibe` checks it in Rust. It nudges once and then gives
+- **The verification gate is lazybug-only.** pi enforces "prove it works" through prose in the Proof
+  Loop prompt; a long turn erodes that, so `lazybug` checks it in Rust. It nudges once and then gives
   up rather than looping, and it reads the shell `exit_code=` because a failing command is still a
   successful tool call.
-- **Label clearing is an empty label entry.** Pi stores `label: undefined` in JSON; `le-vibe` stores
+- **Label clearing is an empty label entry.** Pi stores `label: undefined` in JSON; `lazybug` stores
   an empty `content` string, because `SessionEntry.content` is non-optional. Same last-write-wins
   resolution.
 - **`/compact`, `/handover`, bug reports summarize everything.** They pass `keep_recent_tokens = 0`,

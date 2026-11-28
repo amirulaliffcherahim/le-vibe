@@ -4,9 +4,9 @@ import json
 from pathlib import Path
 import pytest
 
-from le_vibe.bridge import BridgeRuntime
-from le_vibe.policy import PermissionStore
-from le_vibe.providers import (
+from lazybug.bridge import BridgeRuntime
+from lazybug.policy import PermissionStore
+from lazybug.providers import (
     auth_status,
     list_models,
     save_api_key,
@@ -16,7 +16,7 @@ from le_vibe.providers import (
 
 def test_auth_status_and_catalog_never_leak_secrets(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     auth_file = tmp_path / "auth.json"
-    monkeypatch.setenv("LE_VIBE_AUTH_FILE", str(auth_file))
+    monkeypatch.setenv("LAZYBUG_AUTH_FILE", str(auth_file))
 
     secret_ds = "sk-deepseek-super-secret-token-999"
     secret_vibe = "mistral-super-secret-key-888"
@@ -52,7 +52,7 @@ async def test_bridge_errors_and_responses_do_not_leak_tokens(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     auth_file = tmp_path / "auth.json"
-    monkeypatch.setenv("LE_VIBE_AUTH_FILE", str(auth_file))
+    monkeypatch.setenv("LAZYBUG_AUTH_FILE", str(auth_file))
     secret = "sk-leak-check-1234567890"
     save_api_key("deepseek", secret, auth_file=auth_file)
 

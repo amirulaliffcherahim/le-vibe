@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from le_vibe.extensions import ExtensionHost, PythonToolSpec
-from le_vibe.providers import (
+from lazybug.extensions import ExtensionHost, PythonToolSpec
+from lazybug.providers import (
     Message,
     ModelSpec,
     StreamOptions,

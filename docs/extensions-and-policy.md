@@ -1,6 +1,6 @@
 # Python Extensions & Policies
 
-## Policies (`python/le_vibe/policy/__init__.py`)
+## Policies (`python/lazybug/policy/__init__.py`)
 
 `PermissionStore` evaluates every tool call in order:
 1. Hardcoded `_DANGEROUS_SHELL_PATTERNS` (`rm -rf /`, `mkfs`, `dd if=`, etc.) — **always denied**, even in `yolo` mode.
@@ -10,14 +10,14 @@
 5. `tool_permissions` (`always` / `ask` / `never`) and `allowed_commands` wildcard rules.
 
 Files loaded automatically on startup (and `/reload`):
-- `~/.le-vibe/policy.json` (global)
-- `<cwd>/.le-vibe/policy.json` (project override)
+- `~/.lazybug/policy.json` (global)
+- `<cwd>/.lazybug/policy.json` (project override)
 
 See `examples/policies/` (`balanced.json`, `strict.json`, `ci_readonly.json`).
 
-## Extensions (`python/le_vibe/extensions/__init__.py`)
+## Extensions (`python/lazybug/extensions/__init__.py`)
 
-`load_extensions_from_dirs` scans `~/.le-vibe/extensions/*.py` and `<cwd>/.le-vibe/extensions/*.py` (skipping `_*.py`) and calls `register(host: ExtensionHost)`.
+`load_extensions_from_dirs` scans `~/.lazybug/extensions/*.py` and `<cwd>/.lazybug/extensions/*.py` (skipping `_*.py`) and calls `register(host: ExtensionHost)`.
 
 - **Hooks**: `before_tool_call` (can return `{"blocked": True, "reason": "..."}`) and `after_tool_call`.
 - **Custom tools**: `host.register_tool(PythonToolSpec(...))` — merged into `CompletionRequest.tools` and routed through `PolicyPort` before execution.

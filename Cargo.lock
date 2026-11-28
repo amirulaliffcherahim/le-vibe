@@ -544,56 +544,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
-name = "le-vibe-agent"
-version = "0.7.0-beta.1"
+name = "lazybug-agent"
+version = "0.1.0"
 dependencies = [
- "le-vibe-durable",
- "le-vibe-mcp",
- "le-vibe-pybridge",
- "le-vibe-telemetry",
- "le-vibe-tools",
+ "lazybug-durable",
+ "lazybug-mcp",
+ "lazybug-pybridge",
+ "lazybug-telemetry",
+ "lazybug-tools",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
 ]
 
 [[package]]
-name = "le-vibe-cli"
-version = "0.7.0-beta.1"
+name = "lazybug-cli"
+version = "0.1.0"
 dependencies = [
- "le-vibe-agent",
- "le-vibe-durable",
- "le-vibe-mcp",
- "le-vibe-pybridge",
- "le-vibe-telemetry",
- "le-vibe-tools",
- "le-vibe-tui",
+ "lazybug-agent",
+ "lazybug-durable",
+ "lazybug-mcp",
+ "lazybug-pybridge",
+ "lazybug-telemetry",
+ "lazybug-tools",
+ "lazybug-tui",
  "serde",
  "serde_json",
 ]
 
 [[package]]
-name = "le-vibe-durable"
-version = "0.7.0-beta.1"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "le-vibe-mcp"
-version = "0.7.0-beta.1"
-dependencies = [
- "le-vibe-pybridge",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "le-vibe-pybridge"
-version = "0.7.0-beta.1"
+name = "lazybug-durable"
+version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -601,8 +582,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "le-vibe-schema"
-version = "0.7.0-beta.1"
+name = "lazybug-mcp"
+version = "0.1.0"
+dependencies = [
+ "lazybug-pybridge",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "lazybug-pybridge"
+version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -610,19 +601,28 @@ dependencies = [
 ]
 
 [[package]]
-name = "le-vibe-telemetry"
-version = "0.7.0-beta.1"
+name = "lazybug-schema"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "lazybug-telemetry"
+version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
 ]
 
 [[package]]
-name = "le-vibe-tools"
-version = "0.7.0-beta.1"
+name = "lazybug-tools"
+version = "0.1.0"
 dependencies = [
- "le-vibe-pybridge",
- "le-vibe-schema",
+ "lazybug-pybridge",
+ "lazybug-schema",
  "regex",
  "serde",
  "serde_json",
@@ -630,8 +630,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "le-vibe-tui"
-version = "0.7.0-beta.1"
+name = "lazybug-tui"
+version = "0.1.0"
 dependencies = [
  "crossterm",
  "ratatui",

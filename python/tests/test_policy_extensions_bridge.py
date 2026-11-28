@@ -3,9 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 import pytest
 
-from le_vibe.bridge import BridgeRuntime
-from le_vibe.extensions import ExtensionHost, PythonToolSpec, discover_skills
-from le_vibe.policy import ApprovedRule, PermissionScope, PermissionStore, ToolPermission
+from lazybug.bridge import BridgeRuntime
+from lazybug.extensions import ExtensionHost, PythonToolSpec, discover_skills
+from lazybug.policy import ApprovedRule, PermissionScope, PermissionStore, ToolPermission
 
 
 def test_policy_blocks_dangerous_shell_and_enforces_trusted_folders(tmp_path: Path) -> None:
@@ -91,8 +91,8 @@ async def test_bridge_runtime_dispatch() -> None:
     assert policy_resp["result"]["action"] == "deny"
 
     # resolve_model reads the live catalog, so seed one entry for the test.
-    from le_vibe.providers import catalog
-    from le_vibe.providers.types import ModelSpec
+    from lazybug.providers import catalog
+    from lazybug.providers.types import ModelSpec
 
     catalog._DYNAMIC_MODELS["deepseek"] = (
         ModelSpec(
@@ -156,7 +156,7 @@ DESCRIPTION = "Lazy test tool"
 Path({str(marker)!r}).write_text("imported", encoding="utf-8")
 
 def register(host):
-    from le_vibe.extensions import PythonToolSpec
+    from lazybug.extensions import PythonToolSpec
     host.register_tool(
         PythonToolSpec(
             name="lazy_ping",

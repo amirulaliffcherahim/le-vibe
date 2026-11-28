@@ -1,10 +1,10 @@
 # CLI & Slash Commands Reference
 
-## CLI Usage (`crates/le-vibe-cli/src/cli.rs`)
+## CLI Usage (`crates/lazybug-cli/src/cli.rs`)
 
 ```sh
-le-vibe [OPTIONS] [--] [@files...] [prompt...]
-le-vibe <login|logout|auth|usage|mcp> [OPTIONS]
+lazybug [OPTIONS] [--] [@files...] [prompt...]
+lazybug <login|logout|auth|usage|mcp> [OPTIONS]
 ```
 
 Key flags:

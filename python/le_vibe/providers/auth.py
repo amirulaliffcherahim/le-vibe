@@ -839,14 +839,19 @@ def _read_stdin_auth_code() -> str:
         return ""
 
 
-def _is_fatal_oauth_error(resp: httpx.Response) -> bool:
-    if resp.status_code not in {400, 401}:
-        return False
+def _oauth_error_code(resp: httpx.Response) -> str:
+    """The RFC 6749 `error` code, which is safe to show (never the description or body)."""
     try:
-        err = str(resp.json().get("error") or "").strip().lower()
+        return str(resp.json().get("error") or "").strip().lower()
     except Exception:
+        return ""
+
+
+def _is_fatal_oauth_error(resp: httpx.Response) -> bool:
+    """A failure retrying cannot fix: the grant itself is dead."""
+    if resp.status_code not in {400, 401, 403}:
         return False
-    return err in _AGY_FATAL_OAUTH_ERRORS
+    return _oauth_error_code(resp) in _AGY_FATAL_OAUTH_ERRORS
 
 
 def _agy_endpoint_candidates() -> tuple[str, ...]:
@@ -1425,14 +1430,22 @@ def _resolve_oidc_credential(
                             delete_credential("agy", auth_file=auth_file)
                             return None
                         elif provider == "vibe":
-                            # Never swallow refresh errors on Vibe.
+                            # Never swallow refresh errors on Vibe, but say what the user can do.
+                            # The credential slot is shared with mistral-vibe, so a dead grant is
+                            # reported, not evicted: deleting it would sign the other client out.
+                            if _is_fatal_oauth_error(resp):
+                                raise MissingAPIKeyError("", "vibe")
                             raise RuntimeError(
-                                f"vibe OAuth refresh failed: HTTP {resp.status_code}"
+                                "vibe OAuth refresh is temporarily unavailable "
+                                f"(HTTP {resp.status_code}); the stored session was kept, retry later"
                             )
                         # agy keeps the stored token on transient/network errors.
                 except httpx.HTTPError as exc:
                     if provider == "vibe":
-                        raise RuntimeError(f"vibe OAuth refresh failed: {exc}") from exc
+                        raise RuntimeError(
+                            "vibe OAuth refresh is temporarily unavailable "
+                            f"({type(exc).__name__}); the stored session was kept, retry later"
+                        ) from exc
                     # agy keeps the stored token on transient/network errors.
 
         if provider == "vibe":

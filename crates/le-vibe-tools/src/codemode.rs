@@ -140,6 +140,10 @@ pub fn run_codemode_script(
 
     let mut line = String::new();
     let mut tool_calls_count = 0usize;
+    // A sub-tool that returned an error is a failed step, even when the script shrugged it off
+    // and printed `EXIT: 1` as ordinary text. Reporting those as success painted a green card
+    // over a broken command.
+    let mut failed_tool_calls = 0usize;
     loop {
         if started.elapsed() > deadline {
             let _ = child.kill();
@@ -170,6 +174,12 @@ pub fn run_codemode_script(
                 combined.push_str(err);
                 return Err(combined);
             }
+            if failed_tool_calls > 0 {
+                return Err(format!(
+                    "Script ran ({elapsed:.2}s) but {failed_tool_calls} of {tool_calls_count} tool \
+call(s) failed; the output above contains the error:\n{out}"
+                ));
+            }
             return Ok(format!(
                 "Script completed ({elapsed:.2}s, {tool_calls_count} tool call(s)):\n{out}"
             ));
@@ -180,7 +190,10 @@ pub fn run_codemode_script(
             let args = msg.get("args").cloned().unwrap_or_else(|| json!({}));
             let resp = match on_tool_call(tool_name, args) {
                 Ok(res) => json!({ "result": res }),
-                Err(err) => json!({ "error": err }),
+                Err(err) => {
+                    failed_tool_calls += 1;
+                    json!({ "error": err })
+                }
             };
             writeln!(stdin, "{resp}").map_err(|e| format!("codemode reply failed: {e}"))?;
             let _ = stdin.flush();
@@ -205,5 +218,29 @@ mod tests {
         .expect("codemode ok");
         assert!(out.contains("hello world"));
         assert!(out.contains("1 tool call(s)"));
+    }
+
+    #[test]
+    fn a_failed_sub_tool_turn_is_reported_as_an_error_not_a_green_done() {
+        // The script caught the failure and printed ordinary text, so the old code reported
+        // success while the transcript showed `EXIT: 1`.
+        let out = run_codemode_script(
+            "try:\n    tools.run(cmd='tail')\nexcept Exception as e:\n    print('handled:', e)",
+            10_000,
+            |name, _args| {
+                assert_eq!(name, "run");
+                Err("tail : The term 'tail' is not recognized".to_string())
+            },
+        );
+        let err = out.expect_err("a failed sub-tool call must not read as success");
+        assert!(err.contains("1 of 1 tool call(s) failed"), "got: {err}");
+        assert!(err.contains("handled:"), "the script output is kept: {err}");
+    }
+
+    #[test]
+    fn a_clean_script_still_reads_as_success() {
+        let out = run_codemode_script("print('fine')", 10_000, |_n, _a| Ok(String::new()))
+            .expect("no sub-tool failures means success");
+        assert!(out.contains("Script completed") && out.contains("fine"));
     }
 }

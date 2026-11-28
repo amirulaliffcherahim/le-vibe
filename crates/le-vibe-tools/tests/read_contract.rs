@@ -71,14 +71,20 @@ fn offset_plus_limit_records_report_the_next_offset() {
 }
 
 #[test]
-fn a_single_oversized_line_points_at_bash() {
+fn a_single_oversized_line_names_a_command_that_exists_here() {
     let path = fixture("huge.txt", &"z".repeat(60 * 1024));
     let out = read_tool(&path, json!({})).expect("read");
     assert!(
-        out.contains("Use bash"),
-        "pi tells the model to use bash for one huge line, got:\n{out}"
+        out.contains("Read it with"),
+        "one huge line must point at a way to read it, got:\n{out}"
     );
-    assert!(out.contains("sed -n"), "{out}");
+    if cfg!(windows) {
+        // Suggesting `sed`/`head` on Windows primes a Unix reflex and burns a whole turn.
+        assert!(out.contains("PowerShell"), "{out}");
+        assert!(!out.contains("sed -n"), "unix hint leaked on windows: {out}");
+    } else {
+        assert!(out.contains("sed -n"), "{out}");
+    }
 }
 
 #[test]

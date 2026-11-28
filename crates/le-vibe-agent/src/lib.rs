@@ -179,6 +179,37 @@ impl Default for AgentConfig {
 
 const MODE_REMINDER_PREFIX: &str = "<system-reminder>Operational mode changed";
 
+/// Appended (never prepended) so the `exit_code=...` first line the verification gate reads
+/// stays first, and compact enough that repeating it costs almost nothing.
+pub const REPEAT_CALL_NOTE: &str = "[Note: this exact tool call already ran in the previous step \
+with the same output; use the result above and try a different step.]";
+
+/// Flags a tool call that repeats the immediately preceding one with an identical result.
+///
+/// Every step re-sends the whole transcript, so a duplicated call is the most expensive kind of
+/// wasted turn. The state is per turn loop: a different tool, different arguments or a changed
+/// output simply becomes the new baseline, so re-running a test after an edit is never flagged.
+#[derive(Default)]
+struct RepeatCallGuard {
+    last: Option<(String, String, String)>,
+}
+
+impl RepeatCallGuard {
+    fn notice(&mut self, name: &str, args_json: &str, output: &str) -> Option<&'static str> {
+        let args = serde_json::from_str::<serde_json::Value>(args_json)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|_| args_json.trim().to_string());
+        let repeated = self
+            .last
+            .as_ref()
+            .is_some_and(|(prev_name, prev_args, prev_out)| {
+                prev_name == name && prev_args == &args && prev_out == output
+            });
+        self.last = Some((name.to_string(), args, output.to_string()));
+        repeated.then_some(REPEAT_CALL_NOTE)
+    }
+}
+
 pub fn mode_transition_reminder(prev: Option<&str>, current: &str) -> Option<String> {
     if prev == Some(current) {
         return None;
@@ -749,6 +780,7 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
     let cwd_for_hooks = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let hooks = HookRegistry::load_default(&cwd_for_hooks, true);
     let mut last_partial_text = String::new();
+    let mut repeat_guard = RepeatCallGuard::default();
     let mut cumulative_usage = le_vibe_pybridge::Usage {
         input_tokens: 0,
         output_tokens: 0,
@@ -1224,7 +1256,7 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                 }
                 // Observe before compression: the gate needs the raw `exit_code=N` line.
                 gate.observe_tool_result(&tc.name, is_error, &output);
-                let capped_output = match &config.output_store {
+                let mut capped_output = match &config.output_store {
                     Some(arc) => {
                         if let Ok(mut guard) = arc.lock() {
                             compress_tool_output(&tc.name, &output, &mut guard)
@@ -1237,6 +1269,10 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                         compress_tool_output(&tc.name, &output, &mut local)
                     }
                 };
+                if let Some(note) = repeat_guard.notice(&tc.name, &args_json_str, &output) {
+                    capped_output.push('\n');
+                    capped_output.push_str(note);
+                }
                 let _ = session.append_tool_result(&tc.id, &tc.name, &capped_output);
                 on_event(AgentEvent::ToolCallEnd {
                     id: tc.id.clone(),
@@ -1687,7 +1723,7 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                 tc.name.as_str()
             };
             gate.observe_tool_result(&tc.name, is_error, &output);
-            let capped_output = match &config.output_store {
+            let mut capped_output = match &config.output_store {
                 Some(arc) => {
                     if let Ok(mut guard) = arc.lock() {
                         compress_tool_output(route_tool, &output, &mut guard)
@@ -1700,6 +1736,10 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                     compress_tool_output(route_tool, &output, &mut local)
                 }
             };
+            if let Some(note) = repeat_guard.notice(&tc.name, &tc.arguments.to_string(), &output) {
+                capped_output.push('\n');
+                capped_output.push_str(note);
+            }
             let _ = session.append_tool_result(&tc.id, &tc.name, &capped_output);
             on_event(AgentEvent::ToolCallEnd {
                 id: tc.id.clone(),
@@ -2434,5 +2474,58 @@ mod tests {
         assert_eq!(roles, vec!["user", "assistant", "user"]);
         assert!(bridge.seen_messages[0].content.contains("<session_summary>"));
         assert_eq!(bridge.seen_messages[2].content, "continue now");
+    }
+}
+
+#[cfg(test)]
+mod repeat_call_guard_tests {
+    use super::{REPEAT_CALL_NOTE, RepeatCallGuard};
+
+    #[test]
+    fn identical_consecutive_calls_get_the_nudge() {
+        let mut guard = RepeatCallGuard::default();
+        let args = r#"{"path":"src/lib.rs"}"#;
+        assert_eq!(guard.notice("read", args, "same body"), None);
+        assert_eq!(guard.notice("read", args, "same body"), Some(REPEAT_CALL_NOTE));
+    }
+
+    #[test]
+    fn argument_order_does_not_hide_a_repeat() {
+        let mut guard = RepeatCallGuard::default();
+        guard.notice("grep", r#"{"pattern":"a","path":"b"}"#, "hit");
+        // Same call, keys written in the other order: still the same call.
+        assert_eq!(
+            guard.notice("grep", r#"{"path":"b","pattern":"a"}"#, "hit"),
+            Some(REPEAT_CALL_NOTE)
+        );
+    }
+
+    #[test]
+    fn a_changed_output_is_never_flagged() {
+        let mut guard = RepeatCallGuard::default();
+        let args = r#"{"command":"cargo test"}"#;
+        guard.notice("powershell", args, "exit_code=1\nfailures: 1");
+        assert_eq!(guard.notice("powershell", args, "exit_code=0\nfailures: 0"), None);
+    }
+
+    #[test]
+    fn an_intervening_step_resets_the_baseline() {
+        let mut guard = RepeatCallGuard::default();
+        let args = r#"{"path":"src/lib.rs"}"#;
+        guard.notice("read", args, "body");
+        guard.notice("edit", r#"{"path":"src/lib.rs"}"#, "ok");
+        // Re-reading the file after an edit is a legitimate step, even if the text is unchanged.
+        assert_eq!(guard.notice("read", args, "body"), None);
+    }
+
+    #[test]
+    fn the_note_is_a_trailing_line_and_keeps_line_one_intact() {
+        assert!(REPEAT_CALL_NOTE.starts_with("[Note:"));
+        let output = "exit_code=1\nbuild failed";
+        let mut body = String::from(output);
+        body.push('\n');
+        body.push_str(REPEAT_CALL_NOTE);
+        assert_eq!(body.lines().next(), Some("exit_code=1"));
+        assert!(body.ends_with(REPEAT_CALL_NOTE));
     }
 }

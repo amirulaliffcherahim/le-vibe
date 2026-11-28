@@ -148,3 +148,49 @@ fn every_mode_states_its_own_method_and_write_permission() {
     assert!(AgentMode::Rea.can_write());
     assert!(AgentMode::Cyber.can_write());
 }
+
+#[test]
+fn trivial_inputs_are_told_to_answer_without_tools() {
+    // A one-word prompt must not become a filesystem raid: the cost of one unnecessary turn is
+    // larger than any context saving, and a 4-call spiral on "test" is pure waste.
+    let core = static_core(AgentMode::Normal, "C:/work/demo");
+    assert!(
+        core.contains("no tool calls"),
+        "the contract must authorise a zero-tool reply: {core}"
+    );
+    assert!(
+        core.contains("1-2 word"),
+        "the contract must name trivial one- or two-word inputs: {core}"
+    );
+}
+
+#[test]
+fn the_environment_block_marks_whether_the_cwd_is_a_repo() {
+    let dir = std::env::temp_dir().join(format!("le-vibe-nonrepo-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cwd = dir.display().to_string();
+
+    let outside = build_system_prompt(AgentMode::Normal, "powershell", &cwd, "", &[], "");
+    assert!(
+        outside.contains("workspace=not a git repo"),
+        "starting in a plain directory must be stated so the model does not scan for a project"
+    );
+
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    let inside = build_system_prompt(AgentMode::Normal, "powershell", &cwd, "", &[], "");
+    assert!(inside.contains("workspace=git repo"), "{inside}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_hints_name_powershell_and_rule_out_unix_tools() {
+    let core = static_core(AgentMode::Normal, "powershell");
+    assert!(core.contains("PowerShell cmdlets"), "{core}");
+    assert!(
+        core.contains("Unix `tail`/`head`/`sed`/`grep` are unavailable"),
+        "{core}"
+    );
+}

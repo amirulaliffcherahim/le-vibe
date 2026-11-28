@@ -553,6 +553,10 @@ impl PythonBridge {
         )
     }
 
+    pub fn load_extension(&mut self, name: &str) -> Result<Value, BridgeError> {
+        self.call("extensions.load", json!({ "name": name }))
+    }
+
     pub fn list_skills(&mut self, roots: &[&str]) -> Result<Vec<SkillInfo>, BridgeError> {
         let val = self.call("extensions.list_skills", json!({ "roots": roots }))?;
         Ok(serde_json::from_value(val)?)

@@ -11,7 +11,14 @@ from pathlib import Path
 import sys
 from typing import Any
 
-from le_vibe.extensions import ExtensionHost, discover_skills, load_extensions_from_dirs
+from le_vibe.extensions import (
+    ExtensionHost,
+    ExtensionManifest,
+    discover_extension_manifests,
+    discover_skills,
+    load_extension_file,
+    load_extensions_from_dirs,
+)
 from le_vibe.policy import PermissionStore
 from le_vibe.providers import (
     Message,
@@ -135,43 +142,44 @@ def _default_extension_dirs() -> list[Path]:
     return [Path.home() / ".le-vibe" / "extensions", Path.cwd() / ".le-vibe" / "extensions"]
 
 
-def _load_configured_extensions(host: ExtensionHost) -> list[str]:
+def _load_configured_extensions(
+    host: ExtensionHost, dirs: Sequence[Path] | None = None
+) -> list[str]:
     if os.environ.get("LE_VIBE_NO_EXTENSIONS") == "1":
         return []
-    dirs = _default_extension_dirs()
-    loaded = load_extensions_from_dirs(host, dirs)
+    ext_dirs = list(dirs) if dirs is not None else _default_extension_dirs()
+    # Only eager extensions (e.g. policy/guard hooks) load at startup; tool-providing
+    # extensions stay lazy until activated via `extensions.load` / `/ext load <name>`.
+    loaded = load_extensions_from_dirs(host, ext_dirs, eager_only=True)
     extra_raw = os.environ.get("LE_VIBE_EXTRA_EXTENSIONS", "").strip()
     if extra_raw:
-        import importlib.util
-
         for item in extra_raw.split(os.pathsep):
             p = Path(item.strip())
             if not p.exists():
                 continue
             if p.is_dir():
-                loaded.extend(load_extensions_from_dirs(host, [p]))
+                loaded.extend(load_extensions_from_dirs(host, [p], eager_only=True))
             elif p.is_file() and p.suffix == ".py":
-                mod_name = f"le_vibe_ext_extra_{p.stem}_{abs(hash(str(p.resolve())))}"
-                try:
-                    spec = importlib.util.spec_from_file_location(mod_name, p)
-                    if spec and spec.loader:
-                        module = importlib.util.module_from_spec(spec)
-                        sys.modules[mod_name] = module
-                        spec.loader.exec_module(module)
-                        reg = getattr(module, "register", None)
-                        if callable(reg):
-                            reg(host)
-                            loaded.append(str(p))
-                except Exception as exc:
-                    host.load_errors.append(f"{p}: {exc}")
+                if path_str := load_extension_file(host, p):
+                    loaded.append(path_str)
     return loaded
 
 
 class BridgeRuntime:
-    def __init__(self) -> None:
+    def __init__(self, *, extension_dirs: Sequence[Path] | None = None) -> None:
         self.policy = PermissionStore.load_from_files(_default_policy_paths())
         self.extensions = ExtensionHost()
-        self.loaded_extensions = _load_configured_extensions(self.extensions)
+        self._extension_dirs = (
+            list(extension_dirs) if extension_dirs is not None else _default_extension_dirs()
+        )
+        self._manifests: list[ExtensionManifest] = (
+            []
+            if os.environ.get("LE_VIBE_NO_EXTENSIONS") == "1"
+            else discover_extension_manifests(self._extension_dirs)
+        )
+        self.loaded_extensions = _load_configured_extensions(
+            self.extensions, self._extension_dirs
+        )
 
     def reload_policy(self) -> None:
         yolo = self.policy.yolo
@@ -179,8 +187,38 @@ class BridgeRuntime:
 
     def reload_extensions(self) -> list[str]:
         self.extensions.clear()
-        self.loaded_extensions = _load_configured_extensions(self.extensions)
+        self._manifests = (
+            []
+            if os.environ.get("LE_VIBE_NO_EXTENSIONS") == "1"
+            else discover_extension_manifests(self._extension_dirs)
+        )
+        self.loaded_extensions = _load_configured_extensions(
+            self.extensions, self._extension_dirs
+        )
         return self.loaded_extensions
+
+    def load_extension(self, name: str) -> dict[str, Any]:
+        needle = name.strip()
+        if not needle:
+            raise ValueError("Extension name is required")
+        manifest = next((m for m in self._manifests if m.name == needle), None)
+        if manifest is None:
+            # Re-scan in case an extension was added since startup.
+            self._manifests = discover_extension_manifests(self._extension_dirs)
+            manifest = next((m for m in self._manifests if m.name == needle), None)
+        if manifest is None:
+            avail = ", ".join(m.name for m in self._manifests) or "(none)"
+            raise KeyError(f"Unknown extension {needle!r}. Available: {avail}")
+        path_str = str(manifest.path)
+        already = path_str in self.loaded_extensions
+        if not already:
+            if loaded_path := load_extension_file(self.extensions, manifest.path):
+                self.loaded_extensions.append(loaded_path)
+        return {
+            "loaded": manifest.name,
+            "already_loaded": already,
+            "tools": [t.name for t in self.extensions.list_tools()],
+        }
 
     async def handle_request(
         self,
@@ -323,6 +361,9 @@ class BridgeRuntime:
                 for s in discover_skills(roots)
             ]
 
+        if method == "extensions.load":
+            return self.load_extension(str(params.get("name", "")))
+
         if method == "extensions.reload":
             loaded = self.reload_extensions()
             return {
@@ -337,6 +378,15 @@ class BridgeRuntime:
         if method == "extensions.status":
             return {
                 "loaded": list(self.loaded_extensions),
+                "available": [
+                    {
+                        "name": m.name,
+                        "lifecycle": m.lifecycle,
+                        "description": m.description,
+                        "loaded": str(m.path) in self.loaded_extensions,
+                    }
+                    for m in self._manifests
+                ],
                 "tools": [t.name for t in self.extensions.list_tools()],
                 "hooks": self.extensions.hook_events(),
                 "commands": [

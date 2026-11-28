@@ -40,10 +40,10 @@ use crate::rpc::{run_rpc_mode, run_streaming_prompt};
 use crate::settings::{
     arg_value, current_git_branch, current_repo_name, cwd_string, default_mcp_paths,
     default_model_for, format_cwd, load_history, load_layered_settings, load_scope,
-    open_session_with_opts, project_settings_file, resolve_python_dir, resolve_python_exe,
-    pinned_tools, save_history, save_scope, save_setting, save_setting_for_scope,
-    scan_workspace_files, self_repo_path, sessions_dir, settings_file, summarize_git_status,
-    trust_cwd_in_policy,
+    open_session_with_opts, pinned_tools, project_settings_file, resolve_initial_model_offline,
+    resolve_python_dir, resolve_python_exe, save_history, save_scope, save_setting,
+    save_setting_for_scope, scan_workspace_files, self_repo_path, sessions_dir, settings_file,
+    summarize_git_status, trust_cwd_in_policy,
 };
 use crate::worker::{WorkerCmd, WorkerMsg, spawn_tui_worker, update_quota_badges, usage_report};
 
@@ -373,11 +373,11 @@ fn main() {
 
     let python_dir = resolve_python_dir();
     let python_exe = resolve_python_exe(&python_dir);
-    let mut bridge = PythonBridge::spawn(&python_exe, &python_dir)
-        .expect("failed to start le-vibe Python bridge");
 
     match action {
         CliAction::Subcommand(sub, sub_args) => {
+            let mut bridge = PythonBridge::spawn(&python_exe, &python_dir)
+                .expect("failed to start le-vibe Python bridge");
             match sub.as_str() {
                 "login" => handle_login(&mut bridge, &sub_args),
                 "auth" => {
@@ -388,6 +388,8 @@ fn main() {
             }
         }
         CliAction::ListModels(query) => {
+            let mut bridge = PythonBridge::spawn(&python_exe, &python_dir)
+                .expect("failed to start le-vibe Python bridge");
             let models = bridge
                 .refresh_models(None)
                 .or_else(|_| bridge.list_models(None))
@@ -404,101 +406,114 @@ fn main() {
             }
         }
         CliAction::Run(opts) => {
-            let mut provider = opts.provider.clone().unwrap_or_else(|| "vibe".to_string());
-            let mut model = opts
-                .model
-                .clone()
-                .unwrap_or_else(|| default_model_for(&mut bridge, &provider));
             let json_mode = opts.mode.as_deref() == Some("json");
             let rpc_mode = opts.mode.as_deref() == Some("rpc");
+            let non_tty = !std::io::IsTerminal::is_terminal(&std::io::stdout());
+            let initial_prompt = build_initial_prompt(&opts);
+            let is_non_interactive = rpc_mode
+                || ((opts.print_mode || json_mode || non_tty)
+                    && (opts.print_mode || json_mode || initial_prompt.is_some()));
+
             let mut session = open_session_with_opts(&opts);
             let telemetry = TelemetryRecorder::new();
 
-            if opts.yolo {
-                let _ = bridge.set_yolo(true);
-            }
+            if is_non_interactive {
+                let mut bridge = PythonBridge::spawn(&python_exe, &python_dir)
+                    .expect("failed to start le-vibe Python bridge");
+                let mut provider = opts.provider.clone().unwrap_or_else(|| "vibe".to_string());
+                let mut model = opts
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| default_model_for(&mut bridge, &provider));
+                if opts.yolo {
+                    let _ = bridge.set_yolo(true);
+                }
 
-            if rpc_mode {
-                run_rpc_mode(&mut bridge, &mut session, &telemetry, &mut provider, &mut model);
+                if rpc_mode {
+                    run_rpc_mode(&mut bridge, &mut session, &telemetry, &mut provider, &mut model);
+                    return;
+                }
+
+                let prompt = initial_prompt.unwrap_or_default();
+                if !json_mode {
+                    eprintln!("{}", render_status_bar(&provider, &model));
+                }
+                let agent_mode = opts
+                    .agent_mode
+                    .as_deref()
+                    .and_then(AgentMode::from_name)
+                    .unwrap_or(AgentMode::Normal);
+                let allowed_tools = opts
+                    .allowed_tools
+                    .or_else(pinned_tools)
+                    .or_else(|| agent_mode.allowed_tools());
+                let mut sys = build_system_prompt(
+                    agent_mode,
+                    "powershell",
+                    &cwd_string(),
+                    &self_repo_path(),
+                    &[],
+                    "",
+                );
+                if let Some(extra) = &opts.system_prompt_extra
+                    && !extra.trim().is_empty()
+                {
+                    sys.push_str(&format!("\n\n<cli_instructions>\n{}\n</cli_instructions>", extra.trim()));
+                }
+                let model_key = format!("{provider}/{model}");
+                if let Some(note) = le_vibe_tools::memory::MemoryRagStore::open_default()
+                    .read_by_key(&format!("model:{model_key}"))
+                {
+                    le_vibe_tui::append_model_profile(&mut sys, &model_key, &note);
+                }
+                let layered_p = load_layered_settings().0;
+                let cfg = AgentConfig {
+                    provider,
+                    model,
+                    system_prompt: Some(sys),
+                    thinking_level: opts.thinking.unwrap_or_else(|| "medium".to_string()),
+                    max_turns: 40,
+                    max_retries: le_vibe_agent::DEFAULT_MAX_RETRIES,
+                    base_delay_ms: le_vibe_agent::DEFAULT_BASE_DELAY_MS,
+                    max_delay_ms: le_vibe_agent::DEFAULT_MAX_DELAY_MS,
+                    // `-p` has no model registry, so the threshold trigger stays off;
+                    // overflow recovery still works from provider error text.
+                    context_window: 0,
+                    reserve_tokens: le_vibe_agent::DEFAULT_RESERVE_TOKENS,
+                    verify_edits: true,
+                    allowed_tools,
+                    mode_name: Some(agent_mode.name().to_string()),
+                    codemode: layered_p
+                        .get("codemode")
+                        .cloned()
+                        .unwrap_or_else(|| "off".to_string()),
+                    steering_queue: None,
+                    output_store: Some(Arc::new(Mutex::new(le_vibe_agent::OutputStore::new()))),
+                    max_prompt_requests: layered_p
+                        .get("max_prompt_requests")
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(0),
+                    max_prompt_uncached_tokens: layered_p
+                        .get("max_prompt_uncached_tokens")
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(0),
+                    ..AgentConfig::default()
+                };
+                run_streaming_prompt(&mut bridge, &mut session, &telemetry, &cfg, &prompt, json_mode);
                 return;
             }
 
-            let non_tty = !std::io::IsTerminal::is_terminal(&std::io::stdout());
-            if opts.print_mode || json_mode || non_tty {
-                let initial_prompt = build_initial_prompt(&opts);
-                if opts.print_mode || json_mode || initial_prompt.is_some() {
-                    let prompt = initial_prompt.unwrap_or_default();
-                    if !json_mode {
-                        eprintln!("{}", render_status_bar(&provider, &model));
-                    }
-                    let agent_mode = opts
-                        .agent_mode
-                        .as_deref()
-                        .and_then(AgentMode::from_name)
-                        .unwrap_or(AgentMode::Normal);
-                    let allowed_tools = opts
-                        .allowed_tools
-                        .or_else(pinned_tools)
-                        .or_else(|| agent_mode.allowed_tools());
-                    let mut sys = build_system_prompt(
-                        agent_mode,
-                        "powershell",
-                        &cwd_string(),
-                        &self_repo_path(),
-                        &[],
-                        "",
-                    );
-                    if let Some(extra) = &opts.system_prompt_extra
-                        && !extra.trim().is_empty()
-                    {
-                        sys.push_str(&format!("\n\n<cli_instructions>\n{}\n</cli_instructions>", extra.trim()));
-                    }
-                    let model_key = format!("{provider}/{model}");
-                    if let Some(note) = le_vibe_tools::memory::MemoryRagStore::open_default()
-                        .read_by_key(&format!("model:{model_key}"))
-                    {
-                        le_vibe_tui::append_model_profile(&mut sys, &model_key, &note);
-                    }
-                    let layered_p = load_layered_settings().0;
-                    let cfg = AgentConfig {
-                        provider,
-                        model,
-                        system_prompt: Some(sys),
-                        thinking_level: opts.thinking.unwrap_or_else(|| "medium".to_string()),
-                        max_turns: 40,
-                        max_retries: le_vibe_agent::DEFAULT_MAX_RETRIES,
-                        base_delay_ms: le_vibe_agent::DEFAULT_BASE_DELAY_MS,
-                        max_delay_ms: le_vibe_agent::DEFAULT_MAX_DELAY_MS,
-                        // `-p` has no model registry, so the threshold trigger stays off;
-                        // overflow recovery still works from provider error text.
-                        context_window: 0,
-                        reserve_tokens: le_vibe_agent::DEFAULT_RESERVE_TOKENS,
-                        verify_edits: true,
-                        allowed_tools,
-                        mode_name: Some(agent_mode.name().to_string()),
-                        codemode: layered_p
-                            .get("codemode")
-                            .cloned()
-                            .unwrap_or_else(|| "off".to_string()),
-                        steering_queue: None,
-                        output_store: Some(Arc::new(Mutex::new(le_vibe_agent::OutputStore::new()))),
-                        max_prompt_requests: layered_p
-                            .get("max_prompt_requests")
-                            .and_then(|v| v.parse::<usize>().ok())
-                            .unwrap_or(0),
-                        max_prompt_uncached_tokens: layered_p
-                            .get("max_prompt_uncached_tokens")
-                            .and_then(|v| v.parse::<u64>().ok())
-                            .unwrap_or(0),
-                        ..AgentConfig::default()
-                    };
-                    run_streaming_prompt(&mut bridge, &mut session, &telemetry, &cfg, &prompt, json_mode);
-                    return;
-                }
-            }
-
+            // Interactive TUI: resolve initial model offline (0 Python, 0 network) so frame 1
+            // renders and accepts keystrokes immediately while PythonBridge warms in the worker.
+            let layered_boot = load_layered_settings().0;
+            let (provider, model) = resolve_initial_model_offline(
+                opts.provider.as_deref(),
+                opts.model.as_deref(),
+                &layered_boot,
+            );
             run_interactive_tui(
-                bridge,
+                python_exe,
+                python_dir,
                 session,
                 telemetry,
                 provider,
@@ -515,7 +530,8 @@ fn main() {
 
 #[allow(clippy::too_many_arguments)]
 fn run_interactive_tui(
-    bridge: PythonBridge,
+    python_exe: String,
+    python_dir: std::path::PathBuf,
     session: SessionStore,
     telemetry: TelemetryRecorder,
     initial_provider: String,
@@ -580,8 +596,8 @@ fn run_interactive_tui(
     }
     state.confirm_on_exit = parse_bool("confirm_on_exit", false);
     state.double_esc_rewind = parse_bool("double_esc_rewind", true);
-    state.status_text = Some("Syncing live model catalogs...".to_string());
-    state.is_busy = true;
+    state.status_text = None;
+    state.is_busy = false;
 
     let cwd_path = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let detected_project_resources = detect_project_resources(&cwd_path);
@@ -631,7 +647,9 @@ fn run_interactive_tui(
     let cancel = Arc::new(AtomicBool::new(false));
     let steering_queue: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
     let (cmd_tx, msg_rx, approval_tx, question_tx) = spawn_tui_worker(
-        bridge,
+        python_exe,
+        python_dir,
+        state.yolo,
         session,
         telemetry,
         Arc::clone(&cancel),
@@ -640,9 +658,6 @@ fn run_interactive_tui(
         Arc::clone(&logger),
         system_prompt_extra,
     );
-    if state.yolo {
-        let _ = cmd_tx.send(WorkerCmd::SetYolo(true));
-    }
     if state.codemode != "off" {
         let _ = cmd_tx.send(WorkerCmd::SetCodemode(state.codemode.clone()));
     }
@@ -1654,6 +1669,13 @@ fn run_interactive_tui(
                         None => "No forensic usage records found for this session yet.".to_string(),
                     };
                     state.blocks.push(TranscriptBlock::System(report));
+                    continue;
+                }
+                if let Some(arg) = input.strip_prefix("/ext load ") {
+                    let name = arg.trim();
+                    if !name.is_empty() {
+                        let _ = cmd_tx.send(WorkerCmd::LoadExtension(name.to_string()));
+                    }
                     continue;
                 }
                 if input == "/reload" {

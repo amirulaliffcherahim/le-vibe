@@ -21,7 +21,7 @@ pub use le_vibe_telemetry::TelemetryRecorder;
 use le_vibe_tools::codemode::run_codemode_script;
 use le_vibe_tools::hooks::HookRegistry;
 use le_vibe_tools::{
-    TodoStore, ToolError, builtin_tool_definitions, execute_builtin_tool,
+    TodoStore, ToolError, builtin_tool_definitions, core_tool_definitions, execute_builtin_tool,
     execute_builtin_tool_approved_cancellable, execute_todo_tool,
 };
 use serde::Serialize;
@@ -149,6 +149,8 @@ pub struct AgentConfig {
     pub prompt_uncached_counter: Option<Arc<AtomicU64>>,
     /// Subagent personas available to `spawn_agent(mode="...")`.
     pub subagent_personas: Vec<SubagentPersona>,
+    /// Active OS shell (`"powershell"` / `"bash"`), used to keep only the active shell in core.
+    pub active_shell: Option<String>,
 }
 
 /// Classify a successful reply as an overflow, if it is one.
@@ -208,6 +210,7 @@ impl Default for AgentConfig {
             prompt_request_counter: None,
             prompt_uncached_counter: None,
             subagent_personas: Vec::new(),
+            active_shell: None,
         }
     }
 }
@@ -855,7 +858,18 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
     let ext_tools = bridge.list_extension_tools().unwrap_or_default();
     let ext_tool_names: Vec<String> = ext_tools.iter().map(|t| t.name.clone()).collect();
     let codemode_setting = config.codemode.trim().to_lowercase();
-    let mut tools: Vec<_> = builtin_tool_definitions()
+    let default_shell = if cfg!(windows) { "powershell" } else { "bash" };
+    let active_shell = config
+        .active_shell
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(default_shell);
+    let base_builtins = if config.allowed_tools.is_some() {
+        builtin_tool_definitions()
+    } else {
+        core_tool_definitions(active_shell)
+    };
+    let mut tools: Vec<_> = base_builtins
         .into_iter()
         .filter(|t| {
             if t.name == "codemode" {
@@ -875,7 +889,7 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                 .is_none_or(|allow| allow.iter().any(|a| a == &t.name))
         })
         .collect();
-    if config.allowed_tools.is_none() {
+    if config.allowed_tools.is_none() || !ext_tools.is_empty() {
         let mut extra_tools = Vec::new();
         for ext in ext_tools {
             if !tools.iter().any(|t| t.name == ext.name)
@@ -884,7 +898,9 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                 extra_tools.push(ext);
             }
         }
-        if let Some(mgr) = mcp.as_deref() {
+        if config.allowed_tools.is_none()
+            && let Some(mgr) = mcp.as_deref()
+        {
             for m_tool in mgr.tool_definitions() {
                 if !tools.iter().any(|t| t.name == m_tool.name)
                     && !extra_tools.iter().any(|t| t.name == m_tool.name)
@@ -1847,6 +1863,7 @@ fn run_turn_loop_inner<B: ProviderPort + PolicyPort + ExtensionPort>(
                         prompt_request_counter: Some(Arc::clone(&req_counter)),
                         prompt_uncached_counter: Some(Arc::clone(&uncached_counter)),
                         subagent_personas: Vec::new(),
+                        ..AgentConfig::default()
                     };
                     let mut noop_ev = |_: AgentEvent| {};
                     let mut deny_all = |_: ApprovalRequest| ApprovalChoice::Deny;

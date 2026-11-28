@@ -194,13 +194,8 @@ impl AgentMode {
                 "grep".into(),
                 "find".into(),
                 "ls".into(),
-                "todo".into(),
-                "ask_user_question".into(),
-                "memory_search".into(),
-                "memory_read".into(),
                 "retrieve_output".into(),
-                "web_search".into(),
-                "fetch_content".into(),
+                "load_skill".into(),
             ]),
             AgentMode::Rea => Some(vec![
                 "read".into(),
@@ -209,11 +204,8 @@ impl AgentMode {
                 "ls".into(),
                 "bash".into(),
                 "powershell".into(),
-                "memory_search".into(),
-                "memory_read".into(),
                 "retrieve_output".into(),
-                "web_search".into(),
-                "fetch_content".into(),
+                "load_skill".into(),
             ]),
         }
     }
@@ -308,6 +300,7 @@ pub struct ModeSpec {
     pub thinking: Option<String>,
     pub max_turns: Option<usize>,
     pub tools: BTreeMap<String, bool>,
+    pub extensions: Vec<String>,
     pub body: String,
     pub builtin: Option<AgentMode>,
 }
@@ -321,16 +314,7 @@ const ALL_BUILTIN_TOOL_NAMES: &[&str] = &[
     "ls",
     "bash",
     "powershell",
-    "todo",
-    "ask_user_question",
-    "web_search",
-    "fetch_content",
     "retrieve_output",
-    "memory_search",
-    "memory_write",
-    "memory_read",
-    "memory_delete",
-    "spawn_agent",
     "load_skill",
     "codemode",
 ];
@@ -340,13 +324,8 @@ const READONLY_TOOL_NAMES: &[&str] = &[
     "grep",
     "find",
     "ls",
-    "todo",
-    "ask_user_question",
-    "memory_search",
-    "memory_read",
     "retrieve_output",
-    "web_search",
-    "fetch_content",
+    "load_skill",
 ];
 
 impl ModeSpec {
@@ -367,6 +346,7 @@ impl ModeSpec {
             thinking: None,
             max_turns: None,
             tools: BTreeMap::new(),
+            extensions: Vec::new(),
             body,
             builtin: Some(mode),
         }
@@ -448,6 +428,7 @@ pub fn parse_mode_markdown(id: &str, raw: &str) -> ModeSpec {
             thinking: None,
             max_turns: None,
             tools: BTreeMap::new(),
+            extensions: Vec::new(),
             body: String::new(),
             builtin: None,
         });
@@ -473,6 +454,7 @@ pub fn parse_mode_markdown(id: &str, raw: &str) -> ModeSpec {
 
     if let Some(fm) = frontmatter {
         let mut in_tools = false;
+        let mut in_extensions = false;
         for line in fm.lines() {
             let raw_trimmed = line.trim();
             if raw_trimmed.is_empty() || raw_trimmed.starts_with('#') {
@@ -489,7 +471,15 @@ pub fn parse_mode_markdown(id: &str, raw: &str) -> ModeSpec {
                 }
                 continue;
             }
+            if in_extensions && indented {
+                let item = unquote_yaml(raw_trimmed.trim_start_matches('-').trim());
+                if !item.is_empty() && !spec.extensions.contains(&item) {
+                    spec.extensions.push(item);
+                }
+                continue;
+            }
             in_tools = false;
+            in_extensions = false;
             if let Some((k, v)) = raw_trimmed.split_once(':') {
                 let key = k.trim().to_ascii_lowercase();
                 let val = unquote_yaml(v);
@@ -517,6 +507,18 @@ pub fn parse_mode_markdown(id: &str, raw: &str) -> ModeSpec {
                     }
                     "tools" => {
                         in_tools = true;
+                    }
+                    "extensions" => {
+                        if val.is_empty() {
+                            in_extensions = true;
+                        } else {
+                            for part in val.trim_matches(['[', ']']).split(',') {
+                                let ext = unquote_yaml(part);
+                                if !ext.is_empty() && !spec.extensions.contains(&ext) {
+                                    spec.extensions.push(ext);
+                                }
+                            }
+                        }
                     }
                     _ => {}
                 }

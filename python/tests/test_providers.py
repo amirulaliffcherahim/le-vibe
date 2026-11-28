@@ -887,3 +887,56 @@ async def test_vibe_truncated_or_error_finish_reason_raises_incomplete(
                     TranscriptContext(messages=[Message(role="user", content="hi")]),
                 )
 
+
+def test_agy_refresh_missing_oauth_client_raises_instead_of_returning_expired(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from le_vibe.providers import auth, save_oidc_tokens
+
+    auth_file = tmp_path / "auth.json"
+    monkeypatch.setenv("LE_VIBE_AUTH_FILE", str(auth_file))
+    monkeypatch.delenv("AGY_OAUTH_CLIENT_ID", raising=False)
+    monkeypatch.delenv("AGY_OAUTH_CLIENT_SECRET", raising=False)
+    monkeypatch.setattr(auth, "AGY_DEFAULT_CLIENT_ID", "")
+    monkeypatch.setattr(auth, "AGY_DEFAULT_CLIENT_SECRET", "")
+    monkeypatch.setattr(auth, "_AGY_OAUTH_CLIENT_CACHE", None)
+
+    save_oidc_tokens(
+        "agy",
+        access_token="ya29.expired",
+        refresh_token="1//ref",
+        expires_at=1.0,
+        token_endpoint=auth.AGY_OAUTH_TOKEN_URL,
+        project_id="proj-1",
+        auth_file=auth_file,
+    )
+
+    with pytest.raises(RuntimeError, match="Missing AGY_OAUTH_CLIENT_ID"):
+        auth.resolve_api_key("agy", env={}, auth_file=auth_file)
+
+
+def test_agy_oauth_client_discovery_from_binary_caches_to_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from le_vibe.providers import auth
+
+    fake_cid = "123456789012-abcdefghijklmnopqrstuvwx.apps.googleusercontent.com"
+    fake_csec = "GOCSPX" + "-" + ("A" * 28)
+    fake_bin = tmp_path / "agy"
+    fake_bin.write_bytes(b"ELF\x00" + fake_cid.encode() + b"\x00" + fake_csec.encode() + b"\x00")
+
+    monkeypatch.delenv("LE_VIBE_AUTH_FILE", raising=False)
+    monkeypatch.delenv("AGY_OAUTH_CLIENT_ID", raising=False)
+    monkeypatch.delenv("AGY_OAUTH_CLIENT_SECRET", raising=False)
+    monkeypatch.setattr(auth, "AGY_DEFAULT_CLIENT_ID", "")
+    monkeypatch.setattr(auth, "AGY_DEFAULT_CLIENT_SECRET", "")
+    monkeypatch.setattr(auth, "_AGY_OAUTH_CLIENT_CACHE", None)
+    monkeypatch.setattr(auth, "default_auth_file", lambda: tmp_path / "auth.json")
+    monkeypatch.setattr(auth, "_find_agy_binary", lambda: fake_bin)
+
+    cid, csec = auth._load_agy_oauth_client()
+    assert (cid, csec) == (fake_cid, fake_csec)
+    cached = json.loads((tmp_path / "agy_oauth.json").read_text(encoding="utf-8"))
+    assert cached == {"client_id": fake_cid, "client_secret": fake_csec}
+
+

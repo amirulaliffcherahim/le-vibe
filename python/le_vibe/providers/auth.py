@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import bisect
 from collections.abc import Mapping
 import hashlib
 import hmac
@@ -8,9 +9,12 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import os
 from pathlib import Path
+import re
 import secrets
+import shutil
 import socket
 import ssl
+import struct
 import sys
 import threading
 import time
@@ -124,6 +128,196 @@ def agy_user_agent(auth_method: str = "consumer") -> str:
 AGY_USER_AGENT = agy_user_agent()
 
 
+_AGY_OAUTH_CLIENT_CACHE: tuple[str, str] | None = None
+_AGY_CID_RE = re.compile(rb"\d{10,13}-[a-z0-9]{20,40}\.apps\.googleusercontent\.com")
+_AGY_CSEC_RE = re.compile(rb"GOCSPX-[A-Za-z0-9_-]{28}")
+
+
+def _find_agy_binary() -> Path | None:
+    which = shutil.which("agy")
+    if which:
+        p = Path(which)
+        if p.is_file():
+            return p
+    candidates: list[Path] = []
+    if sys.platform.startswith("win"):
+        local_app = os.environ.get("LOCALAPPDATA", "").strip()
+        if local_app:
+            candidates.append(Path(local_app) / "agy" / "bin" / "agy.exe")
+        candidates.append(Path.home() / "AppData" / "Local" / "agy" / "bin" / "agy.exe")
+    else:
+        candidates.extend(
+            [
+                Path.home() / ".local" / "bin" / "agy",
+                Path("/usr/local/bin/agy"),
+                Path("/opt/homebrew/bin/agy"),
+            ]
+        )
+    for cand in candidates:
+        if cand.is_file():
+            return cand
+    return None
+
+
+def _extract_agy_oauth_from_pe(data: bytes) -> tuple[str, str] | None:
+    if len(data) < 0x100 or data[:2] != b"MZ":
+        return None
+    try:
+        pe_off = struct.unpack_from("<I", data, 0x3C)[0]
+        if data[pe_off : pe_off + 4] != b"PE\x00\x00":
+            return None
+        num_sec = struct.unpack_from("<H", data, pe_off + 6)[0]
+        opt_size = struct.unpack_from("<H", data, pe_off + 20)[0]
+    except struct.error:
+        return None
+    sec_off = pe_off + 24 + opt_size
+    secs: list[tuple[str, int, int, int, int]] = []
+    text_sec: tuple[int, int, int] | None = None
+    for i in range(num_sec):
+        o = sec_off + i * 40
+        if o + 40 > len(data):
+            break
+        name = data[o : o + 8].rstrip(b"\x00").decode("ascii", "ignore")
+        vsize, vaddr, rsize, rptr = struct.unpack_from("<IIII", data, o + 8)
+        secs.append((name, vaddr, vsize, rptr, rsize))
+        if name == ".text":
+            text_sec = (vaddr, rptr, rsize)
+    if text_sec is None:
+        return None
+
+    def _foff_to_rva(foff: int) -> int | None:
+        for _, vaddr, _, rptr, rsize in secs:
+            if rptr <= foff < rptr + rsize:
+                return vaddr + (foff - rptr)
+        return None
+
+    tvaddr, trptr, trsize = text_sec
+    text = data[trptr : trptr + trsize]
+
+    cids: list[tuple[str, int]] = []
+    for m in _AGY_CID_RE.finditer(data):
+        rva = _foff_to_rva(m.start())
+        if rva is not None:
+            cids.append((m.group(0).decode("ascii"), rva))
+    csecs: list[tuple[str, int]] = []
+    for m in _AGY_CSEC_RE.finditer(data):
+        rva = _foff_to_rva(m.start())
+        if rva is not None:
+            csecs.append((m.group(0).decode("ascii"), rva))
+    if not cids or not csecs:
+        return None
+
+    cid_rva_set = {rva for _, rva in cids}
+    csec_rva_set = {rva for _, rva in csecs}
+    cid_refs: dict[int, list[int]] = {rva: [] for rva in cid_rva_set}
+    csec_refs: dict[int, list[int]] = {rva: [] for rva in csec_rva_set}
+
+    # Single linear scan over .text for x86_64 RIP-relative LEA (48/4c 8d [mod=00,rm=101] disp32).
+    idx = 1
+    limit = len(text) - 5
+    while True:
+        pos = text.find(b"\x8d", idx, limit)
+        if pos == -1:
+            break
+        idx = pos + 1
+        if text[pos - 1] in (0x48, 0x4C) and (text[pos + 1] & 0xC7) == 0x05:
+            disp = struct.unpack_from("<i", text, pos + 2)[0]
+            target = tvaddr + pos + 6 + disp
+            if target in cid_refs:
+                cid_refs[target].append(tvaddr + pos - 1)
+            elif target in csec_refs:
+                csec_refs[target].append(tvaddr + pos - 1)
+
+    # Pair each client_id with the client_secret referenced right next to it in .text.
+    pairs: list[tuple[str, str, list[int]]] = []
+    for cid_str, cid_rva in cids:
+        crefs = cid_refs.get(cid_rva, [])
+        if not crefs:
+            continue
+        best_csec: str | None = None
+        best_hits = 0
+        for csec_str, csec_rva in csecs:
+            srefs = csec_refs.get(csec_rva, [])
+            hits = sum(1 for cr in crefs if any(abs(cr - sr) <= 64 for sr in srefs))
+            if hits > best_hits:
+                best_hits = hits
+                best_csec = csec_str
+        if best_csec is not None:
+            pairs.append((cid_str, best_csec, crefs))
+    if not pairs:
+        return None
+    if len(pairs) == 1:
+        return pairs[0][0], pairs[0][1]
+
+    # Disambiguate consumer vs business vs MCP via Go's pclntab (`newBrowserLogin`).
+    pcln = data.find(b"\xf1\xff\xff\xff\x00\x00")
+    if pcln != -1 and pcln + 72 <= len(data):
+        try:
+            nfunc, _, _, funcname_off, _, _, _, pcln_off = struct.unpack_from("<8Q", data, pcln + 8)
+            ftab = pcln + pcln_off
+            funcs: list[tuple[int, int]] = []
+            for i in range(nfunc):
+                entryoff, funcoff = struct.unpack_from("<II", data, ftab + i * 8)
+                funcs.append((tvaddr + entryoff, funcoff))
+            rvas = [f[0] for f in funcs]
+            for cid_str, csec_str, crefs in pairs:
+                for ref in crefs:
+                    pos = bisect.bisect_right(rvas, ref) - 1
+                    if pos < 0:
+                        continue
+                    _, foff = funcs[pos]
+                    nameoff = struct.unpack_from("<i", data, ftab + foff + 4)[0]
+                    noff = pcln + funcname_off + nameoff
+                    end = data.find(b"\x00", noff, noff + 256)
+                    if end == -1:
+                        continue
+                    fname = data[noff:end].decode("utf-8", "ignore")
+                    if fname.endswith(".newBrowserLogin"):
+                        return cid_str, csec_str
+        except (struct.error, IndexError):
+            pass
+    return pairs[0][0], pairs[0][1]
+
+
+def _discover_agy_oauth_client() -> tuple[str, str] | None:
+    global _AGY_OAUTH_CLIENT_CACHE
+    if _AGY_OAUTH_CLIENT_CACHE is not None:
+        return _AGY_OAUTH_CLIENT_CACHE
+    bin_path = _find_agy_binary()
+    if bin_path is None:
+        return None
+    try:
+        data = bin_path.read_bytes()
+    except OSError:
+        return None
+    pair = _extract_agy_oauth_from_pe(data)
+    if pair is None:
+        cids = list(dict.fromkeys(m.group(0).decode("ascii") for m in _AGY_CID_RE.finditer(data)))
+        csecs = list(dict.fromkeys(m.group(0).decode("ascii") for m in _AGY_CSEC_RE.finditer(data)))
+        if len(cids) == 1 and len(csecs) == 1:
+            pair = (cids[0], csecs[0])
+    if pair is None:
+        return None
+    _AGY_OAUTH_CLIENT_CACHE = pair
+    # Cache to ~/.le-vibe/agy_oauth.json (0600) so future runs skip scanning the binary.
+    try:
+        cfg_path = default_auth_file().parent / "agy_oauth.json"
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cfg_path.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps({"client_id": pair[0], "client_secret": pair[1]}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, cfg_path)
+    except OSError:
+        pass
+    return pair
+
+
 def _load_agy_oauth_client() -> tuple[str, str]:
     cid = os.environ.get("AGY_OAUTH_CLIENT_ID", "").strip() or AGY_DEFAULT_CLIENT_ID
     csec = (
@@ -142,6 +336,10 @@ def _load_agy_oauth_client() -> tuple[str, str]:
                 return file_cid, file_csec
         except (OSError, json.JSONDecodeError):
             pass
+    if not os.environ.get("LE_VIBE_AUTH_FILE"):
+        discovered = _discover_agy_oauth_client()
+        if discovered is not None:
+            return discovered
     raise RuntimeError(
         "Missing AGY_OAUTH_CLIENT_ID / AGY_OAUTH_CLIENT_SECRET (set env vars or ~/.le-vibe/agy_oauth.json)"
     )
@@ -1162,7 +1360,8 @@ def _resolve_oidc_credential(
                         refresh_data["client_id"] = cid
                         refresh_data["client_secret"] = csec
                     except RuntimeError:
-                        pass
+                        if not refresh_data["client_id"]:
+                            raise
                 try:
                     with httpx.Client(timeout=20.0) as client:
                         resp = client.post(str(token_endpoint), data=refresh_data)
